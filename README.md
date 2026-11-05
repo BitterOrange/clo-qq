@@ -289,6 +289,8 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 
 控制台在 `src/cli/`，运行状态都在项目的 `.runtime/` 里，不碰默认的 OpenClaw 目录。设计细节见 [docs/group-chat-design.md](docs/group-chat-design.md)。
 
+**为什么用 WebSocket，不用 Webhook。** 机器人主动连出去，只需要出站网络，不用开入站端口、域名和 HTTPS，放到远程服务器上也一样。Webhook 的好处主要是 Serverless 和多副本，而这里每个 AppID 只能有一个实例，用不上。换成 Webhook 还会失去 4914、4915 这类停止信号、连接健康判断和 READY 带来的身份确认，这些都要重新设计；SDK 自带的 Webhook 接收层也要先过安全审查才能对公网开放。原因和没确认的部分见 `DECISIONS.md`。
+
 **未来可能加入微信机器人实现，架构上作预留。** 通道和核心是分层的，但核心里还有 QQ 专用的部分（`qq.*` 配置、写着 QQ 群的判定提示词、`--qq-platform-notified`），要接别的通道得先整理这些。现在没有其他通道的代码。
 
 ## 限制
@@ -351,4 +353,4 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 | [docs/wiring-trial.md](docs/wiring-trial.md) | 第一次离线接线试验的报告 |
 | [persona/](persona/) | 人设、内容范围、判定提示词、告知草稿 |
 
-**许可证：** 还没有决定。在决定之前，这个仓库没有授予开源许可。
+**许可证：** [AGPL-3.0-only](LICENSE)，`persona/` 里的人设文字也一样。如果你改了代码，又让别人通过网络和改过的版本互动，比如拉进群里给群友用，第 13 条要求你的版本显著地向这些人提供获取对应源码的途径。程序不会替你做这件事，条文也没有细说聊天机器人怎样才算“显著”，这要你自己判断。不改代码只是运行，这一条不适用。这段是说明，不是法律意见。

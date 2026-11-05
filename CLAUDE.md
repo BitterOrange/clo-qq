@@ -86,6 +86,7 @@ OpenClaw Gateway（项目 PID 管理，环境按白名单构造，只绑 loopbac
       core 策略 → channels/qq/exit：目标校验 → 内容策略 → 限额 → QQ 发送 API
 ```
 
+- **事件接入用 WebSocket，不用 Webhook。** 远程部署也一样，理由和重新考虑的条件见 `DECISIONS.md`。
 - **每个 AppID 一个消费者。** 第二个监听器、官方插件、临时脚本都不能和 Gateway 同时连同一个 AppID。Q0 探测工具（`src/tools/qq-listener.mjs`、`qq-send-probe.mjs`）只用于探测，不和 Gateway 同时跑。
 - **Gateway 只有一个管理者**：`clo start`、`clo stop`。默认只绑 loopback，本地 token 保护接口，控制面板不暴露到公网。
 - **所有输出**，包括回复、固定句、命令回执、定时提醒和失败通知，都经过同一个出口。`connection.js` 创建 SDK 实例，只交给 `exit.js`；`outbound.sendText` 无条件拒绝；工具里禁用 `message`。禁止模型绕过出口调用任何发送接口。
