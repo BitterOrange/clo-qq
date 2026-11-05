@@ -16,6 +16,26 @@ export function estimateTokens(text) {
 
 const clamp = (text, chars) => [...String(text)].slice(0, chars).join('');
 
+// One line may take half the token cap, so a very long line leaves room for the lines around it. Under the floor a
+// line is ordinary speech: it is read whole or not at all, which is what a very small cap still gets.
+const LINE_FLOOR_TOKENS = 256;
+const SHORTENED = '…（太长，后面省略）';
+
+function fitTokens(text, budget) {
+  if (estimateTokens(text) <= budget) return text;
+  const room = budget - estimateTokens(SHORTENED);
+  let ascii = 0;
+  let other = 0;
+  let kept = '';
+  for (const ch of String(text)) {
+    if (ch.codePointAt(0) < 128) ascii += 1;
+    else other += 1;
+    if (other * 2 + Math.ceil(ascii / 3) > room) break;
+    kept += ch;
+  }
+  return kept + SHORTENED;
+}
+
 export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
   const groups = new Map();
 
@@ -64,6 +84,17 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
   return {
     pseudonym,
 
+    // Caps for everything read from here on. A missing cap stays as it is. Lines over a lower item cap go now; lines
+    // over a lower age cap go at the next read or sweep.
+    configure(next = {}) {
+      maxItems = next.maxItems ?? maxItems;
+      maxAgeMs = next.maxAgeMs ?? maxAgeMs;
+      maxTokens = next.maxTokens ?? maxTokens;
+      for (const g of groups.values()) {
+        if (g.items.length > maxItems) g.items.splice(0, g.items.length - maxItems);
+      }
+    },
+
     push(groupKey, { senderKey, text, ts, eventKey, displayName = null, arrival }) {
       const sender = pseudonym(groupKey, senderKey);
       const g = groupOf(groupKey);
@@ -74,17 +105,21 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
 
     // Newest entries that fit the token cap, oldest first, in the host's HistoryEntry shape.
     // Labels count toward the cap only when they are sent, so without names this is what it always was.
+    // A line over the per-line cap is shortened here and only here, so one long message cannot empty the history. The
+    // cap is weighed against the words alone; a label still counts toward the total.
     // hide: event keys to leave out. They take no room under the cap. A hidden line still counts for newestNames: a label
     // belongs to the member, not to one line.
     history(groupKey, excludeEventKey, at, { showNames = false, current = null, hide = null } = {}) {
       const names = showNames ? newestNames(groupKey, at, current) : null;
+      const lineCap = Math.max(Math.floor(maxTokens / 2), LINE_FLOOR_TOKENS);
       const out = [];
       let tokens = 0;
       for (const i of live(groupKey, excludeEventKey, at).filter((l) => !hide?.has(l.eventKey)).reverse()) {
         const sender = names ? speakerLabel(i.sender, names.get(i.sender)) : i.sender;
-        tokens += estimateTokens(i.text) + (names ? estimateTokens(sender) : 0);
+        const body = fitTokens(i.text, lineCap);
+        tokens += estimateTokens(body) + (names ? estimateTokens(sender) : 0);
         if (tokens > maxTokens) break;
-        out.push({ sender, body: i.text, timestamp: i.ts });
+        out.push({ sender, body, timestamp: i.ts });
       }
       return out.reverse();
     },

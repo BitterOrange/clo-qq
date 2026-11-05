@@ -96,13 +96,16 @@ export function usableLock(cfg, lock) {
   return lockMatches(cfg, lock) ? lock : null;
 }
 
-// The whole output of a render, with nothing written.
-export function renderAll(ctx, cfg, env = ctx.env) {
-  const lock = usableLock(cfg, readModelsLock(ctx.paths));
+function renderWith(ctx, cfg, lock, env) {
   const effective = buildEffective(cfg, { paths: ctx.paths, modelsLock: lock, env, now: ctx.now });
   const openclaw = renderOpenclaw(cfg, effective, ctx.paths, { testMode: isTestMode(env) });
   const workspace = renderWorkspace(ctx.paths.repoRoot, effective);
   return { effective, openclaw, workspace };
+}
+
+// The whole output of a render, with nothing written.
+export function renderAll(ctx, cfg, env = ctx.env) {
+  return renderWith(ctx, cfg, usableLock(cfg, readModelsLock(ctx.paths)), env);
 }
 
 function writeIfChanged(path, text) {
@@ -119,8 +122,11 @@ export function readEffective(ctx) {
   return createEffectiveReader(ctx.paths.effectiveJson)();
 }
 
+// Everything that can refuse this config, with nothing written and the render as the result. A command runs it before
+// it writes config.json, so a refusal cannot leave a config that the running effective file does not match.
 // Only `clo mode live` may turn a dry-run install live. Hand-editing config.json cannot do it.
-export function apply(ctx, cfg, { allowLive = false } = {}) {
+// lock is the model lock the config will run on: a model change passes the one it is about to record.
+export function assertApplicable(ctx, cfg, { allowLive = false, lock = readModelsLock(ctx.paths) } = {}) {
   assertValid(ctx, cfg);
   if (cfg.mode === 'live' && !allowLive && readEffective(ctx)?.mode !== 'live') {
     throw new CliError('config.json 写着 live，但当前不是 live。live 只能由 clo mode live 开启，它会先检查所有前置条件。');
@@ -132,11 +138,35 @@ export function apply(ctx, cfg, { allowLive = false } = {}) {
       throw new CliError(`live 下这份 config.json 不满足前置条件（${problems.join('、')}）。先 clo mode dry-run，改好后再 clo mode live，它会重新检查。`);
     }
   }
-  const lock = readModelsLock(ctx.paths);
+  if (cfg.mode === 'live' && !lock) {
+    throw new CliError('live 下没有锁定的模型，不能生成运行配置。先 clo mode dry-run，再 clo model refresh。');
+  }
   if (lock && !lockMatches(cfg, lock)) {
     throw new CliError('config.json 里的模型与锁定的模型不一致。先运行 clo model refresh（启用 QQ 时要加 --qq-platform-notified），不会悄悄换模型。');
   }
-  const { effective, openclaw, workspace } = renderAll(ctx, cfg);
+  return renderWith(ctx, cfg, usableLock(cfg, lock), ctx.env);
+}
+
+// Stops replies and spending on its own, before config.json is even read: the Gateway reads this file for each event.
+// Returns true when it changed the mode. A file that is missing or unreadable is not live to any reader, so it stays.
+export function forceEffectiveDryRun(ctx) {
+  let effective;
+  try {
+    effective = JSON.parse(readFileSync(ctx.paths.effectiveJson, 'utf8'));
+  } catch {
+    return false;
+  }
+  if (effective?.mode !== 'live') return false;
+  try {
+    writeAtomic(ctx.paths.effectiveJson, `${JSON.stringify({ ...effective, mode: 'dry-run' }, null, 2)}\n`);
+  } catch (e) {
+    throw new CliError(`没能切到 dry-run，生效配置还是 live，可洛还会回复：写不了 effective.json（${e.code ?? '未知错误'}）。可以用 clo pause --all 先暂停，或 clo stop 停止。`);
+  }
+  return true;
+}
+
+export function apply(ctx, cfg, { allowLive = false } = {}) {
+  const { effective, openclaw, workspace } = assertApplicable(ctx, cfg, { allowLive });
   const { paths } = ctx;
   // doctor runs before start and needs TEMP to exist: the host's plugin inspect makes a temp folder there.
   for (const d of [paths.stateDir, paths.home, paths.workspace, paths.cloDir, paths.logsDir, paths.gatewayCwd, dirname(paths.pidFile), join(paths.runtime, 'temp')]) {

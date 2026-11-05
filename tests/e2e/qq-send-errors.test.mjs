@@ -73,11 +73,12 @@ test('40054010 URL refused: one resend with URLs removed under a new seq, then d
   assert.deepEqual(s.sends(id).map((r) => [r.kind, r.state]), [['reply', 'failed'], ['reply_url_stripped', 'sent']]);
 });
 
-test('40054010 twice: group_error, no third attempt', async () => {
-  scriptSequence([reject(40054010), reject(40054010)]);
-  const { row, fresh } = await ask('https://member.example/a 再问一次');
+test('40054010 twice: group_error, no third try of the text, and the failure line goes out', async () => {
+  scriptSequence([reject(40054010), reject(40054010), { status: 200 }]);
+  const { id, row, fresh } = await ask('https://member.example/a 再问一次');
   assert.equal(`${row.state}:${row.reason}`, 'failed:group_error');
-  assert.equal(fresh.length, 2);
+  assert.equal(fresh.length, 3);
+  assert.deepEqual(s.sends(id).map((r) => r.kind), ['reply', 'reply_url_stripped', 'fixed_line']);
   s.model.setScript(() => ({ text: CLEAN }));
 });
 

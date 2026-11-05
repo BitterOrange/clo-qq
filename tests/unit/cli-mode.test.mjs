@@ -1,10 +1,12 @@
 // Modes, live preconditions, pause, status, targets, budget, policy. In-process, temp root, fake provider.
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
-import { validateBusinessConfig } from '../../src/clo-plugin/lib/core/config.js';
-import { APP_ID, baseConfig, clo, configOf, effectiveOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, markRunning, OWNER_ID, readJson, readyForLive, ROOT, withDb } from './_cli-helper.mjs';
+import { processInfo } from '../../src/cli/lifecycle.mjs';
+import { createEffectiveReader, validateBusinessConfig } from '../../src/clo-plugin/lib/core/config.js';
+import { createLedger } from '../../src/clo-plugin/lib/core/ledger.js';
+import { APP_ID, baseConfig, clo, configOf, dbOf, effectiveOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, markRunning, OWNER_ID, readJson, readyForLive, ROOT, withDb } from './_cli-helper.mjs';
 
 const roots = [];
 const root = (label, cfg) => {
@@ -510,4 +512,294 @@ test('status shows the decision breaker, open or closed', async () => {
   assert.match(text, /付费 residual/, 'the two are separate states');
   const json = JSON.parse((await clo(r, ['status', '--json'])).out);
   assert.equal(typeof json.db.decisionPausedAt, 'number');
+});
+
+const liveRoot = async (label) => {
+  const r = root(label);
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  const res = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(res.code, 0, `${res.out}${res.err}`);
+  return { r, provider };
+};
+const effectiveFile = (r) => join(r, '.runtime', 'clo', 'effective.json');
+const editConfig = (r, mutate) => {
+  const cfg = configOf(r);
+  mutate(cfg);
+  writeFileSync(join(r, 'config.json'), JSON.stringify(cfg));
+};
+const failedCodes = (out) => [...out.matchAll(/^ {2}(\w+)：/gm)].map((m) => m[1]);
+
+test('mode dry-run stops first: a config it cannot apply leaves the same reader on dry-run, and no platform claim is needed', async () => {
+  const { r } = await liveRoot('forcedry');
+  const reader = createEffectiveReader(effectiveFile(r));
+  assert.equal(reader().mode, 'live', 'positive control: it was live');
+  editConfig(r, (c) => { c.claudeModel.id = 'anthropic/claude-sonnet-5.5'; });
+  const res = await clo(r, ['mode', 'dry-run']);
+  assert.equal(res.code, 1);
+  assert.match(res.err, /已经进入 dry-run/);
+  assert.match(res.err, /clo model refresh/);
+  assert.equal(reader().mode, 'dry-run');
+  assert.equal(configOf(r).mode, 'dry-run');
+});
+
+test('mode dry-run still stops when config.json cannot be read at all', async () => {
+  const { r } = await liveRoot('forcedrybroken');
+  writeFileSync(join(r, 'config.json'), '{ not json');
+  const res = await clo(r, ['mode', 'dry-run']);
+  assert.equal(res.code, 1);
+  assert.match(res.err, /已经进入 dry-run/);
+  assert.equal(effectiveOf(r).mode, 'dry-run');
+});
+
+test('mode dry-run does not claim to have stopped when the effective file cannot be written', async () => {
+  const { r } = await liveRoot('forcedryro');
+  chmodSync(effectiveFile(r), 0o444);
+  try {
+    const res = await clo(r, ['mode', 'dry-run']);
+    assert.equal(res.code, 1);
+    assert.match(res.err, /还是 live/);
+    assert.doesNotMatch(res.err, /已经进入/);
+    assert.equal(effectiveOf(r).mode, 'live');
+  } finally {
+    chmodSync(effectiveFile(r), 0o644);
+  }
+  assert.equal((await clo(r, ['mode', 'dry-run'])).code, 0, 'positive control: writable again, it goes through');
+  assert.equal(effectiveOf(r).mode, 'dry-run');
+});
+
+test('apply refuses live with no model lock, and leaves the effective file as it was', async () => {
+  const { r } = await liveRoot('livenolock');
+  assert.equal((await clo(r, ['apply'])).code, 0, 'positive control: with the lock it applies');
+  const lockFile = join(r, 'versions.lock.json');
+  const saved = readFileSync(lockFile, 'utf8');
+  const lock = readJson(lockFile);
+  delete lock.models.lock;
+  writeFileSync(lockFile, JSON.stringify(lock));
+  const before = readFileSync(effectiveFile(r), 'utf8');
+  const res = await clo(r, ['apply']);
+  assert.equal(res.code, 1);
+  assert.match(res.err, /没有锁定的模型/);
+  assert.match(res.err, /clo model refresh/);
+  assert.equal(readFileSync(effectiveFile(r), 'utf8'), before);
+  writeFileSync(lockFile, saved);
+});
+
+test('a hand-edited live that mode live refuses goes back to dry-run, so apply works again', async () => {
+  const r = root('halfstate');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  editConfig(r, (c) => { c.mode = 'live'; c.acks.q0Recorded = false; });
+  assert.equal((await clo(r, ['apply'])).code, 1, 'positive control: the half state refuses apply');
+  const res = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(res.code, 1);
+  assert.deepEqual(failedCodes(res.out), ['q0']);
+  assert.equal(configOf(r).mode, 'dry-run');
+  assert.equal(effectiveOf(r).mode, 'dry-run');
+  assert.equal((await clo(r, ['apply'])).code, 0);
+});
+
+test('a daily budget below one required reply is refused, using the same hold as the ledger', async () => {
+  const r = root('dailyhold');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  const holdUsd = withDb(r, (store) => createLedger({ store, getEffective: () => effectiveOf(r), fetch: provider.fetch, getKey: () => null, log: () => {}, now: Date.now }).holdMicros('reply_required')) / 1e6;
+  const setDaily = (x) => editConfig(r, (c) => { Object.assign(c.budget, { dailyUsd: x, addressedUsd: x, namedUsd: x, searchUsd: x, interjectUsd: x }); });
+
+  setDaily(holdUsd - 0.000001);
+  const low = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(low.code, 1);
+  assert.deepEqual(failedCodes(low.out), ['daily_hold']);
+  assert.match(low.out, /daily_hold：[^\n]*dailyUsd/, 'the hint is not empty');
+
+  setDaily(holdUsd);
+  const exact = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(exact.code, 0, `${exact.out}${exact.err}`);
+});
+
+test('a Key limit that differs from keyDailyLimitUsd is refused with a hint and no key in it; a lower limit that matches passes', async () => {
+  const r = root('keylimit');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  provider.state.key = { usage: 0, limit: 3.25, limit_remaining: 3.25, limit_reset: 'daily', usage_daily: 0 };
+  const res = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(res.code, 1);
+  assert.deepEqual(failedCodes(res.out), ['key_limit']);
+  assert.match(res.out, /key_limit：[^\n]*keyDailyLimitUsd/);
+  assert.ok(!res.out.includes(FAKE_KEY));
+
+  provider.state.key = { usage: 0, limit: 1.6, limit_remaining: 1.6, limit_reset: 'daily', usage_daily: 0 };
+  assert.ok(configOf(r).budget.dailyUsd > 1.6, 'this limit is below the local budget');
+  assert.equal((await clo(r, ['mode', 'live'], { fetch: provider.fetch })).code, 0);
+});
+
+test('a non-empty localNumbers is refused before any write', async () => {
+  const r = root('numbers');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  editConfig(r, (c) => { c.contentPolicy.crisis.localNumbers = ['12345']; });
+  const res = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(res.code, 1);
+  assert.match(res.err, /contentPolicy\.crisis\.localNumbers/);
+  assert.equal(effectiveOf(r).mode, 'dry-run');
+});
+
+test('with another Key in the Gateway, mode live reads the Key but does not reconcile, so the baseline is not flipped', async () => {
+  const r = root('skipreconcile');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  const keyReads = () => provider.calls.filter((c) => c.url.endsWith('/key')).length;
+  const baseline = withDb(r, (store) => {
+    const other = store.key('sk-or-v1-SOME-OTHER-KEY');
+    store.setControl('gateway_key', other, 'start');
+    const text = JSON.stringify({ usage: 0, at: Date.now() - 1000, keyId: other });
+    store.setMeta('key_baseline', text);
+    return text;
+  });
+  const reads = keyReads();
+  const res = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(res.code, 1);
+  assert.deepEqual(failedCodes(res.out), ['reconciled', 'gateway_key']);
+  assert.match(res.out, /reconciled：这次没有对账/);
+  assert.match(res.out, /gateway_key：[^\n]*刚启动的 Gateway 要先连接完成/);
+  assert.equal(keyReads(), reads + 1, 'one read for the limit');
+  withDb(r, (store) => {
+    assert.equal(store.getMeta('key_baseline'), baseline);
+    assert.equal(store.q("SELECT COUNT(*) AS n FROM alerts WHERE kind='key_changed'").get().n, 0);
+  });
+
+  withDb(r, (store) => store.setControl('gateway_key', store.key(FAKE_KEY), 'start'));
+  const matched = keyReads();
+  await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.ok(keyReads() > matched + 1, 'positive control: with the same Key it does reconcile');
+});
+
+test('resume refuses anything it cannot read, since that would otherwise resume every group; bare resume still works', async () => {
+  const r = root('resumeargs', enabledConfig());
+  await clo(r, ['apply']);
+  assert.equal((await clo(r, ['pause', '--all'])).code, 0);
+  withDb(r, (s) => s.setControl('interject_paused', '1', 'test'));
+  for (const args of [['--group'], ['--group=测试群'], ['测试群'], ['--nope'], ['--all', '测试群'], ['--interject', 'x'], ['--interject', '--all'], ['--interject', '--group', '测试群']]) {
+    const res = await clo(r, ['resume', ...args]);
+    assert.equal(res.code, 1, args.join(' '));
+    assert.match(res.err, /什么都没有恢复/);
+    assert.equal(withDb(r, (s) => s.getControl('global_paused')), 'console', args.join(' '));
+    assert.equal(withDb(r, (s) => s.getControl('interject_paused')), '1', args.join(' '));
+  }
+  assert.equal((await clo(r, ['resume'])).code, 0);
+  assert.equal(withDb(r, (s) => s.getControl('global_paused')), null);
+  assert.equal((await clo(r, ['resume', '--interject'])).code, 0);
+  assert.equal(withDb(r, (s) => s.getControl('interject_paused')), null);
+  assert.equal((await clo(r, ['resume', '--group', '测试群'])).code, 0);
+  assert.equal((await clo(r, ['resume', '--all'])).code, 0);
+});
+
+test('accept-unsettled says what actually happened to the pause', async () => {
+  const r = root('acceptnote', enabledConfig());
+  await clo(r, ['model', 'refresh'], { fetch: fakeProvider().fetch });
+  const none = await clo(r, ['budget', 'accept-unsettled']);
+  assert.match(none.out, /现在没有付费暂停/);
+  assert.doesNotMatch(none.out, /随之解除/);
+
+  withDb(r, (s) => s.setControl('paid_paused', 'openrouter_credits', 'test'));
+  const other = await clo(r, ['budget', 'accept-unsettled']);
+  assert.match(other.out, /还没有恢复：现在的暂停原因是 openrouter_credits/);
+  assert.doesNotMatch(other.out, /随之解除/);
+
+  withDb(r, (s) => s.setControl('paid_paused', 'crash_unsettled', 'test'));
+  const lifted = await clo(r, ['budget', 'accept-unsettled']);
+  assert.match(lifted.out, /随之解除/);
+  assert.equal(withDb(r, (s) => s.getControl('paid_paused')), null);
+});
+
+test('status --json --ack keeps standard output one JSON document', async () => {
+  const r = root('jsonack', enabledConfig());
+  await clo(r, ['apply']);
+  withDb(r, (s) => s.addAlert('x', {}));
+  const res = await clo(r, ['status', '--json', '--ack']);
+  assert.equal(res.code, 0);
+  assert.equal(JSON.parse(res.out).db.alerts.length, 1);
+  assert.match(res.err, /已把 1 条告警/);
+  withDb(r, (s) => s.addAlert('y', {}));
+  assert.match((await clo(r, ['status', '--ack'])).out, /已把 1 条告警/, 'as text it stays with the report');
+});
+
+const NO_SUCH_PID = 999999;
+const pidFileOf = (r) => join(r, '.runtime', 'pids', 'gateway.json');
+const lockFileOf = (r) => join(r, '.runtime', 'pids', 'start.lock');
+const writeInPids = (file, value) => {
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(value));
+};
+const guarded = { env: { CLO_TEST_NODE_IMPORT: join(ROOT, 'tests', 'harness', 'net-guard.mjs') } };
+
+test('stop drops the heartbeat, so a stopped Gateway does not read as fresh', async () => {
+  const r = root('stopbeat', enabledConfig());
+  await clo(r, ['apply']);
+  markRunning(r);
+  assert.equal(JSON.parse((await clo(r, ['status', '--json'])).out).heartbeatFresh, true, 'positive control');
+  writeInPids(pidFileOf(r), { pid: NO_SUCH_PID, startTime: 'x', commandDigest: 'y' });
+  const res = await clo(r, ['stop']);
+  assert.equal(res.code, 0, `${res.out}${res.err}`);
+  assert.equal(withDb(r, (s) => s.getControl('heartbeat_at')), null);
+  assert.equal(withDb(r, (s) => s.getControl('connected')), 'false');
+  assert.equal(JSON.parse((await clo(r, ['status', '--json'])).out).heartbeatFresh, false);
+});
+
+test('a start under way: another start and a stop both refuse and touch nothing; a dead holder blocks neither', { timeout: 120000 }, async () => {
+  const r = root('startlock');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  // Hand-edited live stops a start right after the lock, so this never reaches a Gateway.
+  editConfig(r, (c) => { c.mode = 'live'; });
+  writeInPids(pidFileOf(r), { pid: NO_SUCH_PID, startTime: 'x', commandDigest: 'y' });
+
+  writeInPids(lockFileOf(r), { pid: process.pid, startTime: null, token: 't', startedAt: 'x' });
+  const start = await clo(r, ['start'], guarded);
+  assert.equal(start.code, 1);
+  assert.match(start.err, /另一个 clo start 正在运行/);
+  const stop = await clo(r, ['stop']);
+  assert.equal(stop.code, 1);
+  assert.match(stop.out, /clo start 可能还在运行/);
+  assert.ok(existsSync(pidFileOf(r)), 'nothing was touched');
+  assert.ok(existsSync(lockFileOf(r)), 'nor the lock');
+
+  writeInPids(lockFileOf(r), { pid: NO_SUCH_PID, startTime: null, token: 't', startedAt: 'x' });
+  const afterDead = await clo(r, ['start'], guarded);
+  assert.equal(afterDead.code, 1);
+  assert.match(afterDead.err, /clo mode live/, 'it went past the lock, to the next refusal');
+  assert.equal(existsSync(lockFileOf(r)), false, 'reclaimed, and released after the refusal');
+
+  writeInPids(lockFileOf(r), { pid: NO_SUCH_PID, startTime: null, token: 't', startedAt: 'x' });
+  assert.equal((await clo(r, ['stop'])).code, 0, 'a stale lock does not block a stop');
+  assert.equal(existsSync(pidFileOf(r)), false);
+});
+
+test('a Gateway whose command line the OS withholds: stop and start say to use the shell that started it', { timeout: 90000 }, async () => {
+  const r = root('cmdlinehint', enabledConfig());
+  await clo(r, ['apply']);
+  // The System process shows a start time and no command line to every caller.
+  const info = processInfo(4);
+  assert.ok(info?.startTime, 'positive control: the start time is readable');
+  writeInPids(pidFileOf(r), { pid: 4, startTime: info.startTime, commandDigest: 'digest' });
+  const stop = await clo(r, ['stop']);
+  assert.equal(stop.code, 1);
+  assert.match(stop.out, /从启动它的 shell 里运行/);
+  assert.ok(existsSync(pidFileOf(r)));
+  const start = await clo(r, ['start'], guarded);
+  assert.equal(start.code, 1);
+  assert.match(start.err, /从启动它的 shell 里运行/);
+  assert.ok(existsSync(pidFileOf(r)));
+});
+
+test('ack terminal also clears a close that only reached the file', async () => {
+  const r = root('closefile', enabledConfig());
+  await clo(r, ['apply']);
+  assert.match((await clo(r, ['ack', 'terminal'])).out, /没有锁存/, 'positive control: nothing latched yet');
+  const file = `${dbOf(r)}.terminal_close`;
+  writeFileSync(file, '4915');
+  const res = await clo(r, ['ack', 'terminal']);
+  assert.match(res.out, /4915/);
+  assert.equal(existsSync(file), false);
+  assert.match((await clo(r, ['ack', 'terminal'])).out, /没有锁存/);
 });

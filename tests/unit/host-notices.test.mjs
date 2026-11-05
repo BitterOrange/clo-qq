@@ -10,6 +10,8 @@ import { makeHarness, ROOT, USAGE } from '../fixtures/inbound.mjs';
 
 const LINES = JSON.parse(readFileSync(join(ROOT, 'persona', 'policy-lines.zh.json'), 'utf8'));
 const TRUNCATED = EXACT_NOTICES[0];
+const REMINDER = 'Note: I did not schedule a reminder in this turn, so this will not trigger automatically.';
+const TOOL_RUN = 'The tool run finished, but no final summary was produced. I did not repeat any completed actions.';
 const DIST = join(ROOT, '.runtime', 'pkg', 'node_modules', 'openclaw', 'dist');
 
 const open = [];
@@ -37,6 +39,32 @@ test('truncated: the partial text goes out, the notice does not, and it is logge
   assert.equal(h.state(e), 'completed:sent');
   assert.deepEqual(h.posted, ['半句']);
   assert.ok(h.logs.some((l) => l.event === 'exit_drop' && l.reason === 'host-notice'));
+  assert.equal(h.logs.some((l) => l.reason === 'host-notice-other'), false);
+});
+
+test('the reminder note the host appends is cut off, and the log does not call it truncation', async () => {
+  // The host appends it to the payload itself, after an English promise of a reminder.
+  const h = stack([`I'll remind you tomorrow.\n\n${REMINDER}`]);
+  const e = await h.sendAndFlush(h.at());
+  assert.equal(h.state(e), 'completed:sent');
+  assert.deepEqual(h.posted, ["I'll remind you tomorrow."]);
+  assert.ok(h.logs.some((l) => l.event === 'exit_drop' && l.reason === 'host-notice-other'));
+  assert.equal(h.logs.some((l) => l.reason === 'host-notice'), false, 'tools/q5-probe.mjs would count this as a truncated reply');
+});
+
+test('the tool-run sentence on a required turn: the failure line, recorded as a host error, not counted as truncation', async () => {
+  const h = stack([TOOL_RUN]);
+  const e = await h.sendAndFlush(h.at());
+  assert.equal(h.state(e), 'failed:host_error');
+  assert.deepEqual(h.posted, [LINES.modelFailed]);
+  assert.equal(h.logs.some((l) => l.reason === 'host-notice'), false);
+});
+
+test('a status line caught by its shape is not counted as truncation either', async () => {
+  const h = stack(['🧹 Compacting context...']);
+  await h.sendAndFlush(h.at());
+  assert.ok(h.logs.some((l) => l.event === 'exit_drop' && l.reason === 'host-notice-other'));
+  assert.equal(h.logs.some((l) => l.reason === 'host-notice'), false);
 });
 
 test('a notice joined onto the text it follows is cut off too', async () => {

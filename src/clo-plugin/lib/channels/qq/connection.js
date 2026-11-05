@@ -36,9 +36,13 @@ function sleepUntilAborted(ms, signal) {
 // So only a run of consecutive failures counts as failing.
 export const PROBE_FAILS_TO_SUSPECT = 3;
 
-export function createLivenessMonitor({ probe, isConnected, restart, takeRestartSlot, log = () => {}, intervalMs = PROBE_INTERVAL_MS, setTimer = setInterval, clearTimer = clearInterval, failsToSuspect = PROBE_FAILS_TO_SUSPECT }) {
+// A READY or RESUMED newer than the first failed probe means the SDK already rebuilt the socket during the
+// outage, so a recovery proves nothing about it. The cost: a socket that came back and then went half-open
+// within the same run of failures is not rebuilt this time.
+export function createLivenessMonitor({ probe, isConnected, restart, takeRestartSlot, lastConnectedAt = () => null, now = Date.now, log = () => {}, intervalMs = PROBE_INTERVAL_MS, setTimer = setInterval, clearTimer = clearInterval, failsToSuspect = PROBE_FAILS_TO_SUSPECT }) {
   let timer = null;
   let failing = false;
+  let failingSince = null;
   let consecutiveFails = 0;
   let running = false;
 
@@ -46,9 +50,11 @@ export function createLivenessMonitor({ probe, isConnected, restart, takeRestart
     if (running) return;
     running = true;
     try {
+      const probedAt = now();
       const ok = await probe();
       if (!ok) {
         consecutiveFails += 1;
+        failingSince ??= probedAt;
         if (!failing && consecutiveFails >= failsToSuspect) {
           log('liveness_probe', { state: 'failing' });
           failing = true;
@@ -56,10 +62,16 @@ export function createLivenessMonitor({ probe, isConnected, restart, takeRestart
         return;
       }
       consecutiveFails = 0;
+      const since = failingSince;
+      failingSince = null;
       if (!failing) return;
       failing = false;
       log('liveness_probe', { state: 'recovered' });
       if (!isConnected()) return;
+      if ((lastConnectedAt() ?? 0) > since) {
+        log('liveness_restart', { state: 'already_reconnected' });
+        return;
+      }
       if (!takeRestartSlot()) {
         log('liveness_restart', { state: 'cap_reached' });
         return;
@@ -87,6 +99,55 @@ export function createLivenessMonitor({ probe, isConnected, restart, takeRestart
   };
 }
 
+export const DOWN_ALERT_AFTER_MS = 10 * 60000;
+// A gap in the heartbeat longer than this means the process or the channel was off, not that a host restart passed.
+export const DOWN_CONTINUITY_MS = 5 * 60000;
+const DOWN_SINCE_KEY = 'conn_down_since';
+const DOWN_ALERTED_KEY = 'conn_down_alerted';
+
+// The host health monitor stops and restarts a channel that stays disconnected, which ends runConnection and
+// everything local to it, so the start of an outage has to live in the store. It only ever adds a status line.
+export function createDownWatch({ store, log = () => {}, now = Date.now, alertAfterMs = DOWN_ALERT_AFTER_MS, continuityMs = DOWN_CONTINUITY_MS }) {
+  const clear = () => {
+    store.delControl(DOWN_SINCE_KEY);
+    store.delControl(DOWN_ALERTED_KEY);
+  };
+  const guarded = (fn) => {
+    try {
+      fn();
+    } catch {
+      log('status_error', { reason: 'connection_down' });
+    }
+  };
+  return {
+    // Call with the heartbeat read before this start wrote its own.
+    begin(lastHeartbeatAt) {
+      guarded(() => {
+        if (lastHeartbeatAt === null || !(now() - Number(lastHeartbeatAt) <= continuityMs)) clear();
+      });
+    },
+    // Idempotent, so a write lost to a locked database is made up on the next call.
+    check(connected) {
+      guarded(() => {
+        const since = store.getControl(DOWN_SINCE_KEY);
+        if (connected) {
+          if (since !== null) clear();
+          return;
+        }
+        const at = now();
+        if (since === null) {
+          store.setControl(DOWN_SINCE_KEY, at, 'connection');
+          return;
+        }
+        const durationMs = at - Number(since);
+        if (durationMs < alertAfterMs || store.getControl(DOWN_ALERTED_KEY) === since) return;
+        store.addAlert('connection_down', { durationMs });
+        store.setControl(DOWN_ALERTED_KEY, since, 'connection');
+      });
+    },
+  };
+}
+
 // Resolves after abort and socket close. Throws only on a fatal close, which the caller latches.
 // exitDeps are passed to createExit; onExit receives the exit, the one object that may send.
 export async function runConnection({ account, abortSignal, onInbound, exitDeps, onExit, onStatus = () => {}, onAlert = () => {}, takeRestartSlot = () => true, log = () => {}, userAgent, probeIntervalMs = PROBE_INTERVAL_MS }) {
@@ -107,7 +168,21 @@ export async function runConnection({ account, abortSignal, onInbound, exitDeps,
   let lastReadyAt = null;
   let lastResumedAt = null;
   let lastDisconnectCode = null;
-  const publish = (extra = {}) => onStatus({ connected, lastReadyAt, lastResumedAt, lastDisconnectCode, ...extra });
+  // Runs inside SDK handlers and in the catch below that must still see a fatal close, so it never throws.
+  const publish = (extra = {}) => {
+    try {
+      onStatus({ connected, lastReadyAt, lastResumedAt, lastDisconnectCode, ...extra });
+    } catch {
+      log('status_error', { reason: 'publish' });
+    }
+  };
+  const raiseAlert = (kind, detail) => {
+    try {
+      onAlert(kind, detail);
+    } catch {
+      log('status_error', { reason: 'alert' });
+    }
+  };
 
   bot.on('ready', (data) => {
     connected = true;
@@ -152,6 +227,7 @@ export async function runConnection({ account, abortSignal, onInbound, exitDeps,
     isConnected: () => connected,
     restart: () => bot.stop(),
     takeRestartSlot,
+    lastConnectedAt: () => Math.max(lastReadyAt ?? 0, lastResumedAt ?? 0),
     log,
     intervalMs: probeIntervalMs,
   });
@@ -172,7 +248,7 @@ export async function runConnection({ account, abortSignal, onInbound, exitDeps,
         if (abortSignal.aborted) return;
         failures += 1;
         log('connection_start_failed', { attempt: failures, code: typeof err?.code === 'string' ? err.code.slice(0, 64) : null });
-        if (failures === ALERT_AFTER_FAILURES) onAlert('connection_failing', { count: failures });
+        if (failures === ALERT_AFTER_FAILURES) raiseAlert('connection_failing', { count: failures });
         const delay = RESTART_DELAYS_MS[Math.min(failures - 1, RESTART_DELAYS_MS.length - 1)];
         await sleepUntilAborted(delay, abortSignal);
       }

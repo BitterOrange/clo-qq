@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { PROBE_FAILS_TO_SUSPECT } from '../../src/clo-plugin/lib/channels/qq/connection.js';
+import { DOWN_ALERT_AFTER_MS, PROBE_FAILS_TO_SUSPECT } from '../../src/clo-plugin/lib/channels/qq/connection.js';
 import { buildPlan } from '../../src/tools/q5-probe.mjs';
 import { makeRoot, ROOT } from './_cli-helper.mjs';
 
@@ -321,6 +321,70 @@ test('the path limit is stated with how it was measured', () => {
 
 test('DECISIONS says what CLAUDE.md is', () => {
   assert.match(read('DECISIONS.md'), /`CLAUDE\.md` 是当前的任务书，已从最初的微信任务书改写为 QQ 版/);
+});
+
+test('the decisions made on 2026-11-05 are described as built, in simulation only, and the design says the same', () => {
+  const DECISIONS = read('DECISIONS.md');
+  const DESIGN = read('docs/group-chat-design.md');
+  const section = DECISIONS.slice(DECISIONS.indexOf('## 用户定的'), DECISIONS.indexOf('第一次提交之前要做的'));
+  assert.match(section, /第一批修复实现了这四条/);
+  assert.match(section, /都只在模拟环境验证过/);
+  assert.match(section, /真实 QQ 和真实模型没有测/);
+  assert.match(DEPLOYMENT, /## 第一批修复[^\n]*\n\n[^\n]*\*\*都只在模拟环境验证过\*\*/);
+  assertGone(DEPLOYMENT, ['里有几条决定还没有实现'], 'DEPLOYMENT');
+  assertGone(README, ['这个字段现在只用来显示'], 'README');
+  assertGone(DESIGN, ['undecided in `DECISIONS.md`', 'D3 is pending', '`localNumbers` empty, or `numbersVerifiedOn` set', '`crisis.localNumbers` without `numbersVerifiedOn`', 'counted per group, not per sender'], 'design');
+  const g11 = DESIGN.split('\n').find((l) => l.startsWith('| `at`, `reply_bot` |'));
+  assert.match(g11, /`crisis_route`.*`crisis:true`.*`crisis_refused`/);
+  const g4 = DESIGN.split('\n').find((l) => l.startsWith('| 4 | G4 command'));
+  assert.match(g4, /Other slash text is plain text.*for the owner too/);
+  assert.match(DESIGN, /`no_reply`\)/);
+  assert.match(DESIGN, /exit stopped, deadline, owner `\/stop`/);
+});
+
+test('the decisions made on 2026-11-06 are recorded as built in simulation only, and their open items are gone', () => {
+  const DECISIONS = read('DECISIONS.md');
+  const DESIGN = read('docs/group-chat-design.md');
+  const CLAUDE = read('CLAUDE.md');
+  const section = DECISIONS.slice(DECISIONS.indexOf('## 用户定的（2026-11-06）'), DECISIONS.indexOf('## 第一批修复时选的数值和行为'));
+  assert.ok(section.length > 0, 'positive control: the section was found');
+  assert.match(section, /只在模拟环境验证过/);
+  assert.match(section, /`owner_stop`/);
+  assert.match(section, /`usage_missing`/);
+  assertGone(DEPLOYMENT, ['正在跑的危险回合被 `/stop` 中止，** 结束为 `failed:aborted`，没有求助句', '`failed:aborted` 可能跟在已发出的段落后面'], 'DEPLOYMENT');
+  assertGone(CLAUDE, ['决定了但还没有实现', '这条还没有实现'], 'CLAUDE.md');
+  assertGone(DESIGN, ['If that decision says no crisis, the name line gets no reply'], 'design');
+  assert.match(DESIGN, /ends `merged` if that turn said something; a turn that said nothing does not absorb it/);
+  assert.match(DESIGN, /{ exemptFromCap: true }/);
+  const open = DEPLOYMENT.slice(DEPLOYMENT.indexOf('## 进真实群前要修'), DEPLOYMENT.indexOf('## 第一批修复'));
+  assert.match(open, /`crisis_refused` 和 `crisis_dropped_on_stop`.*草稿没有改/, 'the notice wording stays open for the user');
+  assert.match(README, /这两种告警都明写了 crisis/);
+});
+
+test('the political-topic row records all three narrowings the task book names', () => {
+  const row = read('DECISIONS.md').split('\n').find((l) => l.startsWith('| 政治话题'));
+  for (const section of ['§7.2', '§7.3', '§7.4']) assert.ok(row.includes(section), section);
+});
+
+test('the numbers chosen during the fix are recorded as they are in the code, and as unconfirmed', () => {
+  const DECISIONS = read('DECISIONS.md');
+  const section = DECISIONS.slice(DECISIONS.indexOf('## 第一批修复时选的数值和行为'), DECISIONS.indexOf('## 待定'));
+  assert.match(section, /用户还没有确认/);
+  const queues = read('src/clo-plugin/lib/core/window.js');
+  const extra = Number(queues.match(/urgentExtra = (\d+)/)[1]);
+  const perSender = Number(queues.match(/urgentPerSender = (\d+)/)[1]);
+  assert.ok(section.split('\n').find((l) => l.includes('`urgentExtra`')).includes(`每群 ${extra} 个`));
+  assert.ok(section.split('\n').find((l) => l.includes('`urgentPerSender`')).includes(`每人 ${perSender} 个`));
+  assert.equal(DOWN_ALERT_AFTER_MS, 10 * 60000);
+  assert.match(section, /`DOWN_ALERT_AFTER_MS`.*10 分钟/);
+});
+
+test('fixed gaps have left the open lists, and what still awaits a decision stays there', () => {
+  assertGone(DEPLOYMENT, ['危险窗口的名额按群算', '`/stop` 的记录只在内存里', '解除一次暂停，余额探测的 24 小时就重新算', '假的 `crisis_queue_full`。读代码得出'], 'DEPLOYMENT');
+  const open = DEPLOYMENT.slice(DEPLOYMENT.indexOf('## 还没解决，要部署者决定'), DEPLOYMENT.indexOf('## 已知的小缺口'));
+  for (const item of ['判定失败', '`crisis_route` 不管熔断', '`residual` 没有 owner 放行办法', '余额探测的 24 小时', '要不要插队', '预留和预算还没有按']) assert.ok(open.includes(item), item);
+  assert.match(DEPLOYMENT, /\*\*事件日志不轮转：\*\*/);
+  assert.match(DEPLOYMENT, /\*\*优雅停机：\*\* 没有/);
 });
 
 // These cross into files other copies own. They fail until the docs are merged with the code and templates they

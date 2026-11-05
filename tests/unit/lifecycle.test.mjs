@@ -2,13 +2,13 @@
 // Gateway against loopback mocks. Nothing here can reach QQ or OpenRouter; other Node processes must survive.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { digestOf, duplicateEnvNames, duplicateLinesHint, gatewayEnv, inspectGateway, lookupProcess, oldLinesHint, parseEnvFile, processInfo, readPidRecord, renamedEnvNames, startGateway } from '../../src/cli/lifecycle.mjs';
+import { digestOf, duplicateEnvNames, duplicateLinesHint, gatewayEnv, inspectGateway, lookupProcess, oldLinesHint, parseEnvFile, inspectStartLock, processInfo, readPidRecord, renamedEnvNames, startGateway, startLockFile, stopGateway, withStartLock } from '../../src/cli/lifecycle.mjs';
 import { makeContext } from '../../src/cli/common.mjs';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { APP_ID, baseConfig, clo, configOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, NODE, readJson, ROOT, testEnv, withDb } from './_cli-helper.mjs';
@@ -603,4 +603,220 @@ test('the Gateway is started with the output filter loaded', { timeout: 60000 },
   const rec = readJson(pidFileOf(s.root));
   assert.match(processInfo(rec.pid).commandLine, /host-output-filter\.mjs/);
   assert.equal((await s.run(['stop'])).code, 0);
+});
+
+// Lock tests use a bare context: the lock needs only the PID file's folder, the env and a clock.
+function lockCtx(label) {
+  const dir = mkdtempSync(join(tmpdir(), `clo-lock-${label}-`));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  return { paths: { pidFile: join(dir, 'pids', 'gateway.json') }, env: process.env, now: Date.now };
+}
+function placeLock(ctx, text) {
+  mkdirSync(dirname(startLockFile(ctx.paths)), { recursive: true });
+  writeFileSync(startLockFile(ctx.paths), text);
+}
+const SELF_FOUND = { outcome: 'found', info: { startTime: 'self-start', commandLine: 'x' } };
+async function endedPid() {
+  const gone = spawn(NODE, ['-e', ''], { cwd: tmpdir(), env: cleanChildEnv(), stdio: 'ignore', windowsHide: true });
+  await new Promise((res) => gone.on('exit', res));
+  return gone.pid;
+}
+
+test('a process whose command line the OS withholds is unknown: the record stays and nothing is signalled', { timeout: 90000 }, async () => {
+  const s = await stack('cmdline');
+  const ctx = makeContext({ env: testEnv(s.root), stdout: { write() {} }, stderr: { write() {} } });
+  // The System process is the one every caller can see only partly: a start time and no command line.
+  const info = processInfo(4);
+  assert.ok(info?.startTime, 'positive control: the start time is readable');
+  assert.equal(info.commandLine, null, 'positive control: the command line is withheld');
+  mkdirSync(dirname(pidFileOf(s.root)), { recursive: true });
+
+  writeFileSync(pidFileOf(s.root), JSON.stringify({ pid: 4, startTime: info.startTime, commandDigest: 'digest-from-when-it-could-be-read' }));
+  const seen = inspectGateway(ctx.paths, ctx.env);
+  assert.equal(seen.state, 'unknown');
+  assert.equal(seen.cause, 'cmdline_unreadable');
+  const stopped = stopGateway(ctx);
+  assert.equal(stopped.reason, 'lookup_failed', 'the reason the CLI already handles');
+  assert.equal(stopped.cause, 'cmdline_unreadable');
+  assert.equal(existsSync(pidFileOf(s.root)), true, 'the record is kept');
+
+  writeFileSync(pidFileOf(s.root), JSON.stringify({ pid: 4, startTime: '2001-01-01T00:00:00.0000000Z', commandDigest: 'x' }));
+  assert.equal(inspectGateway(ctx.paths, ctx.env).state, 'mismatch', 'another start time still proves the PID changed hands');
+});
+
+test('start lock: runs fn, returns its value, holds the file meanwhile, and releases after a throw too', async () => {
+  const ctx = lockCtx('basic');
+  const lookup = () => SELF_FOUND;
+  const value = await withStartLock(ctx, async () => {
+    const rec = readJson(startLockFile(ctx.paths));
+    assert.equal(rec.pid, process.pid);
+    assert.equal(rec.startTime, 'self-start');
+    return 'done';
+  }, { lookup });
+  assert.equal(value, 'done');
+  assert.equal(existsSync(startLockFile(ctx.paths)), false);
+  await assert.rejects(withStartLock(ctx, async () => { throw new Error('inner'); }, { lookup }), /inner/);
+  assert.equal(existsSync(startLockFile(ctx.paths)), false);
+});
+
+test('start lock: a second caller is refused and its fn never runs', async () => {
+  const ctx = lockCtx('second');
+  const lookup = () => SELF_FOUND;
+  let ran = false;
+  await withStartLock(ctx, async () => {
+    await assert.rejects(withStartLock(ctx, async () => { ran = true; }, { lookup }), /另一个 clo start 正在运行/);
+    assert.equal(inspectStartLock(ctx, { lookup }).state, 'held');
+    assert.equal(existsSync(startLockFile(ctx.paths)), true, 'the refused caller leaves the lock alone');
+  }, { lookup });
+  assert.equal(ran, false);
+  assert.equal(inspectStartLock(ctx, { lookup }).state, 'free');
+});
+
+test('start lock: only a provable end frees it: a gone or reused PID does, an unknown or unreadable holder does not', { timeout: 60000 }, async () => {
+  const ctx = lockCtx('stale');
+  let ran = 0;
+  const enter = async () => { ran += 1; };
+
+  // The real lookup, on a process that really ended.
+  placeLock(ctx, JSON.stringify({ pid: await endedPid(), startTime: 'x' }));
+  assert.equal(inspectStartLock(ctx).state, 'stale');
+  await withStartLock(ctx, enter);
+  assert.equal(ran, 1);
+
+  // The real lookup, on a live process with another start time: its PID was reused, and it is left alive.
+  const other = bystander();
+  await until(() => alive(other.pid), 'bystander');
+  placeLock(ctx, JSON.stringify({ pid: other.pid, startTime: '2001-01-01T00:00:00.0000000Z' }));
+  await withStartLock(ctx, enter);
+  assert.equal(ran, 2);
+  assert.equal(alive(other.pid), true);
+
+  // The same process, its start time matching: held.
+  placeLock(ctx, JSON.stringify({ pid: other.pid, startTime: processInfo(other.pid).startTime }));
+  await assert.rejects(withStartLock(ctx, enter), /另一个 clo start 正在运行/);
+
+  // No start time on record, so a live PID proves nothing.
+  placeLock(ctx, JSON.stringify({ pid: other.pid, startTime: null }));
+  await assert.rejects(withStartLock(ctx, enter), /另一个 clo start 正在运行/);
+
+  // A lookup that failed says nothing about the holder.
+  placeLock(ctx, JSON.stringify({ pid: other.pid, startTime: 'x' }));
+  await assert.rejects(withStartLock(ctx, enter, { lookup: () => ({ outcome: 'unknown' }) }), /查不到持有启动锁/);
+  assert.equal(existsSync(startLockFile(ctx.paths)), true);
+
+  // A holder may be between creating the file and writing it.
+  for (const text of ['', 'garbage', '{"pid":"x"}']) {
+    placeLock(ctx, text);
+    await assert.rejects(withStartLock(ctx, enter, { lookup: () => SELF_FOUND }), /启动锁读不出内容/);
+    assert.equal(readFileSync(startLockFile(ctx.paths), 'utf8'), text);
+  }
+  assert.equal(ran, 2);
+});
+
+test('start lock: a lock that changed after it was judged stale is not removed', async () => {
+  const ctx = lockCtx('reclaimrace');
+  const fresh = JSON.stringify({ pid: 222, startTime: 'fresh' });
+  placeLock(ctx, JSON.stringify({ pid: 111, startTime: 'old' }));
+  let swapped = false;
+  const lookup = (pid) => {
+    if (pid === process.pid) return SELF_FOUND;
+    if (pid === 111) {
+      // The other start has just reclaimed the same stale lock and taken it.
+      if (!swapped) { swapped = true; placeLock(ctx, fresh); }
+      return { outcome: 'gone' };
+    }
+    return { outcome: 'found', info: { startTime: 'fresh', commandLine: 'x' } };
+  };
+  let ran = false;
+  await assert.rejects(withStartLock(ctx, async () => { ran = true; }, { lookup }), /另一个 clo start 正在运行/);
+  assert.equal(ran, false);
+  assert.equal(readFileSync(startLockFile(ctx.paths), 'utf8'), fresh);
+  assert.equal(existsSync(`${startLockFile(ctx.paths)}.reclaim`), false);
+});
+
+test('start lock: release leaves a lock that is no longer its own', async () => {
+  const ctx = lockCtx('release');
+  const other = JSON.stringify({ pid: 222, startTime: 'other' });
+  await withStartLock(ctx, async () => { placeLock(ctx, other); }, { lookup: () => SELF_FOUND });
+  assert.equal(readFileSync(startLockFile(ctx.paths), 'utf8'), other);
+});
+
+test('start lock across real processes: one wins, the rest are refused, and a killed holder can be reclaimed', { timeout: 120000 }, async () => {
+  const ctx = lockCtx('procs');
+  const dir = dirname(dirname(startLockFile(ctx.paths)));
+  const lifecycleUrl = new URL('../../src/cli/lifecycle.mjs', import.meta.url).href;
+  const script = `
+    import { existsSync, writeFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    import { withStartLock } from ${JSON.stringify(lifecycleUrl)};
+    const dir = process.argv[1];
+    const ctx = { paths: { pidFile: join(dir, 'pids', 'gateway.json') }, env: process.env, now: Date.now };
+    try {
+      await withStartLock(ctx, async () => {
+        writeFileSync(join(dir, 'winner-' + process.pid), '');
+        while (!existsSync(join(dir, 'release'))) await new Promise((r) => { setTimeout(r, 50); });
+      });
+    } catch (e) {
+      console.log(e.message);
+      process.exit(3);
+    }
+  `;
+  const contender = () => {
+    const child = spawn(NODE, ['--input-type=module', '-e', script, dir], { cwd: tmpdir(), env: cleanChildEnv(), stdio: ['ignore', 'pipe', 'inherit'], windowsHide: true });
+    cleanups.push(() => child.kill());
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    const exit = new Promise((res) => { child.on('exit', (code) => res({ code, out: () => out })); });
+    return { child, exit };
+  };
+  const winners = () => readdirSync(dir).filter((n) => n.startsWith('winner-'));
+
+  const all = [contender(), contender(), contender()];
+  await until(() => winners().length > 0, 'a winner', 60000);
+  const winnerPid = Number(winners()[0].slice('winner-'.length));
+  const losers = all.filter((c) => c.child.pid !== winnerPid);
+  assert.equal(losers.length, 2);
+  for (const l of losers) {
+    const { code, out } = await l.exit;
+    assert.equal(code, 3);
+    assert.match(out(), /另一个 clo start 正在运行/);
+  }
+  assert.equal(winners().length, 1);
+
+  // The holder dies without releasing. The next one proves that and takes over.
+  all.find((c) => c.child.pid === winnerPid).child.kill();
+  await all.find((c) => c.child.pid === winnerPid).exit;
+  assert.equal(existsSync(startLockFile(ctx.paths)), true);
+  const next = contender();
+  await until(() => winners().length === 2, 'the next start to take over', 60000);
+  writeFileSync(join(dir, 'release'), '');
+  assert.equal((await next.exit).code, 0);
+  assert.equal(existsSync(startLockFile(ctx.paths)), false);
+});
+
+// Registered before anything is asserted, so a failing run still ends both processes and the test file can exit.
+async function cleanUpStandIn(root) {
+  const { pid, childPid } = await fakeInfo(root);
+  for (const p of [childPid, pid]) cleanups.push(() => spawnSync('taskkill', ['/PID', String(p), '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true }));
+  return pid;
+}
+
+test('start ends what it spawned when the PID file cannot be written, and reports it', { timeout: 60000 }, async () => {
+  const s = await stack('pidwrite');
+  const ctx = makeContext({ env: { ...testEnv(s.root), ...s.env }, stdout: { write() {} }, stderr: { write() {} } });
+  mkdirSync(pidFileOf(s.root), { recursive: true }); // A folder in its place, so the final rename fails.
+  const failure = await startGateway(ctx, configOf(s.root), { secrets: {} }).then(() => null, (e) => e);
+  const pid = await cleanUpStandIn(s.root);
+  assert.match(String(failure?.message), /写不进 PID 文件.*已结束刚启动的进程/);
+  await until(() => !alive(pid), 'the stand-in to be gone');
+});
+
+test('start treats a lookup with no command line as no information: it ends the child and writes no record', { timeout: 60000 }, async () => {
+  const s = await stack('startnocmd');
+  const ctx = makeContext({ env: { ...testEnv(s.root), ...s.env }, stdout: { write() {} }, stderr: { write() {} } });
+  const failure = await startGateway(ctx, configOf(s.root), { secrets: {}, lookup: () => ({ startTime: 'x', commandLine: null }) }).then(() => null, (e) => e);
+  const pid = await cleanUpStandIn(s.root);
+  assert.match(String(failure?.message), /已结束刚启动的进程/);
+  assert.equal(existsSync(pidFileOf(s.root)), false);
+  await until(() => !alive(pid), 'the stand-in to be gone');
 });

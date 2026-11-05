@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buildEffective, ConfigError, createEffectiveReader, livePreconditions, loadBusinessConfig, OPENROUTER_BASE_URL, resolvePaths, validateBusinessConfig } from '../../src/clo-plugin/lib/core/config.js';
+import { buildEffective, ConfigError, createEffectiveReader, liveConfigProblems, livePreconditions, loadBusinessConfig, OPENROUTER_BASE_URL, resolvePaths, validateBusinessConfig } from '../../src/clo-plugin/lib/core/config.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
@@ -89,7 +89,16 @@ test('rejected always', () => {
     ['qq.apiBaseUrl', (c) => { c.qq.apiBaseUrl = 'http://127.0.0.1:9'; }],
     ['qq.tokenBaseUrl', (c) => { c.qq.tokenBaseUrl = 'https://bots.qq.com'; }],
     ['openrouter.baseUrl', (c) => { c.openrouter = { baseUrl: 'http://127.0.0.1:9' }; }],
-    ['contentPolicy.crisis.numbersVerifiedOn', (c) => { c.contentPolicy.crisis.localNumbers = '110'; }],
+    ['contentPolicy.crisis.localNumbers', (c) => { c.contentPolicy.crisis.localNumbers = '110'; }],
+    ['contentPolicy.crisis.localNumbers', (c) => { c.contentPolicy.crisis.localNumbers = '110'; c.contentPolicy.crisis.numbersVerifiedOn = 'a date'; }],
+    ['contentPolicy.crisis.localNumbers', (c) => { c.contentPolicy.crisis.localNumbers = 110; }],
+    ['contentPolicy.crisis.localNumbers', (c) => { c.contentPolicy.crisis.localNumbers = '  '; }],
+    ['retention.reservationDays', (c) => { c.retention.reservationDays = 30; }],
+    ['budget.maxOutputUsdPerMtok', (c) => { c.budget.maxOutputUsdPerMtok = 0; }],
+    ['budget.maxOutputUsdPerMtok', (c) => { c.budget.maxOutputUsdPerMtok = null; }],
+    ['budget.maxOutputUsdPerMtok', (c) => { c.budget.maxOutputUsdPerMtok = '50'; }],
+    ['claudeModel.cacheRetention', (c) => { c.claudeModel.cacheRetention = 'long'; }],
+    ['claudeModel.cacheRetention', (c) => { c.claudeModel.cacheRetention = null; }],
     ['quietHours.timezone', (c) => { c.quietHours.timezone = 'UTC'; }],
     ['quietHours', (c) => { c.quietHours.start = '25:00'; }],
     ['budget', (c) => { c.budget.addressedUsd = 3; }],
@@ -114,6 +123,23 @@ test('rejected always', () => {
     const cfg = sample();
     mutate(cfg);
     assert.ok(errorsOf(cfg).includes(path), `expected an error at ${path}, got ${errorsOf(cfg)}`);
+  }
+});
+
+test('accepted at the edges of the newer rules', () => {
+  const cases = [
+    (c) => { c.retention.reservationDays = 31; },
+    (c) => { c.budget.maxOutputUsdPerMtok = 50; },
+    (c) => { delete c.budget.maxOutputUsdPerMtok; },
+    (c) => { c.claudeModel.cacheRetention = 'short'; },
+    (c) => { delete c.claudeModel.cacheRetention; },
+    (c) => { c.contentPolicy.crisis.localNumbers = ''; },
+    (c) => { delete c.contentPolicy.crisis.localNumbers; },
+  ];
+  for (const mutate of cases) {
+    const cfg = sample();
+    mutate(cfg);
+    assert.deepEqual(errorsOf(cfg), [], String(mutate));
   }
 });
 
@@ -240,7 +266,9 @@ test('live preconditions: each code fails on its own', () => {
     q0: [(c) => { c.acks.q0Recorded = false; }],
     d3: [(c) => { c.acks.d3 = '   '; }],
     policy: [null, (f) => { f.policyOk = false; }],
-    numbers: [(c) => { c.contentPolicy.crisis.localNumbers = '110'; c.contentPolicy.crisis.numbersVerifiedOn = ''; }],
+    numbers: [(c) => { c.contentPolicy.crisis.localNumbers = '110'; c.contentPolicy.crisis.numbersVerifiedOn = 'a date'; }],
+    key_limit: [(c) => { c.budget.keyDailyLimitUsd = 1.6; }],
+    daily_hold: [null, (f) => { f.requiredHoldMicros = 2500001; }],
     doctor: [null, (f) => { f.doctorOk = false; }],
     base_urls: [(c) => { c.qq.apiBaseUrl = 'http://127.0.0.1:9'; }],
     no_paid_pause: [null, (f) => { f.paidPaused = 'residual'; }],
@@ -275,6 +303,76 @@ test('live preconditions: the finer cases', () => {
   empty.qq.allowedGroupIds = [];
   empty.qq.groups = {};
   assert.deepEqual(livePreconditions(empty, goodFacts()).failed.sort(), ['notice', 'targets']);
+});
+
+const atUsd = (usd) => {
+  const c = goodCfg();
+  Object.assign(c.budget, { dailyUsd: usd, interjectUsd: usd, searchUsd: usd, namedUsd: usd, addressedUsd: usd, keyDailyLimitUsd: usd });
+  return c;
+};
+
+test('key_limit: the declared limit must be the real one, and a limit below the local budget is fine', () => {
+  const low = goodCfg();
+  low.budget.keyDailyLimitUsd = 1.6;
+  assert.deepEqual(livePreconditions(low, { ...goodFacts(), key: { limitMicros: 1600000, limitReset: 'daily' } }), { ok: true, failed: [] });
+  assert.equal(validateBusinessConfig(low, { env: {} }).warnings.length, 0);
+  for (const limitMicros of [1599999, 1600001, 3250000]) {
+    assert.deepEqual(livePreconditions(low, { ...goodFacts(), key: { limitMicros, limitReset: 'daily' } }).failed, ['key_limit'], String(limitMicros));
+  }
+});
+
+test('key_limit: compared in whole micros, since 2.01 * 1e6 falls just short of 2010000', () => {
+  assert.deepEqual(livePreconditions(atUsd(2.01), { ...goodFacts(), key: { limitMicros: 2010000, limitReset: 'daily' } }).failed, []);
+});
+
+test('key_limit: only key_readable speaks when there is no daily limit to compare', () => {
+  for (const key of [null, undefined, { limitMicros: null, limitReset: 'daily' }, { limitMicros: 1, limitReset: 'monthly' }]) {
+    assert.deepEqual(livePreconditions(goodCfg(), { ...goodFacts(), key }).failed, ['key_readable'], JSON.stringify(key));
+  }
+});
+
+test('key_limit: a config that declares no limit has nothing to compare', () => {
+  const cfg = goodCfg();
+  delete cfg.budget.keyDailyLimitUsd;
+  assert.deepEqual(livePreconditions(cfg, goodFacts()).failed, []);
+});
+
+test('daily_hold: the daily budget must cover one required hold, once that hold is known', () => {
+  for (const requiredHoldMicros of [undefined, null, 1, 2500000]) {
+    assert.deepEqual(livePreconditions(goodCfg(), { ...goodFacts(), requiredHoldMicros }).failed, [], String(requiredHoldMicros));
+  }
+  for (const requiredHoldMicros of [2500001, Number.NaN, Number.POSITIVE_INFINITY, '1']) {
+    assert.deepEqual(livePreconditions(goodCfg(), { ...goodFacts(), requiredHoldMicros }).failed, ['daily_hold'], String(requiredHoldMicros));
+  }
+});
+
+test('daily_hold: compared in whole micros, since 2.01 * 1e6 falls just short of 2010000', () => {
+  const key = { limitMicros: 2010000, limitReset: 'daily' };
+  assert.deepEqual(livePreconditions(atUsd(2.01), { ...goodFacts(), key, requiredHoldMicros: 2010000 }).failed, []);
+  assert.deepEqual(livePreconditions(atUsd(2.01), { ...goodFacts(), key, requiredHoldMicros: 2010001 }).failed, ['daily_hold']);
+});
+
+test('a hand edit while live: the budget and the content policy count as config problems', () => {
+  assert.deepEqual(liveConfigProblems(goodCfg()), []);
+  const cases = {
+    budget: [
+      (c) => { c.budget = { dailyUsd: 0, interjectUsd: 0, searchUsd: 0, namedUsd: 0, addressedUsd: 0 }; },
+      (c) => { c.budget.interjectUsd = 2.4; },
+      (c) => { delete c.budget; },
+    ],
+    policy: [
+      (c) => { c.contentPolicy.enabled = false; },
+      (c) => { delete c.contentPolicy; },
+    ],
+  };
+  for (const [code, mutations] of Object.entries(cases)) {
+    for (const mutate of mutations) {
+      const cfg = goodCfg();
+      mutate(cfg);
+      assert.deepEqual(liveConfigProblems(cfg), [code], String(mutate));
+      assert.deepEqual(livePreconditions(cfg, goodFacts()).failed, [code], String(mutate));
+    }
+  }
 });
 
 test('nothing passes on empty facts, and the shipped defaults are not ready for live: D3 is pending', () => {

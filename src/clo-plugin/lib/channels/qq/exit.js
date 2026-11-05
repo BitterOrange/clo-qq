@@ -4,10 +4,12 @@ import { createHash } from 'node:crypto';
 import { loadFixedLines } from '../../core/contentPolicy.js';
 import { crashpoint, hourBucket, shanghaiDay } from '../../core/ids.js';
 import { refShape } from '../../core/log.js';
-import { isHostNotice, withoutHostNotices } from './hostNotices.js';
-import { clipToSentence, removeUrls, shapeForQq, splitParts } from './text.js';
+import { isHostNotice, noticeLogReason, withoutHostNotices } from './hostNotices.js';
+import { checkFormForQq, clipToSentence, removeUrls, shapeForQq, splitParts } from './text.js';
 
-const SILENT = /^\s*(NO_REPLY|HEARTBEAT_OK|ANNOUNCE_SKIP|REPLY_SKIP)\s*$/i;
+// The token alone, whatever punctuation or symbols wrap it. The host swallows some wrapped forms and not others,
+// and shaping can reveal one from inside backticks, tildes or a code block.
+const SILENT = /^[\s\p{P}\p{S}]*(?:NO_REPLY|HEARTBEAT_OK|ANNOUNCE_SKIP|REPLY_SKIP)[\s\p{P}\p{S}]*$/iu;
 const PASSIVE_WINDOW_MS = 285000;
 const HOUR = 3600000;
 const VIOLATIONS_TO_LATCH = 2;
@@ -26,6 +28,8 @@ const CODES_DM = new Set([40034105, 40034100, 40054013]);
 const SEND_CONNECT_ATTEMPTS = 4;
 const PROBE_CONNECT_ATTEMPTS = 3;
 const CONNECT_RETRY_DELAY_MS = 1000;
+// How soon a wait for send-rate room notices that the owner stopped the turn.
+const WAKE_POLL_MS = 250;
 
 // The SDK keeps no error object, only the cause's text, so this reads that text. It lists failures that happen before
 // any byte of the request can leave: the socket never connected, or the token needed for the request was never fetched.
@@ -66,6 +70,7 @@ export function classifySendError(err) {
 
 export function createExit({ bot, store, policy, getEffective, secrets = [], log = () => {}, now = Date.now, appId = null, sleep = realSleep }) {
   const turns = new Map();
+  const wakers = new Set();
   let stopped = false;
   let lines = null;
   let linesFile = null;
@@ -107,19 +112,40 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
     }
   }
 
-  // A retry can come many seconds after the checks that let this part out, so the hard stops are read again.
-  function mayRetrySend(ref, pausable) {
-    if (stopped || now() >= endOfWindow(ref)) return false;
-    const eff = getEffective();
-    if (eff?.mode !== 'live' || store.getControl('terminal_close') !== null || !accountOk(eff) || !groupOf(eff, ref.groupId)) return false;
-    if (!pausable) return true;
-    const p = store.pauseState(ref.groupKey);
-    return !p.global && !p.group;
+  // A wait the exit can cut short: stop() ends it at once, and wake() is polled, because nothing tells the exit about a /stop.
+  function sleepUnless(ms, wake = () => false) {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearInterval(poll);
+        wakers.delete(done);
+        resolve();
+      };
+      const poll = setInterval(() => {
+        if (wake()) done();
+      }, WAKE_POLL_MS);
+      poll.unref?.();
+      wakers.add(done);
+      Promise.resolve(sleep(ms)).then(done, done);
+    });
   }
+
+  // What stops a send right now, or null. A retry or a later part can come many seconds after the checks that let
+  // the reply out, so these are read again.
+  function hardStop(ref, pausable) {
+    if (stopped) return 'exit_refused';
+    if (now() >= endOfWindow(ref)) return 'deadline';
+    const eff = getEffective();
+    if (eff?.mode !== 'live' || store.getControl('terminal_close') !== null || !accountOk(eff) || !groupOf(eff, ref.groupId)) return 'exit_refused';
+    if (!pausable) return null;
+    const p = store.pauseState(ref.groupKey);
+    return p.global || p.group ? 'paused' : null;
+  }
+
+  const mayRetrySend = (ref, pausable) => hardStop(ref, pausable) === null;
 
   // One logical POST: durable before and after. Returns what the send table says should happen next. It is posted again,
   // with the same msg_seq, only after an error that shows the earlier attempt never left this machine.
-  async function postPart(ref, row, content, { pausable = true, connectAttempts = SEND_CONNECT_ATTEMPTS } = {}) {
+  async function postPart(ref, row, content, { pausable = true, connectAttempts = SEND_CONNECT_ATTEMPTS, ownerStopped = () => false } = {}) {
     crashpoint('before_post');
     store.markSend(row.sendId, 'sending');
     const path = `/v2/groups/${encodeURIComponent(ref.groupId)}/messages`;
@@ -136,8 +162,12 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
           return { ok: false, ...resolveFailure(ref, row, content, qqCode, httpStatus) };
         }
         log('exit_post', { eventKey: ref.eventKey, seq: row.msgSeq, part: row.part, attempt, state: 'not_connected' });
-        const again = attempt < connectAttempts && mayRetrySend(ref, pausable);
+        const again = attempt < connectAttempts && mayRetrySend(ref, pausable) && !ownerStopped();
         if (again) await sleep(CONNECT_RETRY_DELAY_MS);
+        if (ownerStopped()) {
+          store.markSend(row.sendId, 'failed', { qqCode, httpStatus });
+          return { ok: false, action: 'stop', reason: 'aborted' };
+        }
         if (!again || !mayRetrySend(ref, pausable)) {
           store.markSend(row.sendId, 'failed', { qqCode, httpStatus });
           alertOnce('send_not_connected', ref);
@@ -220,10 +250,11 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
     });
   }
 
-  // The hourly limit is spent last, only when the line would otherwise go out.
-  function takeFailureLineSlot(ref, eff) {
-    const bucket = hourBucket(now());
-    return store.bumpCounter(`failline:${ref.groupKey}:${bucket}`, (bucket + 2) * HOUR, eff.limits.failureLinePerGroupPerHour).ok;
+  const failureLineKey = (ref) => `failline:${ref.groupKey}:${hourBucket(now())}`;
+
+  // The hourly limit is spent last, once the line has its send row.
+  function spendFailureLineSlot(ref, eff) {
+    store.bumpCounter(failureLineKey(ref), (hourBucket(now()) + 2) * HOUR, eff.limits.failureLinePerGroupPerHour);
   }
 
   // Sends a fixed line or an ack. One part. It applies its own checks and never touches the event row.
@@ -247,33 +278,43 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
       hit = true;
     }
     if (hit) return { sent: false, reason: 'policy' };
-    if (limited && !takeFailureLineSlot(ref, eff)) return { sent: false, reason: 'failline_rate' };
+    if (limited && store.peekCounter(failureLineKey(ref)) >= eff.limits.failureLinePerGroupPerHour) return { sent: false, reason: 'failline_rate' };
     const inserted = insertParts(ref, kind, [text], eff);
     if (!inserted.ok) {
       log('exit_drop', { eventKey: ref.eventKey, reason: inserted.reason, kind });
       return { sent: false, reason: 'send_rate' };
     }
+    if (limited) spendFailureLineSlot(ref, eff);
     const result = await postPart(ref, inserted.rows[0], text, { pausable });
     return { sent: result.ok === true || result.action === 'continue', reason: result.reason ?? null };
+  }
+
+  // A line that must not be lost to a full minute waits for room once, inside the passive window. Every check runs
+  // again when it is sent.
+  async function sendWaitingOnce(ref, line, why) {
+    const first = await sendOneLine(ref, line);
+    if (first.reason !== 'send_rate') return first;
+    const eff = getEffective();
+    if (!eff) return first;
+    const waitMs = store.sendWaitMs({ groupKey: ref.groupKey, need: 1, rate: rateOf(eff), now: now() });
+    if (!Number.isFinite(waitMs) || now() + waitMs >= endOfWindow(ref)) return first;
+    log('exit_wait', { eventKey: ref.eventKey, groupKey: ref.groupKey, reason: why, durationMs: waitMs });
+    await sleepUnless(waitMs);
+    return sendOneLine(ref, line);
   }
 
   // The ack is the group's only word that a command took, and /stop tends to come in a burst, when the rate is full.
   // It waits for room once. If it still cannot go out, the operator hears of it.
   async function sendAck(ref, text) {
-    const line = { kind: 'command_ack', text, pausable: false };
-    let ack = await sendOneLine(ref, line);
-    if (ack.reason !== 'send_rate') return ack;
-    const waitMs = store.sendWaitMs({ groupKey: ref.groupKey, need: 1, rate: rateOf(getEffective()), now: now() });
-    if (Number.isFinite(waitMs) && now() + waitMs < endOfWindow(ref)) {
-      log('exit_wait', { eventKey: ref.eventKey, groupKey: ref.groupKey, reason: 'command_ack', durationMs: waitMs });
-      await sleep(waitMs);
-      ack = await sendOneLine(ref, line);
-    }
+    const ack = await sendWaitingOnce(ref, { kind: 'command_ack', text, pausable: false }, 'command_ack');
     if (ack.reason === 'send_rate') alertOnce('command_ack_refused', ref);
     return ack;
   }
 
-  async function sendFixed(ref, lineKey) {
+  // exemptFromCap is for one case, decided by the gate: the failure line after /stop aborts a running turn for a person in danger.
+  // That line comes right behind the stop ack, often in a full minute, so it also waits for room once. Whether it went
+  // out is the gate's to report.
+  async function sendFixed(ref, lineKey, { exemptFromCap = false } = {}) {
     let text;
     try {
       const eff = getEffective();
@@ -284,7 +325,8 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
       return { sent: false, reason: 'fixed_line_unreadable' };
     }
     if (typeof text !== 'string' || !text) return { sent: false, reason: 'unknown_line' };
-    return sendOneLine(ref, { kind: 'fixed_line', text, pausable: true, limited: lineKey === 'modelFailed' });
+    const line = { kind: 'fixed_line', text, pausable: true, limited: lineKey === 'modelFailed' && !exemptFromCap };
+    return exemptFromCap ? sendWaitingOnce(ref, line, 'fixed_line') : sendOneLine(ref, line);
   }
 
   function refOf(turn) {
@@ -341,15 +383,21 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
     });
   }
 
+  // Waits until this many parts could fit. False when that cannot happen inside the passive window.
+  async function waitOutRate(turn, ref, need, eff, reason, ownerStopped) {
+    const waitMs = store.sendWaitMs({ groupKey: ref.groupKey, need, rate: rateOf(eff), now: now() });
+    if (!Number.isFinite(waitMs) || now() + waitMs >= turn.deadlineAt) return false;
+    log('exit_wait', { eventKey: turn.eventKey, groupKey: turn.groupKey, reason, durationMs: waitMs });
+    await sleepUnless(waitMs, ownerStopped);
+    return true;
+  }
+
   // The money for a required answer is already spent, so it waits for room inside the passive window.
   async function waitForRoom(turn, ref, parts, kind, firstEff, refused, ownerStopped) {
     let eff = firstEff;
     let inserted = refused;
     while (!inserted.ok) {
-      const waitMs = store.sendWaitMs({ groupKey: ref.groupKey, need: parts.length, rate: rateOf(eff), now: now() });
-      if (!Number.isFinite(waitMs) || now() + waitMs >= turn.deadlineAt) return inserted;
-      log('exit_wait', { eventKey: turn.eventKey, groupKey: turn.groupKey, reason: inserted.reason, durationMs: waitMs });
-      await sleep(waitMs);
+      if (!(await waitOutRate(turn, ref, parts.length, eff, inserted.reason, ownerStopped))) return inserted;
       if (stopped) return { ok: false, stop: refuse('exit_refused') };
       if (ownerStopped()) return { ok: false, stop: refuse('aborted') };
       const again = authorizeReply(turn);
@@ -360,14 +408,43 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
     return inserted;
   }
 
-  async function refuseForRate(turn, ref, reason) {
+  // Someone who asked hears that the answer failed, unless some of it has reached them or the owner stopped the turn.
+  async function tellFailedIfNothingOut(turn, ref, ownerStopped) {
+    if (!turn.required || ownerStopped()) return;
+    if (store.sendsForEvent(ref.eventKey).some((s) => s.state === 'sent' || s.state === 'uncertain')) return;
+    const fixed = await sendFixed(ref, 'modelFailed');
+    log('fixed_line', { eventKey: turn.eventKey, kind: 'modelFailed', reason: fixed.reason ?? null });
+  }
+
+  async function refuseForRate(turn, ref, reason, ownerStopped) {
     log('exit_drop', { eventKey: turn.eventKey, groupKey: turn.groupKey, reason });
     store.addAlert('send_rate', { eventKey: turn.eventKey, groupKey: turn.groupKey, reason });
-    if (turn.required) {
-      const fixed = await sendFixed(ref, 'modelFailed');
-      log('fixed_line', { eventKey: turn.eventKey, kind: 'modelFailed', reason: fixed.reason ?? null });
-    }
+    await tellFailedIfNothingOut(turn, ref, ownerStopped);
     return refuse('send_rate');
+  }
+
+  // Why the rest of this reply must not go out, or null. The deadline comes first, so a reply that ran out of time says so.
+  function partStop(turn, ref, ownerStopped) {
+    if (stopped) return refuse('exit_refused');
+    if (now() >= turn.deadlineAt) return refuse('deadline');
+    if (ownerStopped()) return refuse('aborted');
+    const why = hardStop(ref, true);
+    if (!why) return null;
+    log('exit_drop', { eventKey: turn.eventKey, groupKey: turn.groupKey, reason: why });
+    return why === 'paused' ? { state: 'paused', reason: 'paused' } : refuse(why);
+  }
+
+  // The refused row and the rows sent before it stay on the rate, so a long reply can need room it does not have yet.
+  // A required answer waits once. Whether QQ counts a refused request is not known, so the row keeps counting.
+  async function reserveResend(turn, ref, parts, ownerStopped) {
+    const before = partStop(turn, ref, ownerStopped);
+    if (before) return { ok: false, stop: before };
+    const inserted = insertParts(ref, 'reply_url_stripped', parts, getEffective());
+    if (inserted.ok || !turn.required) return inserted;
+    if (!(await waitOutRate(turn, ref, parts.length, getEffective(), inserted.reason, ownerStopped))) return inserted;
+    const after = partStop(turn, ref, ownerStopped);
+    if (after) return { ok: false, stop: after };
+    return insertParts(ref, 'reply_url_stripped', parts, getEffective());
   }
 
   // Steps 8 and 9, with one URL-free resend for 40054010.
@@ -383,20 +460,17 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
       return refuse('exit_refused');
     }
     if (inserted.stop) return inserted.stop;
-    if (!inserted.ok) return refuseForRate(turn, ref, inserted.reason);
+    if (!inserted.ok) return refuseForRate(turn, ref, inserted.reason, ownerStopped);
     let { rows } = inserted;
 
     for (let i = 0; i < parts.length; i += 1) {
-      if (stopped) {
+      const halt = partStop(turn, ref, ownerStopped);
+      if (halt) {
         abortRest(rows, i);
-        return refuse('exit_refused');
-      }
-      if (now() >= turn.deadlineAt) {
-        abortRest(rows, i);
-        return refuse('deadline');
+        return halt;
       }
       // Nobody asked for an interjection, and one that arrives 45 s late has missed the conversation.
-      const result = await postPart(ref, rows[i], parts[i], { connectAttempts: turn.required ? SEND_CONNECT_ATTEMPTS : 1 });
+      const result = await postPart(ref, rows[i], parts[i], { connectAttempts: turn.required ? SEND_CONNECT_ATTEMPTS : 1, ownerStopped });
       if (result.ok || result.action === 'continue') continue;
       abortRest(rows, i + 1);
       if (result.action === 'url_refused') {
@@ -404,11 +478,13 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
         const changed = stripped.some((p, n) => p !== parts[i + n]);
         if (urlsRemoved || !changed) {
           alertOnce('group_error', ref, { qqCode: CODE_URL_REFUSED });
+          await tellFailedIfNothingOut(turn, ref, ownerStopped);
           return refuse('group_error');
         }
         urlsRemoved = true;
-        const again = insertParts(ref, 'reply_url_stripped', stripped, eff);
-        if (!again.ok) return refuseForRate(turn, ref, again.reason);
+        const again = await reserveResend(turn, ref, stripped, ownerStopped);
+        if (again.stop) return again.stop;
+        if (!again.ok) return refuseForRate(turn, ref, again.reason, ownerStopped);
         parts = stripped;
         rows = again.rows;
         i = -1;
@@ -465,12 +541,17 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
       const kept = isHostNotice(body) ? '' : withoutHostNotices(body);
       if (kept !== body) {
         t.hostError = true;
-        log('exit_drop', { eventKey: t.turn.eventKey, reason: 'host-notice' });
+        log('exit_drop', { eventKey: t.turn.eventKey, reason: noticeLogReason(body) });
       }
       if (!kept) return suppressed('host_notice');
       t.buffer.push(kept);
       log('exit_collect', { eventKey: t.turn.eventKey, count: t.buffer.length });
       return { messageIds: [], visibleReplySent: true };
+    },
+
+    // Whether the host has handed this turn a reply that would be posted. Read-only: nothing is sent through it.
+    hasReply(turnId) {
+      return (turns.get(turnId)?.buffer.length ?? 0) > 0;
     },
 
     async finishTurn(turnId, { hostError = false, aborted = false, ownerStopped = () => false } = {}) {
@@ -491,9 +572,16 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
       if (hit.hit) return dropForPolicy(t, hit);
 
       const plain = shapeForQq(whole, turn.inboundUrls);
+      if (SILENT.test(plain)) return finishEmpty(t, failed);
       // What is posted is what counts: markup inside a phrase or number hid it from the check above.
       const shapedHit = policyHit(plain, turn, eff);
       if (shapedHit.hit) return dropForPolicy(t, shapedHit);
+      // Code keeps its characters when shaped, so markup there can still split a match. This form is never posted.
+      const checkForm = checkFormForQq(whole, turn.inboundUrls);
+      if (checkForm !== plain) {
+        const checkHit = policyHit(checkForm, turn, eff);
+        if (checkHit.hit) return dropForPolicy(t, checkHit);
+      }
 
       // One reply must fit the send rate, or it could never go out at all.
       const maxParts = Math.min(eff.qq.maxPartsGroup, eff.limits.sendGroupPerMin, eff.limits.sendAccountPerMin);
@@ -507,6 +595,8 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
     sendFixed,
 
     accountOk: () => accountOk(getEffective()),
+
+    isStopped: () => stopped,
 
     commandAck(ref, ackText) {
       return sendAck(ref, ackText);
@@ -532,6 +622,7 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
 
     stop() {
       stopped = true;
+      for (const wake of [...wakers]) wake();
     },
   };
 }

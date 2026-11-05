@@ -257,3 +257,85 @@ test('a command with no exit attached fails closed before any effect', async () 
   assert.equal(h.store.getControl(`group_paused:${h.row(e).group_key}`), null);
   await h.close();
 });
+
+// ---- slash text that is not shaped like a command ----
+
+const CRISIS = '我真的不想活了';
+const PLAIN_SLASH = ['/(ㄒoㄒ)/~~ 我不开心', '/usr/bin 是什么', '/usr/bin', '/开始 帮我看看', '/ status', '/', '//注释 是什么', '/stop了', '/stop!', '/new。', '/new,你好', '/think高 你好', '/1 是什么'];
+const SHAPED = ['/help', '/x', '/foo bar', '/usr 是什么', '/new@bot', '/help@bot 你好', '/think:high 你好', '/model x', '/think high 你好', '/a-b_c1', '/NEW 你好'];
+
+test('slash text whose first word is not shaped like a command is plain text, from a member and from an owner', async () => {
+  const h = makeHarness({ effective: makeEffective({ limits: { perSenderAddressedPerHour: 100 } }) });
+  for (const senderId of [MEMBER, OWNER]) {
+    for (const text of PLAIN_SLASH) {
+      const n = h.dispatched.length;
+      const e = await h.sendAndFlush(h.at({ text, senderId }));
+      assert.equal(h.dispatched.length, n + 1, text);
+      const t = h.dispatched.at(-1);
+      assert.equal(t.cls, 'at', text);
+      assert.equal(t.authorizedCommand, null, text);
+      assert.equal(t.text, text);
+      assert.equal(h.row(e).cls, 'at', text);
+    }
+  }
+  assert.equal(h.exit.finished.every((f) => f.aborted === false), true, 'and it stops nothing');
+  await h.close();
+});
+
+test('a first word shaped like a command stays a command that does nothing, for both, and costs nothing', async () => {
+  const h = makeHarness();
+  for (const [senderId, reason] of [[MEMBER, 'cmd_non_owner'], [OWNER, 'cmd_unknown']]) {
+    for (const text of SHAPED) {
+      const e = await h.send(cmd(h, text, senderId));
+      assert.equal(h.state(e), `ignored:${reason}`, text);
+    }
+  }
+  assert.equal(h.dispatched.length, 0);
+  assert.equal(h.exit.acks.length, 0);
+  await h.close();
+});
+
+test('the forms that hide a command from the shape still count as commands', async () => {
+  const h = makeHarness();
+  for (const text of ['／clo pause', '​/help', ' /help', '/­help']) {
+    assert.equal(h.state(await h.send(cmd(h, text, MEMBER))), 'ignored:cmd_non_owner', text);
+  }
+  assert.equal(h.dispatched.length, 0);
+  await h.close();
+});
+
+test('plain slash text that is not addressed goes the ordinary way, and is no command row', async () => {
+  const h = makeHarness();
+  const e = await h.sendAndFlush(h.event({ text: '/usr/bin 是什么东西' }));
+  assert.equal(h.decideCalls.length, 1);
+  assert.equal(h.decideCalls[0].trigger, 'ordinary');
+  assert.equal(h.row(e).cls, 'interject');
+  await h.close();
+});
+
+test('danger words after a slash word are never a command, whoever says them and whatever the word', async () => {
+  const h = makeHarness({ effective: makeEffective({ limits: { perSenderAddressedPerHour: 100 } }) });
+  for (const senderId of [MEMBER, OWNER]) {
+    for (const text of [`/(ㄒoㄒ)/~~ ${CRISIS}`, `/help ${CRISIS}`, `/think high ${CRISIS}`, `/stop ${CRISIS}`, `/clo pause ${CRISIS}`]) {
+      const n = h.dispatched.length;
+      await h.sendAndFlush(h.at({ text, senderId }));
+      assert.equal(h.dispatched.length, n + 1, text);
+      assert.equal(h.dispatched.at(-1).authorizedCommand, null, text);
+      assert.equal(h.dispatched.at(-1).cls, 'at', text);
+    }
+  }
+  assert.equal(h.store.getControl(`group_paused:${h.store.key(h.dispatched[0].groupId)}`), null);
+  assert.equal(h.exit.finished.every((f) => f.aborted === false), true);
+  await h.close();
+});
+
+test('positive control: the same words of danger with no slash, and the owner\'s real commands, are untouched', async () => {
+  const h = makeHarness();
+  await h.sendAndFlush(h.at({ text: CRISIS }));
+  assert.equal(h.dispatched.at(-1).text, CRISIS);
+  const stop = await h.send(cmd(h, '/stop'));
+  await h.gate.idle();
+  assert.equal(h.dispatched.at(-1).authorizedCommand, '/stop');
+  assert.equal(h.state(stop), 'completed:sent');
+  await h.close();
+});

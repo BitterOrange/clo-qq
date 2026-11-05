@@ -135,6 +135,24 @@ test('a hit that spans whitespace or a payload boundary is still one text', asyn
   assert.deepEqual(posts.map((p) => p.content), [LINES.policyDropped]);
 });
 
+test('markup inside code that splits a match: the check form catches it, and nothing of the text is posted', async () => {
+  for (const reply of ['`加我 约**炮**`', `\`\`\`\n${SECRET.slice(0, 8)}**${SECRET.slice(8)}**\n\`\`\``]) {
+    const h = stack();
+    h.replyText = reply;
+    const e = await h.sendAndFlush(h.at());
+    assert.equal(h.state(e).split(':')[0], 'policy_dropped', reply);
+    assert.deepEqual(h.posts.map((p) => p.body.content), [LINES.policyDropped], reply);
+  }
+});
+
+test('the check form is never what goes out: clean code keeps its stars when posted', async () => {
+  const h = stack();
+  h.replyText = '写成 `a**b**c` 就行';
+  const e = await h.sendAndFlush(h.at());
+  assert.equal(h.state(e), 'completed:sent');
+  assert.equal(h.posts[0].body.content, '写成 a**b**c 就行');
+});
+
 test('clean text in two payloads: one flush, joined, parts in order, nothing before finish', async () => {
   const posts = [];
   let duringRun = -1;

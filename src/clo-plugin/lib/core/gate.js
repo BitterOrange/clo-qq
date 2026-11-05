@@ -27,12 +27,23 @@ const REPLY_PLANS = {
   interject: { tier: 'interject', hold: 'reply_optional', required: false },
 };
 const DECISION_TIERS = { ordinary: 'interject', name: 'named', crisis_route: 'addressed' };
-const NO_OUTPUT = new Set(['host_error', 'required_no_text', 'aborted']);
+const NO_OUTPUT = new Set(['host_error', 'required_no_text', 'aborted', 'no_reply']);
+// Endings where a running turn's reply is lost to a stop: an abort, a pause, the deadline, or the exit refusing it.
+// Send errors raise alerts of their own, and content refusals keep their own rules.
+const REPLY_LOST = new Set(['aborted', 'paused', 'deadline', 'exit_refused']);
+// Send rows that reached the group, or may have.
+const MAY_BE_OUT = new Set(['sending', 'sent', 'uncertain']);
 // Classes whose line gets its own decision or turn. Plain chat normally gets neither, so it stays in others' history.
 const OWN_TURN_CLASSES = ['at', 'reply_bot', 'name', 'name_addressed'];
 // One shared reason, so a row or log line cannot be counted as a content hit (plan: no hit record).
 const STORED_REASON = { prerule: 'rule', noise: 'rule', flood: 'rule' };
 const storedReason = (reason) => STORED_REASON[reason] ?? reason;
+// A slash text is a command only if its first word looks like a command name, with or without an @bot or :value end.
+// The host hands any other slash text to the model as plain text, and a person's words can start that way.
+const COMMAND_WORD = /^\/[a-z][a-z0-9_-]*(?:[@:]\S*)?(?:\s|$)/iu;
+const commandShaped = (text) => COMMAND_WORD.test(String(text ?? '').normalize('NFKC').replace(/\p{Cf}/gu, '').trim());
+// Reasons a message in danger can leave its own path for the crisis route, which pays and counts apart.
+const CRISIS_FALLBACK = new Set(['budget', 'decision_cap']);
 const WOULD = { at: 'would_at', reply_bot: 'would_reply_bot', name: 'would_name', crisis: 'would_window', name_addressed: 'would_name', interject: 'would_window' };
 
 class Refused extends Error {
@@ -97,6 +108,13 @@ const interjectLimits = (group) => ({
   leaseMs: INTERJECT_LEASE_MS,
 });
 
+// Ordinary messages get five sixths of each decision cap, which leaves room for names. The crisis route is counted
+// against the same totals and has no cap of its own here: its own caps are the crisis ones.
+function decisionCap(trigger, cap) {
+  if (trigger === 'crisis_route') return undefined;
+  return trigger === 'ordinary' ? Math.ceil((cap * 5) / 6) : cap;
+}
+
 const hourExpiry = (at) => (hourBucket(at) + 2) * HOUR;
 const dayExpiry = (at) => at + 2 * 24 * HOUR;
 
@@ -123,30 +141,38 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
   let invalidStreak = 0;
   let arrivals = 0;
   const flights = new Map();
+  // Every model turn from its start to its very end, for the shutdown grace. Held in memory only.
+  const running = new Set();
   const ownerStops = new Map();
   const adhoc = new Set();
   const crisisSenders = new Map();
   const bypassSenders = new Map();
   const abort = new AbortController();
 
+  const contextCaps = (eff) => ({
+    maxItems: eff.retention.contextMaxItems,
+    maxAgeMs: eff.retention.contextMaxAgeHours * HOUR,
+    maxTokens: eff.retention.contextMaxTokens,
+  });
+
   function ensureRuntime(eff) {
-    if (!context) {
-      context = createContextBuffer({
-        maxItems: eff.retention.contextMaxItems,
-        maxAgeMs: eff.retention.contextMaxAgeHours * HOUR,
-        maxTokens: eff.retention.contextMaxTokens,
-      });
-    }
+    if (context) context.configure(contextCaps(eff));
+    else context = createContextBuffer(contextCaps(eff));
     if (!queues) {
       queues = createGroupQueues({
         windowMs: eff.window.windowMs,
         maxPending: eff.window.maxPending,
         maxConcurrentTurns: eff.window.maxConcurrentTurns,
-        setTimer,
+        // The queues' only timer is a window's, so a changed length applies from the next window that opens.
+        setTimer: (fn, ms) => setTimer(fn, getEffective()?.window?.windowMs ?? ms),
         clearTimer,
         onError: () => log('gate_error', { reason: 'queue_task' }),
-        onDrop: (rec) => tryQuietly(() => end(rec, 'queued', 'restart_dropped', 'restart')),
+        onDrop: (rec) => tryQuietly(() => {
+          end(rec, 'queued', 'restart_dropped', 'restart');
+          if (isCrisis(rec)) alertDropped(rec);
+        }),
         isUrgent: (records) => records.some(isCrisis),
+        urgentKey: (rec) => rec.senderKey,
       });
     }
   }
@@ -165,7 +191,9 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     sweepTimer = setTimer(() => {
       sweepTimer = null;
       if (stopped) return;
-      const groups = Object.entries(getEffective()?.qq?.groups ?? {});
+      const eff = getEffective();
+      if (eff) context.configure(contextCaps(eff));
+      const groups = Object.entries(eff?.qq?.groups ?? {});
       context.retainNames(new Set(groups.filter(([, g]) => showsNames(g)).map(([id]) => store.key(id))));
       if (context.sweep(now()) > 0) armSweep();
     }, HOUR);
@@ -177,6 +205,12 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     log('gate_end', { eventKey: rec.eventKey, groupKey: rec.groupKey, state, reason });
     return moved;
   }
+
+  // Danger the shutdown took with it. The next start does not pick it up.
+  const alertDropped = (rec) => store.addAlert('crisis_dropped_on_stop', { eventKey: rec.eventKey, groupKey: rec.groupKey });
+  // Danger with no reply and no decision that could lead to one.
+  const alertRefused = (rec, reason) => store.addAlert('crisis_refused', { eventKey: rec.eventKey, groupKey: rec.groupKey, reason });
+  const alertMissed = (rec, reason) => (stopped ? alertDropped(rec) : alertRefused(rec, reason));
 
   const refOf = (rec) => ({
     eventKey: rec.eventKey,
@@ -211,6 +245,24 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
 
   // ---- owner commands ----
 
+  const stopControl = (groupKey) => `owner_stop:${groupKey}`;
+
+  // The host keeps its cutoff across a restart, so the gate has to as well, or a late message older than /stop reaches it.
+  function stopOf(groupKey) {
+    if (ownerStops.has(groupKey)) return ownerStops.get(groupKey);
+    const msgTs = Number(store.getControl(stopControl(groupKey)));
+    const stop = Number.isFinite(msgTs) && msgTs > 0 ? { arrival: null, msgTs } : null;
+    ownerStops.set(groupKey, stop);
+    return stop;
+  }
+
+  // A text in danger is never taken for a command: no exact owner command matches the list, and a slash word
+  // in front of those words must not cost the person their answer. The worst the host does with it is leave the failure line.
+  function commandIn(rec) {
+    const cmd = parseCommand(rec.evt.text);
+    return cmd && commandShaped(rec.evt.text) && !isCrisis(rec) ? cmd : null;
+  }
+
   async function handleCommand(rec, cmd, eff, group) {
     store.setClass(rec.eventKey, 'command');
     if (!group.ownerMemberIds?.includes(rec.evt.senderId)) return end(rec, 'received', 'ignored', 'cmd_non_owner');
@@ -228,7 +280,12 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     // The buffer is uploaded with the next turn, so a reset has to reach it as well as the host session.
     if (cmd.name === 'new' || cmd.name === 'reset') context.clear(rec.groupKey);
     if (cmd.name === 'stop') {
-      for (const flight of flights.get(rec.groupKey) ?? []) flight.aborted = true;
+      for (const flight of flights.get(rec.groupKey) ?? []) {
+        flight.aborted = true;
+        // A reply the host already handed over was written before this /stop. For a person in danger it still goes out.
+        flight.replyBeforeStop = exit?.hasReply?.(flight.turnId) === true;
+      }
+      store.setControl(stopControl(rec.groupKey), rec.evt.timestampMs, 'owner');
       ownerStops.set(rec.groupKey, { arrival: rec.arrival, msgTs: rec.evt.timestampMs });
     }
     if (!store.transition(rec.eventKey, 'received', 'dispatching')) return undefined;
@@ -276,6 +333,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
 
   // fin is how the turn ended. A turn that produced nothing because the provider or an abort stopped it
   // leaves its hold unsettled, and only the failure streak pauses paid work (plan: repeated failures).
+  // An abort after a part went out is not that case: a reply reached the group and its cost is unknown.
   function settleReply(turn, holdId, result, eff, fin) {
     if (!holdId) {
       const known = usageMicros(result.usage, eff?.models?.primary?.price);
@@ -294,19 +352,36 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     log('settle_missing', { eventKey: turn.eventKey, tier: turn.tier });
     // False means a late usage event has already settled it.
     if (!ledger.markUnsettled(holdId)) return;
-    if (!result.aborted && !result.hostError && !NO_OUTPUT.has(fin?.reason)) ledger.pausePaid('usage_missing', 'gate');
+    const aborted = result.aborted === true || fin?.reason === 'aborted';
+    const partSent = aborted && store.sendsForEvent(turn.eventKey).some((s) => s.state === 'sent');
+    if (partSent || (!result.aborted && !result.hostError && !NO_OUTPUT.has(fin?.reason))) ledger.pausePaid('usage_missing', 'gate');
   }
 
   async function runTurn(rec, turn, holdId, eff) {
     const started = now();
-    const flight = { aborted: false };
+    const flight = { aborted: false, replyBeforeStop: false, turnId: turn.turnId, rec, cls: turn.cls, droppedOnStop: false };
     if (turn.cls !== 'command') {
       if (!flights.has(rec.groupKey)) flights.set(rec.groupKey, new Set());
       flights.get(rec.groupKey).add(flight);
     }
+    running.add(flight);
+    try {
+      await runFlight(rec, turn, holdId, eff, flight, started);
+    } finally {
+      running.delete(flight);
+    }
+  }
+
+  async function runFlight(rec, turn, holdId, eff, flight, started) {
     let result;
     let fin;
     let hostRefused = false;
+    // For a reply already being delivered: read while it waits for send-rate room, before each part, on a connect retry
+    // and before it says it failed. One written for a person in danger still goes out.
+    const ownerStopped = () => flight.aborted && !inDanger(rec, turn.cls);
+    // The host may have ended its run with the whole reply while dispatchTurn still drains usage. A /stop in that gap
+    // aborts nothing for a person in danger: their reply goes out as it would once delivery had begun.
+    const stopAborts = () => flight.aborted && !(flight.replyBeforeStop && inDanger(rec, turn.cls));
     try {
       exit.beginTurn(turn);
       try {
@@ -321,9 +396,8 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
         fin = await exit.finishTurn(turn.turnId, {
           hostError: !hostRefused && result?.hostError === true,
           // A turn the host refused has nothing to send. This also clears it from the exit.
-          aborted: hostRefused || result?.aborted === true || flight.aborted,
-          // For a reply still waiting for send-rate room. One written for a person in danger still goes out.
-          ownerStopped: () => flight.aborted && turn.cls !== 'crisis' && !isCrisis(rec),
+          aborted: hostRefused || result?.aborted === true || stopAborts(),
+          ownerStopped,
         });
       } catch {
         fin = { state: 'failed', reason: 'exit_refused' };
@@ -333,12 +407,72 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       flights.get(rec.groupKey)?.delete(flight);
     }
     if (hostRefused) fin = { state: 'skipped', reason: result.reason ?? 'ingress' };
+    rec.spoke = fin?.state === 'completed' || wentOut(rec.eventKey);
+    rec.contentDropped = fin?.state === 'policy_dropped' || fin?.reason === 'platform_violation';
     crashpoint('before_settle');
     settleReply(turn, holdId, result ?? { started: true, usage: null }, eff, fin);
     const state = TERMINAL.has(fin?.state) ? fin.state : 'failed';
     const reason = fin?.reason ?? (TERMINAL.has(fin?.state) ? fin.state : 'exit_refused');
     store.transition(rec.eventKey, ['dispatching', 'delivering'], state, { reason });
     log('turn_end', { eventKey: rec.eventKey, groupKey: rec.groupKey, state, reason, tier: turn.tier, durationMs: now() - started });
+    if (hostRefused) {
+      if (await noteHostRefused(rec, turn, reason, ownerStopped())) rec.spoke = true;
+    } else if (inDanger(rec, turn.cls) && !flight.droppedOnStop && await noteDangerLost(rec, turn, reason, stopAborts())) {
+      rec.spoke = true;
+    }
+  }
+
+  // A running turn for a person in danger that ended without its reply: an abort, a pause, the deadline or a refusal at
+  // the exit. The operator always hears, and a shutdown has its own alert. A /stop is the one abort that leaves time to
+  // say anything, so the person gets the failure line unless some of the reply reached them. That line alone passes the
+  // hourly cap, and does not use it up. Its alert is raised once the line is settled and says whether it went out.
+  // Returns whether it went out.
+  async function noteDangerLost(rec, turn, reason, ownerAborted) {
+    if (reason === 'exit_refused' && (stopped || exit?.isStopped?.() === true)) {
+      alertDropped(rec);
+      return false;
+    }
+    if (!REPLY_LOST.has(reason)) return false;
+    if (reason !== 'aborted') {
+      alertRefused(rec, reason);
+      return false;
+    }
+    const why = ownerAborted ? 'owner_stop' : 'aborted';
+    if (!ownerAborted || !turn.required || wentOut(rec.eventKey)) {
+      alertRefused(rec, why);
+      return false;
+    }
+    let fixed = null;
+    try {
+      fixed = await exit.sendFixed(refOf(rec), 'modelFailed', { exemptFromCap: true });
+    } finally {
+      const state = fixed?.sent === true ? 'line_sent' : 'line_refused';
+      store.addAlert('crisis_refused', { eventKey: rec.eventKey, groupKey: rec.groupKey, reason: why, state });
+    }
+    log('fixed_line', { eventKey: rec.eventKey, kind: 'modelFailed', reason: fixed?.reason ?? null });
+    return fixed?.sent === true;
+  }
+
+  // Read from the sends, not the turn's reason: a reply cut off after its first part, a post nobody can confirm and a
+  // failure line that really went out all count, and one that was held back does not. A failed read costs at worst a
+  // double answer.
+  function wentOut(eventKey) {
+    try {
+      return store.sendsForEvent(eventKey).some((s) => MAY_BE_OUT.has(s.state));
+    } catch {
+      return false;
+    }
+  }
+
+  // Nothing ran and nothing was said. The hold is released, and anything already spent stays spent: giving it back
+  // would buy a decision for every message while the host keeps refusing. Returns whether a line went out after all.
+  async function noteHostRefused(rec, turn, reason, ownerStopped) {
+    const kind = reason === 'expired_before_dispatch' ? reason : 'host_refused';
+    store.addAlert(kind, { eventKey: rec.eventKey, groupKey: rec.groupKey, reason });
+    if (!turn.required || turn.cls === 'command' || ownerStopped) return false;
+    const fixed = await exit.sendFixed(refOf(rec), 'modelFailed');
+    log('fixed_line', { eventKey: rec.eventKey, kind: 'modelFailed', reason: fixed?.reason ?? null });
+    return fixed?.sent === true;
   }
 
   // G14's refusal. Work that waited reads it too, so no decision is bought for a turn G14 would refuse.
@@ -372,13 +506,19 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     const finishRefused = async (state, reason) => {
       dropClaim(rec);
       end(rec, from, state, reason);
-      if (plan.required && exit && (reason === 'budget' || reason === 'paid_paused')) {
+      if (reason !== 'budget' && reason !== 'paid_paused') return;
+      // The failure line has an hourly cap and tells the operator nothing, so danger raises an alert as well.
+      if (inDanger(rec, cls)) alertRefused(rec, reason);
+      if (plan.required && exit) {
         const fixed = await exit.sendFixed(refOf(rec), 'modelFailed');
         log('fixed_line', { eventKey: rec.eventKey, kind: 'modelFailed', reason: fixed?.reason ?? null });
       }
     };
 
-    if (stopped) return finishRefused('restart_dropped', 'restart');
+    if (stopped) {
+      if (inDanger(rec, cls)) alertDropped(rec);
+      return finishRefused('restart_dropped', 'restart');
+    }
     const eff = getEffective();
     if (!eff) return finishRefused('skipped', 'no_effective');
     if (!stillAdmitted(eff, rec.evt.conversationId)) return finishRefused('ignored', 'admission');
@@ -455,9 +595,20 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     return guarded(rec, async () => {
       if (stoppedByOwner(rec)) return end(rec, 'queued', 'skipped', 'owner_stop');
       const eff = getEffective();
-      if (eff && !takeSenderSlot(rec, eff)) return end(rec, 'queued', 'skipped', 'sender_rate');
+      if (eff && !takeSenderSlot(rec, eff)) return isCrisis(rec) ? judgeOverRate(rec) : end(rec, 'queued', 'skipped', 'sender_rate');
       return approveAndRun(rec, rec.cls, 'queued');
     });
+  }
+
+  // Danger past the hourly count buys one decision on the crisis route, and is answered only if the model agrees.
+  function judgeOverRate(rec) {
+    const ready = readyToJudge(rec, WOULD[rec.cls]);
+    if (!ready || endIfExpired(rec, ready.eff)) return undefined;
+    if (!crisisRoom(rec.senderKey, now(), ready.eff)) {
+      end(rec, 'queued', 'skipped', 'sender_rate');
+      return alertRefused(rec, 'sender_rate');
+    }
+    return decideAndRun(rec, 'crisis_route', ready.eff, ready.group, 'sender_rate');
   }
 
   // ---- window lane ----
@@ -518,8 +669,8 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       }
       if (trigger === 'name' && !store.bumpCounter(`name_dec:${rec.groupKey}:${hour}`, hourExpiry(at), limits.nameDecisionsPerGroupPerHour).ok) throw new Refused('decision_cap');
       if (trigger === 'crisis_route' && !bumpCrisisGroup(rec, at, eff)) throw new Refused(crisisRefusal);
-      if (!store.bumpCounter(`dec_group:${rec.groupKey}:${hour}`, hourExpiry(at), limits.decisionsPerGroupPerHour).ok) throw new Refused('decision_cap');
-      if (!store.bumpCounter(`dec_day:${day}`, dayExpiry(at), limits.decisionsPerDay).ok) throw new Refused('decision_cap');
+      if (!store.bumpCounter(`dec_group:${rec.groupKey}:${hour}`, hourExpiry(at), decisionCap(trigger, limits.decisionsPerGroupPerHour)).ok) throw new Refused('decision_cap');
+      if (!store.bumpCounter(`dec_day:${day}`, dayExpiry(at), decisionCap(trigger, limits.decisionsPerDay)).ok) throw new Refused('decision_cap');
       const r = ledger.reserve({ tier: DECISION_TIERS[trigger], category: 'decision', heldMicros, eventKey: rec.eventKey, model: eff.models.decision.id });
       if (!r.ok) throw new Refused(r.reason === 'paid_paused' ? 'paid_paused' : 'budget');
       if (!store.transition(rec.eventKey, 'queued', 'deciding')) throw new Refused('gone');
@@ -578,21 +729,24 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
   async function decideAndRun(rec, trigger, eff, group, crisisRefusal) {
     const claim = claimDecision(rec, trigger, eff, group, crisisRefusal);
     if (!claim.ok) {
-      // A spent interjection tier is no reason to miss a person in danger. The crisis route pays from its own tier,
+      // A spent tier or decision cap is no reason to miss a person in danger. The crisis route pays from its own tier,
       // on its own caps, and answers nothing but crisis.
-      if (trigger === 'ordinary' && claim.reason === 'budget' && isCrisis(rec) && crisisRoom(rec.senderKey, now(), eff)) {
-        return decideAndRun(rec, 'crisis_route', eff, group, 'budget');
+      if (trigger !== 'crisis_route' && CRISIS_FALLBACK.has(claim.reason) && isCrisis(rec) && crisisRoom(rec.senderKey, now(), eff)) {
+        return decideAndRun(rec, 'crisis_route', eff, group, claim.reason);
       }
-      if (claim.reason !== 'gone') end(rec, 'queued', 'skipped', claim.reason);
+      if (claim.reason !== 'gone') {
+        end(rec, 'queued', 'skipped', claim.reason);
+        if (isCrisis(rec)) alertRefused(rec, claim.reason);
+      }
       return undefined;
     }
-    rec.decided = true;
     rec.claimId = claim.value.claimId;
     crashpoint('deciding');
 
     const d = await askDecision(rec, trigger, eff);
     settleDecision(claim.value.holdId, d);
     noteDecisionHealth(d);
+    rec.modelCrisis = d.crisis === true;
     const route = routeDecision(trigger, d, {
       takeCrisisCap: () => {
         const at = now();
@@ -608,15 +762,25 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
         store.bumpCounter(`skip_class:${shanghaiDay(at)}`, dayExpiry(at));
       }
       dropClaim(rec);
-      return end(rec, 'deciding', 'skipped', route.reason);
+      end(rec, 'deciding', 'skipped', route.reason);
+      // The model said danger with the caps spent, or could not answer about a line on the list. Nobody else will look.
+      if (d.crisis === true || (d.invalid && isCrisis(rec))) alertMissed(rec, route.reason);
+      return undefined;
     }
     if (route.next === 'crisis') {
       dropClaim(rec);
     } else if (route.next === 'interject' ? interjectionRefused(rec) : stoppedByOwner(rec)) {
       dropClaim(rec);
-      return end(rec, 'deciding', 'skipped', 'owner_stop');
+      end(rec, 'deciding', 'skipped', 'owner_stop');
+      if (d.crisis === true) alertMissed(rec, 'owner_stop');
+      return undefined;
     }
-    if (route.next === 'name_addressed' && !takeSenderSlot(rec, eff)) return end(rec, 'deciding', 'skipped', 'sender_rate');
+    if (route.next === 'name_addressed' && !takeSenderSlot(rec, eff)) {
+      end(rec, 'deciding', 'skipped', 'sender_rate');
+      // Past the crisis caps a reply and a skip are the same verdict, and nobody else will look at either.
+      if (d.crisis === true) alertMissed(rec, 'sender_rate');
+      return undefined;
+    }
     return approveAndRun(rec, route.next, 'deciding');
   }
 
@@ -628,38 +792,62 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     }
   }
 
+  // A turn on the crisis route, a line the model called danger past the caps, or a line on the list.
+  const inDanger = (rec, cls) => cls === 'crisis' || rec.modelCrisis === true || isCrisis(rec);
+
   // The host refuses any turn older than /stop, and the exit would then post the failure line. A person in danger
   // still gets that line, which says where to find help; anyone else has been told the replying stopped, or the
   // operator has been told that they were not.
-  const olderThanStop = (rec) => rec.arrival < (ownerStops.get(rec.groupKey)?.arrival ?? 0);
+  const olderThanStop = (rec) => {
+    const stop = stopOf(rec.groupKey);
+    if (!stop) return false;
+    // Arrival order ends with the process. After a restart only the message time is left, and a message from the same
+    // whole second may be newer, so it is not counted as older.
+    return stop.arrival === null ? rec.evt.timestampMs < stop.msgTs : rec.arrival < stop.arrival;
+  };
 
   // An interjection has no such line, and a refused one would only pause paid work, so it stops either way. The host
   // compares timestamps, and QQ's are whole seconds: arriving after /stop does not save one from the same second, or one
   // sent before it and delivered late. Nobody is owed an interjection, so this drops no question.
-  const interjectionRefused = (rec) => olderThanStop(rec) || rec.evt.timestampMs <= ownerStops.get(rec.groupKey)?.msgTs;
+  const interjectionRefused = (rec) => olderThanStop(rec) || rec.evt.timestampMs <= stopOf(rec.groupKey)?.msgTs;
 
   function stoppedByOwner(rec) {
     return olderThanStop(rec) && !isCrisis(rec);
   }
 
-  // Everything is read here and now: a queued name may have waited behind several turns.
+  // Everything is read here and now: queued work may have waited behind several turns. Null means the event has ended.
+  function readyToJudge(rec, wouldReason) {
+    const eff = getEffective();
+    const group = stillAdmitted(eff, rec.evt.conversationId);
+    const stop = (state, reason) => {
+      end(rec, 'queued', state, reason);
+      return null;
+    };
+    if (!eff || !group) return stop('ignored', 'admission');
+    const pause = store.pauseState(rec.groupKey);
+    if (pause.global || pause.group || pause.terminal) return stop('paused', 'paused');
+    if (eff.mode !== 'live') return stop('dry_run', wouldReason);
+    if (exitRefuses()) return stop('failed', 'exit_refused');
+    return { eff, group, pause };
+  }
+
+  function endIfExpired(rec, eff) {
+    if (now() - rec.receivedAt <= eff.window.dispatchDeadlineMs) return false;
+    store.addAlert('expired_before_dispatch', { eventKey: rec.eventKey, groupKey: rec.groupKey });
+    end(rec, 'queued', 'skipped', 'expired_before_dispatch');
+    return true;
+  }
+
   function judgeName(rec, windowCount) {
     return guarded(rec, async () => {
-      const eff = getEffective();
-      const group = stillAdmitted(eff, rec.evt.conversationId);
-      if (!eff || !group) return end(rec, 'queued', 'ignored', 'admission');
-      const p = store.pauseState(rec.groupKey);
-      if (p.global || p.group || p.terminal) return end(rec, 'queued', 'paused', 'paused');
-      if (eff.mode !== 'live') return end(rec, 'queued', 'dry_run', WOULD.name);
-      if (exitRefuses()) return end(rec, 'queued', 'failed', 'exit_refused');
+      const ready = readyToJudge(rec, WOULD.name);
+      if (!ready) return undefined;
+      const { eff, group } = ready;
       // With the switch off a name is ordinary, and an ordinary message in danger is still looked at.
       if (!group.nameMention) return isCrisis(rec) ? judgeCrisis(rec, windowCount) : end(rec, 'queued', 'skipped', 'name_off');
       if (stoppedByOwner(rec)) return end(rec, 'queued', 'skipped', 'owner_stop');
+      if (endIfExpired(rec, eff)) return undefined;
       const at = now();
-      if (at - rec.receivedAt > eff.window.dispatchDeadlineMs) {
-        store.addAlert('expired_before_dispatch', { eventKey: rec.eventKey, groupKey: rec.groupKey });
-        return end(rec, 'queued', 'skipped', 'expired_before_dispatch');
-      }
       // No decision is bought for someone already at their limit, unless the words suggest danger.
       if (!isCrisis(rec) && store.peekCounter(senderCounter(rec, at)) >= eff.limits.perSenderAddressedPerHour) {
         return end(rec, 'queued', 'skipped', 'sender_rate');
@@ -675,13 +863,22 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     return moved;
   }
 
-  // Yielding, so a real @ arriving later is still not held behind them. Danger does not yield.
-  function queueJudged(rec, task) {
-    const lane = queues.addressed(rec.groupKey, task, rec, { yielding: !isCrisis(rec) });
+  // Yielding, so a real @ arriving later is still not held behind them. Danger does not yield, and has a little room of
+  // its own. A sender over their share of that room is still refused with the alert: this line may be the one that matters.
+  function queueJudged(rec, task, refuse = refuseFull) {
+    const danger = isCrisis(rec);
+    const lane = queues.addressed(rec.groupKey, task, rec, { urgent: danger, yielding: !danger });
     if (lane.ok) return;
-    if (lane.reason === 'stopped') end(rec, 'queued', 'restart_dropped', 'restart');
-    else refuseFull(rec);
+    if (lane.reason === 'stopped') {
+      end(rec, 'queued', 'restart_dropped', 'restart');
+      if (danger) alertDropped(rec);
+    } else {
+      refuse(rec);
+    }
   }
+
+  // No alert: the same person's later line is judged either way, and raises its own if it finds no room.
+  const refuseFolded = (rec) => end(rec, 'queued', 'skipped', 'queue_full');
 
   const ruleFor = (r, { eff, group, pause, at, windowCount }) => evaluateOrdinary({
     group,
@@ -704,10 +901,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
 
   function runWindowRep(rep, ctx, rescue) {
     return guarded(rep, async () => {
-      if (ctx.at - rep.receivedAt > ctx.eff.window.dispatchDeadlineMs) {
-        store.addAlert('expired_before_dispatch', { eventKey: rep.eventKey, groupKey: rep.groupKey });
-        return end(rep, 'queued', 'skipped', 'expired_before_dispatch');
-      }
+      if (endIfExpired(rep, ctx.eff)) return undefined;
       const rule = ruleFor(rep, ctx);
       if (rule.ok) return interjectionRefused(rep) && !isCrisis(rep) ? end(rep, 'queued', 'skipped', 'owner_stop') : decideAndRun(rep, 'ordinary', ctx.eff, ctx.group);
       if (rescue) return decideAndRun(rep, 'crisis_route', ctx.eff, ctx.group, storedReason(rule.reason));
@@ -718,22 +912,22 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
   // A second person in danger from the same window, read fresh once the lane reaches them.
   function judgeCrisis(rec, windowCount) {
     return guarded(rec, async () => {
-      const eff = getEffective();
-      const group = stillAdmitted(eff, rec.evt.conversationId);
-      if (!eff || !group) return end(rec, 'queued', 'ignored', 'admission');
-      const pause = store.pauseState(rec.groupKey);
-      if (pause.global || pause.group || pause.terminal) return end(rec, 'queued', 'paused', 'paused');
-      if (eff.mode !== 'live') return end(rec, 'queued', 'dry_run', 'would_window');
-      if (exitRefuses()) return end(rec, 'queued', 'failed', 'exit_refused');
-      const ctx = { eff, group, pause, at: now(), windowCount };
+      const ready = readyToJudge(rec, 'would_window');
+      if (!ready) return undefined;
+      const ctx = { ...ready, at: now(), windowCount };
       return runWindowRep(rec, ctx, isRescued(rec, ctx));
     });
   }
 
-  // Queued behind the line that speaks for it, so that line's fate is known by now. If it got no decision, nothing spoke.
+  // Queued behind the line that speaks for it, so that line's fate is known by now. If its turn said nothing, the name
+  // message is judged itself. The exception is a reply a content check refused: a second turn on the same words would be
+  // another try at it, so that stays closed, and the operator hears if the person heard nothing.
   function judgeFolded(rec, later, windowCount) {
-    if (!later.decided) return judgeName(rec, windowCount);
-    return guarded(rec, async () => end(rec, 'queued', 'merged', 'merged', { mergedInto: later.eventKey }));
+    if (!later.spoke && !later.contentDropped) return judgeName(rec, windowCount);
+    return guarded(rec, async () => {
+      end(rec, 'queued', 'merged', 'merged', { mergedInto: later.eventKey });
+      if (!later.spoke) alertRefused(rec, 'reply_dropped');
+    });
   }
 
   async function flushWindow(arrived) {
@@ -764,7 +958,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       // A person's later danger line speaks for their earlier one even if that one said her name: one turn, one cap slot.
       const laterLine = (r) => (isCrisis(r) ? rescued.find((c) => c !== r && c.senderKey === r.senderKey) : undefined);
       const selected = group.nameMention ? selectNameRecords(records.filter((r) => !laterLine(r)), eff.limits) : [];
-      // Only if that line gets its decision, so each such name message stays open until then, outside the cap of names.
+      // Only if that line's turn says something, so each such name message stays open until then, outside the cap of names.
       const folded = group.nameMention ? selectNameRecords(records.filter(laterLine), { nameWindowMax: records.length }) : [];
       // A name message in danger the rules cannot rescue is still a name message, so the window cap does not push it
       // out, nor does a later word from the same person. The decision caps still count it.
@@ -792,7 +986,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       };
       for (const r of elsewhere) if (r !== lead) queueJudged(r, () => judgeCrisis(r, records.length));
       queueNames(named.filter(isCrisis));
-      for (const r of folded) queueJudged(r, () => judgeFolded(r, laterLine(r), records.length));
+      for (const r of folded) queueJudged(r, () => judgeFolded(r, laterLine(r), records.length), refuseFolded);
       queueNames(named.filter((n) => !isCrisis(n)));
       return named.includes(lead) ? judgeName(lead, records.length) : runWindowRep(lead, ctx, rescued.includes(lead));
     });
@@ -852,7 +1046,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     crashpoint('after_claim');
     store.setControl('last_event_at', receivedAt, 'gate');
     arrivals += 1;
-    const rec = { evt, eventKey, groupKey, senderKey: store.key(evt.senderId), receivedAt, arrival: arrivals, cls: null, prerule: false, claimId: null, displayName: null, decided: false, heldBack: [] };
+    const rec = { evt, eventKey, groupKey, senderKey: store.key(evt.senderId), receivedAt, arrival: arrivals, cls: null, prerule: false, claimId: null, displayName: null, spoke: false, contentDropped: false, modelCrisis: false, heldBack: [] };
 
     await guarded(rec, async () => {
       ensureRuntime(eff);
@@ -860,7 +1054,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       const stale = staleReason(evt, receivedAt, eff.window);
       if (stale) return end(rec, 'received', 'stale', stale);
 
-      const cmd = parseCommand(evt.text);
+      const cmd = commandIn(rec);
       if (cmd) return handleCommand(rec, cmd, eff, group);
 
       const { cls, ambiguous } = classify(evt, {
@@ -890,9 +1084,12 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
 
       store.transition(eventKey, 'received', 'queued');
       const lane = rec.cls === 'at' || rec.cls === 'reply_bot'
-        ? queues.addressed(groupKey, () => runAddressed(rec), rec)
+        ? queues.addressed(groupKey, () => runAddressed(rec), rec, { urgent: isCrisis(rec) })
         : queues.ordinary(groupKey, rec, flushWindow);
-      if (!lane.ok) return lane.reason === 'stopped' ? end(rec, 'queued', 'skipped', 'restart') : refuseFull(rec);
+      if (lane.ok) return undefined;
+      if (lane.reason !== 'stopped') return refuseFull(rec);
+      end(rec, 'queued', 'skipped', 'restart');
+      if (isCrisis(rec)) alertDropped(rec);
       return undefined;
     });
   }
@@ -942,11 +1139,24 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
         if (queues) await queues.stop();
         await Promise.allSettled([...adhoc]);
       })();
+      // Whatever is still running past the grace ends after the store has closed, where its own alert cannot be written.
+      // A person in danger among them is reported now, once, and their turn raises nothing more when it ends.
+      const reportOutlasting = () => {
+        for (const flight of running) {
+          if (flight.droppedOnStop || !inDanger(flight.rec, flight.cls)) continue;
+          flight.droppedOnStop = true;
+          tryQuietly(() => alertDropped(flight.rec));
+        }
+      };
       stopping = new Promise((resolve) => {
-        const grace = setTimer(resolve, STOP_GRACE_MS);
+        const grace = setTimer(() => {
+          reportOutlasting();
+          resolve();
+        }, STOP_GRACE_MS);
         grace?.unref?.();
         done.finally(() => {
           clearTimer(grace);
+          reportOutlasting();
           resolve();
         });
       });

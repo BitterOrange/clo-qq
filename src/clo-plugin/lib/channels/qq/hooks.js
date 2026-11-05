@@ -28,16 +28,28 @@ function addUsage(target, evt) {
 
 const emptyUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: null, model: null });
 
+// The host stamps a usage event with when it fired and how long its run had been going. Without those it
+// cannot be placed, and false keeps it with the turn that is owed: a wrong pause costs less than unowned money.
+function startedAfter(evt, at, nowMs) {
+  const ran = evt.durationMs;
+  if (typeof ran !== 'number' || !Number.isFinite(ran) || ran < 0) return false;
+  return (typeof evt.ts === 'number' ? evt.ts : nowMs) - ran >= at;
+}
+
 // Diagnostic listeners are process-wide and a replaced plugin generation may not have unsubscribed yet.
 // Only the newest tracker in this process acts, so one model.usage is never counted twice.
 export function createUsageTracker({ onInternalDiagnosticEvent, waitDrained = async () => {}, ledger, log = () => {}, price = () => null, drainWaitMs = DRAIN_WAIT_MS, now = Date.now, lateUsageMs = LATE_USAGE_MS }) {
   const openTurns = new Map();
   const byTurn = new Map();
   const closedTurns = new Map();
+  // A closed turn whose run was still going: that run's next usage belongs to it, whichever turn came after.
+  // A run that began once the turn had closed is some later turn's. The host defers a new turn while a run is
+  // registered as active, but its stuck-session recovery can drop that registration while the old run is still pending.
+  const owedTurns = new Map();
   const owner = {};
   globalThis[USAGE_OWNER] = owner;
 
-  function lateUsage(evt) {
+  function lateUsage(evt, owed) {
     const seen = emptyUsage();
     addUsage(seen, evt);
     const known = usageMicros(seen, price());
@@ -45,7 +57,8 @@ export function createUsageTracker({ onInternalDiagnosticEvent, waitDrained = as
       log('usage_ignored', { model: seen.model });
       return;
     }
-    const closed = closedTurns.get(sessionId(evt.sessionKey));
+    if (owed) owedTurns.delete(sessionId(evt.sessionKey));
+    const closed = owed ?? closedTurns.get(sessionId(evt.sessionKey));
     const eventKey = closed && now() - closed.at <= lateUsageMs ? closed.eventKey : null;
     ledger.applyLateUsage(eventKey, { actualMicros: known.micros, source: known.source, model: seen.model });
     log(eventKey ? 'usage_late' : 'usage_unattributed', { eventKey, actualMicros: known.micros, source: known.source, model: seen.model });
@@ -54,10 +67,15 @@ export function createUsageTracker({ onInternalDiagnosticEvent, waitDrained = as
   const off = onInternalDiagnosticEvent((evt) => {
     if (globalThis[USAGE_OWNER] !== owner || evt?.type !== 'model.usage') return;
     try {
-      const entry = openTurns.get(sessionId(evt.sessionKey));
-      if (entry) {
+      const key = sessionId(evt.sessionKey);
+      const owed = owedTurns.get(key);
+      const entry = openTurns.get(key);
+      if (owed && now() - owed.at <= lateUsageMs && !startedAfter(evt, owed.at, now())) {
+        lateUsage(evt, owed);
+      } else if (entry) {
         entry.usage ??= emptyUsage();
         addUsage(entry.usage, evt);
+        entry.runMs = evt.durationMs ?? null;
       } else {
         lateUsage(evt);
       }
@@ -68,7 +86,7 @@ export function createUsageTracker({ onInternalDiagnosticEvent, waitDrained = as
 
   return {
     open(sessionKey, turn) {
-      const entry = { turn, key: sessionId(sessionKey), usage: null, rounds: 0, toolHolds: [] };
+      const entry = { turn, key: sessionId(sessionKey), usage: null, runMs: null, rounds: 0, toolHolds: [] };
       openTurns.set(entry.key, entry);
       byTurn.set(turn.turnId, entry);
       return entry;
@@ -77,7 +95,7 @@ export function createUsageTracker({ onInternalDiagnosticEvent, waitDrained = as
       return openTurns.get(sessionId(sessionKey)) ?? null;
     },
     // Waits for the host's event to arrive. Tool holds end with the turn: the reply settlement pays for them.
-    async close(turnId) {
+    async close(turnId, { runActive = false } = {}) {
       const entry = byTurn.get(turnId);
       if (!entry) return null;
       const deadline = Date.now() + drainWaitMs;
@@ -89,16 +107,22 @@ export function createUsageTracker({ onInternalDiagnosticEvent, waitDrained = as
       byTurn.delete(turnId);
       if (openTurns.get(entry.key) === entry) openTurns.delete(entry.key);
       closedTurns.set(entry.key, { eventKey: entry.turn.eventKey, at: now() });
+      if (runActive) owedTurns.set(entry.key, { turnId, eventKey: entry.turn.eventKey, at: now() });
       // Numbers only. Q5 reads these: on the Gateway path the host gives no other token breakdown.
       if (entry.usage) {
         const { input, output, cacheRead, cacheWrite, model } = entry.usage;
-        log('turn_usage', { eventKey: entry.turn.eventKey, inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite, model });
+        log('turn_usage', { eventKey: entry.turn.eventKey, inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite, model, durationMs: entry.runMs });
       }
       for (const id of entry.toolHolds) {
         if (entry.usage) ledger.release(id);
         else ledger.markUnsettled(id);
       }
       return entry.usage;
+    },
+    // The run has ended, so once its events are in, it owes nothing more.
+    async runEnded(turnId) {
+      await waitDrained();
+      for (const [key, owed] of owedTurns) if (owed.turnId === turnId) owedTurns.delete(key);
     },
     stop() {
       off?.();
@@ -113,6 +137,8 @@ export function registerHooks(api, { getServices }) {
     if (s.getEffective()?.privacy?.replaceSystemPrompt !== true) return undefined;
     const systemPrompt = s.systemPrompt();
     if (!systemPrompt) {
+      // Without this file the turn runs on the host's own prompt, which carries the host name and paths.
+      s.store.addAlert('prompt_replace', { state: 'unreadable' });
       s.log('prompt_replace', { state: 'unreadable' });
       return undefined;
     }

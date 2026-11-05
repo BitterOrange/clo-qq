@@ -3,6 +3,10 @@
 import { sessionPeerId } from '../../core/ids.js';
 
 const CHANNEL_ID = 'clo-qq';
+// How long an aborted run gets to end before its group's queue moves on without it.
+const ABORT_GRACE_MS = 5000;
+// An optional reply this close to the passive window's end would be paid for and then cut off.
+const MIN_OPTIONAL_TURN_MS = 15000;
 const shanghaiTime = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
 });
@@ -31,8 +35,20 @@ function deadlineTimer(ms) {
   return { expired, clear: () => clearTimeout(timer) };
 }
 
-export function createDispatcher({ rt, getCfg, account, getExit, identity, usage, log = () => {}, now = Date.now }) {
+function endedWithin(run, ms) {
+  const graced = deadlineTimer(ms);
+  const ended = () => true;
+  return Promise.race([run.then(ended, ended), graced.expired.then(() => false)]).finally(graced.clear);
+}
+
+export function createDispatcher({ rt, getCfg, account, getExit, identity, usage, log = () => {}, now = Date.now, abortGraceMs = ABORT_GRACE_MS }) {
   return async function dispatchTurn(turn) {
+    // A required turn may carry a message from someone in danger, which only the gate can tell, so it tries while any time is left.
+    const remaining = turn.deadlineAt - now();
+    if (remaining <= (turn.required === false ? MIN_OPTIONAL_TURN_MS : 0)) {
+      log('turn_expired', { eventKey: turn.eventKey, tier: turn.tier });
+      return { started: false, reason: 'expired_before_dispatch' };
+    }
     const cfg = getCfg();
     const peer = sessionPeerId('g', turn.groupId);
     const sender = sessionPeerId('u', turn.senderId);
@@ -102,6 +118,7 @@ export function createDispatcher({ rt, getCfg, account, getExit, identity, usage
     // A standalone command starts no model call, and it must not take the place of a turn in flight.
     if (turn.cls !== 'command') usage?.open(route.sessionKey, turn);
     log('turn_start', { eventKey: turn.eventKey, groupKey: turn.groupKey, tier: turn.tier });
+    const stopRun = new AbortController();
     const run = rt.inbound.run({
       channel: CHANNEL_ID,
       accountId: account.accountId,
@@ -116,7 +133,7 @@ export function createDispatcher({ rt, getCfg, account, getExit, identity, usage
           ctxPayload,
           messageId: turn.eventKey,
           record: { onRecordError: () => log('record_error', { eventKey: turn.eventKey }) },
-          replyOptions: { disableBlockStreaming: true },
+          replyOptions: { disableBlockStreaming: true, abortSignal: stopRun.signal },
           delivery: {
             deliver: async (payload, info) => getExit().collect(turn.turnId, { text: payload?.text, isError: payload?.isError === true }, { kind: info?.kind }),
             onError: () => log('deliver_error', { eventKey: turn.eventKey }),
@@ -128,13 +145,19 @@ export function createDispatcher({ rt, getCfg, account, getExit, identity, usage
     // A run that never ends must not hold the group's queue. Past the passive window nothing could be sent anyway.
     let hostError = false;
     let aborted = false;
+    let runActive = false;
     const watchdog = deadlineTimer(turn.deadlineAt - now());
     try {
-      const outcome = await Promise.race([run.then(() => 'done'), watchdog.expired]);
+      const outcome = await Promise.race([run.then((result) => ({ result })), watchdog.expired]);
       if (outcome === 'deadline') {
         aborted = true;
-        log('turn_watchdog', { eventKey: turn.eventKey });
-        run.catch(() => {});
+        stopRun.abort();
+        runActive = !(await endedWithin(run, abortGraceMs));
+        log('turn_watchdog', { eventKey: turn.eventKey, state: runActive ? 'still_running' : 'ended' });
+      } else if (outcome.result?.dispatchResult?.deferredToActiveRun) {
+        // The host names how it queued this text behind another run of the session ("steer" or "followup"), so no answer is coming for this turn.
+        hostError = true;
+        log('turn_deferred', { eventKey: turn.eventKey });
       }
     } catch {
       hostError = true;
@@ -142,7 +165,8 @@ export function createDispatcher({ rt, getCfg, account, getExit, identity, usage
     } finally {
       watchdog.clear();
     }
-    const seen = usage ? await usage.close(turn.turnId) : null;
+    const seen = usage ? await usage.close(turn.turnId, { runActive }) : null;
+    if (runActive) run.catch(() => {}).then(() => usage?.runEnded(turn.turnId)).catch(() => {});
     return { started: true, hostError, aborted, usage: seen };
   };
 }

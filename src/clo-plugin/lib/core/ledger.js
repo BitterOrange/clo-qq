@@ -8,7 +8,9 @@ const KEY_TIMEOUT_MS = 8000;
 const TICK_MS = 60000;
 const CONNECTED_READ_MS = 10 * 60000;
 const REBASE_AFTER_MS = 30 * 24 * 3600000;
+const DAY_MS = 24 * 3600000;
 const BASELINE_META = 'key_baseline';
+const KEY_LIMIT_SEEN = 'key_limit_seen';
 const RESIDUAL_COUNT = 'residual_over';
 const STREAK_KEY = 'provider_fail_streak';
 const STREAK_TTL_MS = 7 * 24 * 3600000;
@@ -27,7 +29,8 @@ const CLEAR_WHEN_SETTLED = new Set(['crash_unsettled', 'usage_missing']);
 // costs money has not been observed, so its hold stays counted until something settles it.
 const CREDITS_RETRY_MS = 3600000;
 // After this long with paid work able to run and no paid success, a failure streak says nothing about those credits:
-// it is provider_fail again. A pause cannot age the probe, so a lift restarts it.
+// it is provider_fail again. A pause cannot age the probe. Its control value is the absolute expiry while paid work can
+// run, and f<ms left> during a pause, so a lift gives back exactly what was left. Lifting a credits pause gives a full life.
 const CREDITS_PROBE_TTL_MS = 24 * 3600000;
 // A row with no usage is cleared after this long with this many clean Key reads. The delay is provisional:
 // the real reporting lag has not been measured (Q5). Budget fields can override both.
@@ -84,22 +87,37 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     };
   }
 
-  function probeLive() {
-    const probeAt = store.controlUpdatedAt(CREDITS_PROBE);
-    return probeAt !== null && now() - probeAt < CREDITS_PROBE_TTL_MS;
+  // What the probe has left at a moment. Not a positive number means there is no live probe.
+  function probeLeftAt(at) {
+    const raw = store.getControl(CREDITS_PROBE);
+    if (raw === null) return 0;
+    if (raw.startsWith('f')) return Number(raw.slice(1));
+    // '1' is a value written before the expiry was stored: it lives from when it was written.
+    const expiresAt = raw === '1' ? store.controlUpdatedAt(CREDITS_PROBE) + CREDITS_PROBE_TTL_MS : Number(raw);
+    return expiresAt - at;
   }
 
+  const probeLive = () => probeLeftAt(now()) > 0;
+
   function pausePaid(reason, by = 'ledger') {
-    const old = store.getControl('paid_paused');
-    if (old !== null && pauseRank(old) > pauseRank(reason)) return;
-    if (old === reason) return;
-    // What replaces it says nothing about credits, and lifts with no wait, so the probe bounds what follows.
-    if (old === 'openrouter_credits') store.setControl(CREDITS_PROBE, '1', 'ledger');
-    // Died with paid work open, so the next lift must not bring it back.
-    else if (old === null && !probeLive()) store.delControl(CREDITS_PROBE);
-    store.setControl('paid_paused', reason, by);
-    store.addAlert('paid_paused', { reason });
-    log('paid_paused', { reason });
+    store.tx(() => {
+      const old = store.getControl('paid_paused');
+      if (old !== null && pauseRank(old) > pauseRank(reason)) return;
+      if (old === reason) return;
+      // What replaces it says nothing about credits, and lifts with no wait, so the probe bounds what follows.
+      if (old === 'openrouter_credits') {
+        store.setControl(CREDITS_PROBE, `f${CREDITS_PROBE_TTL_MS}`, 'ledger');
+      } else {
+        // A pause the store wrote at recovery froze nothing, so its own start is what counts.
+        const left = probeLeftAt(old === null ? now() : store.controlUpdatedAt('paid_paused'));
+        if (left > 0) store.setControl(CREDITS_PROBE, `f${left}`, 'ledger');
+        // Died with paid work open, so the next lift must not bring it back.
+        else store.delControl(CREDITS_PROBE);
+      }
+      store.setControl('paid_paused', reason, by);
+      store.addAlert('paid_paused', { reason });
+      log('paid_paused', { reason });
+    });
   }
 
   function reserve({ tier, category, heldMicros, eventKey = null, model = null }) {
@@ -185,8 +203,11 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
   }
 
   function liftPause(reason) {
+    const pausedAt = store.controlUpdatedAt('paid_paused');
     store.delControl('paid_paused');
-    if (reason === 'openrouter_credits' || store.getControl(CREDITS_PROBE) !== null) store.setControl(CREDITS_PROBE, '1', 'ledger');
+    const left = reason === 'openrouter_credits' ? CREDITS_PROBE_TTL_MS : probeLeftAt(pausedAt);
+    if (left > 0) store.setControl(CREDITS_PROBE, now() + left, 'ledger');
+    else store.delControl(CREDITS_PROBE);
   }
 
   // Only a read can end a residual, so a pause lifted without one does not run past it.
@@ -267,18 +288,52 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     }
   }
 
+  const saveBaseline = (usage, at, keyId) => store.setMeta(BASELINE_META, JSON.stringify({ usage, at, keyId }));
+
+  // For rows the Key figure can no longer speak for. They stay counted at their hold, and are dated before the new
+  // baseline so they explain nothing charged after it. A charge that does land later is a residual: counted twice, not lost.
+  function settleAtHold(source, at) {
+    return Number(q("UPDATE reservations SET status='settled', actual_micros=held_micros, source=?, settled_at=? WHERE status='unsettled'").run(source, at - 1).changes);
+  }
+
+  // Moving the baseline past a row absorbs its charge. A row settling later would then explain money it did not cause,
+  // and one that never settles would wait on a figure that already holds it. A charge lags the local settlement too, so
+  // a row settled just now counts as well: its charge would arrive after the new baseline as a false residual.
+  function quietToRebase(at) {
+    const lag = getEffective()?.budget?.unsettledClearMs ?? UNSETTLED_CLEAR_MS;
+    return q("SELECT COUNT(*) AS n FROM reservations WHERE status IN ('held','unsettled') OR (status='settled' AND actual_micros>0 AND settled_at>?)").get(at - lag).n === 0;
+  }
+
+  // The sweep drops rows by this age, so past it the sum of what is explained would read swept spend as new charges.
+  function baselineOutlivesRows(base, at) {
+    const days = getEffective()?.retention?.reservationDays;
+    return days > 0 && at - base.at > days * DAY_MS;
+  }
+
   // What the key has charged since the baseline, beyond what local rows already explain.
-  function attribute(k, at) {
+  function attribute(k, keyId, at) {
     let base = loadBaseline();
-    if (base && k.usageMicros < base.usage) {
+    // A baseline from before it carried an id takes the current one: a rotation in that one gap shows only if the figure falls.
+    if (base && ((base.keyId && base.keyId !== keyId) || k.usageMicros < base.usage)) {
       store.addAlert('key_changed', {});
-      // What the old Key charged can never show on this one, so waiting cannot settle these. They stay counted
-      // at their hold, and are dated before the new baseline so they explain nothing charged on the new Key.
-      q("UPDATE reservations SET status='settled', actual_micros=held_micros, source='key_changed', settled_at=? WHERE status='unsettled'").run(at - 1);
+      // What the old Key charged can never show on this one, so waiting cannot settle these.
+      settleAtHold('key_changed', at);
+      // Lifetime figures of two Keys cannot be subtracted, so the provider's day starts again at this read.
+      // Local rows still hold what the old Key was seen to charge today.
+      q('DELETE FROM key_snapshots WHERE taken_at<>?').run(at);
       base = null;
     }
     if (!base) {
-      store.setMeta(BASELINE_META, JSON.stringify({ usage: k.usageMicros, at }));
+      saveBaseline(k.usageMicros, at, keyId);
+      return;
+    }
+    if (!base.keyId) saveBaseline(base.usage, base.at, keyId);
+    if (baselineOutlivesRows(base, at)) {
+      // Only a call in flight can delay this, and a restart turns those into unsettled rows. Until then nothing is
+      // attributed. The provider figure for the day does not use the baseline, so the budget still sees the charges.
+      if (q("SELECT COUNT(*) AS n FROM reservations WHERE status='held'").get().n > 0) return;
+      log('key_baseline_reset', { count: settleAtHold('baseline_expired', at) });
+      saveBaseline(k.usageMicros, at, keyId);
       return;
     }
     const explained = q("SELECT COALESCE(SUM(actual_micros), 0) AS m FROM reservations WHERE status='settled' AND settled_at>=?").get(base.at).m;
@@ -296,7 +351,24 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
       if (unexplained > 0) insertSettledRow({ tier: 'none', category: 'unattributed', actualMicros: unexplained, source: 'key_delta' });
     }
     if (clean) clearUnbilled(base, at);
-    if (at - base.at > REBASE_AFTER_MS) store.setMeta(BASELINE_META, JSON.stringify({ usage: k.usageMicros, at }));
+    if (at - base.at > REBASE_AFTER_MS && quietToRebase(at)) saveBaseline(k.usageMicros, at, keyId);
+  }
+
+  // Only says so: the local budget and the Key's own room are what stop spending, and a limit below the budget is fine.
+  // Alerts once for each difference, so a read every few minutes does not repeat it, across restarts too.
+  function noteKeyLimit(k, eff) {
+    const configured = eff.budget?.keyDailyLimitUsd;
+    const wanted = configured === null || configured === undefined ? null : usdToMicros(configured);
+    const reason = wanted === null ? null : k.limitMicros !== wanted ? 'amount' : k.limitReset !== 'daily' ? 'reset' : null;
+    if (reason === null) {
+      store.delControl(KEY_LIMIT_SEEN);
+      return;
+    }
+    const seen = `${reason}:${wanted}:${k.limitMicros}`;
+    if (store.getControl(KEY_LIMIT_SEEN) === seen) return;
+    store.setControl(KEY_LIMIT_SEEN, seen, 'ledger');
+    store.addAlert('key_limit_mismatch', { reason, actualMicros: k.limitMicros });
+    log('key_limit_mismatch', { reason });
   }
 
   function residualFor(day) {
@@ -313,8 +385,10 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
   async function reconcile(at = now(), { atStart = false } = {}) {
     const readStartedAt = now();
     let k;
+    let keyId;
     try {
       k = await readKey();
+      keyId = store.key(getKey());
     } catch {
       keyFailures += 1;
       log('key_read_failed', { count: keyFailures });
@@ -328,7 +402,8 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     return store.tx(() => {
       q(`INSERT OR REPLACE INTO key_snapshots(taken_at, usage_micros, usage_daily_micros, limit_micros, remaining_micros, limit_reset)
          VALUES (?, ?, ?, ?, ?, ?)`).run(at, k.usageMicros, k.usageDailyMicros, k.limitMicros, k.remainingMicros, k.limitReset);
-      attribute(k, at);
+      noteKeyLimit(k, eff);
+      attribute(k, keyId, at);
 
       const day = shanghaiDay(at);
       const residualMicros = residualFor(day);

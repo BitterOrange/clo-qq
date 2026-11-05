@@ -20,7 +20,8 @@ const HOUR = 3600000;
 
 function setup({ streakPause = 3 } = {}) {
   const clock = { t: T0 };
-  const store = openStore(join(dir, `l${++n}.db`), { runGen: 'g', now: () => clock.t });
+  const file = join(dir, `l${++n}.db`);
+  const store = openStore(file, { runGen: 'g', now: () => clock.t });
   const eff = { mode: 'live', budget: { dailyUsd: 2.5, interjectUsd: 0.75, searchUsd: 2.1, namedUsd: 2.25, addressedUsd: 2.5, residualMinUsd: 0.25, residualPct: 0.15, providerFailStreakPause: streakPause }, openrouter: { baseUrl: 'http://mock/api/v1' } };
   const key = { usage: 0, limit: 3.25, limit_remaining: 3.25, limit_reset: 'daily', usage_daily: 0 };
   const state = { fail: false };
@@ -28,8 +29,15 @@ function setup({ streakPause = 3 } = {}) {
     if (state.fail) throw new Error('network down');
     return { ok: true, status: 200, json: async () => ({ data: { ...key } }) };
   };
-  const ledger = createLedger({ store, getEffective: () => eff, fetch: fetchStub, getKey: () => 'FAKE', log: () => {}, now: () => clock.t });
-  return { store, ledger, clock, key, state };
+  const open = (s) => createLedger({ store: s, getEffective: () => eff, fetch: fetchStub, getKey: () => 'FAKE', log: () => {}, now: () => clock.t });
+  const h = { store, ledger: open(store), clock, key, state };
+  h.restart = () => {
+    h.store.close();
+    h.store = openStore(file, { runGen: `g${++n}`, now: () => clock.t });
+    h.store.recoverOnStart(clock.t);
+    h.ledger = open(h.store);
+  };
+  return h;
 }
 const paused = (store) => store.getControl('paid_paused');
 const streak = (store) => store.peekCounter('provider_fail_streak');
@@ -260,7 +268,7 @@ test('one read over the threshold pauses nothing, so it does not stop clear-paus
 
 // --- the probe's life counts only time paid work could run ---
 
-test('a Key at zero for longer than the probe life: the lift restarts it, so failures still pause as credits', async () => {
+test('a Key at zero for longer than the probe life: it keeps its life, so failures still pause as credits', async () => {
   const { ledger, store, key, clock } = setup();
   ledger.noteDecisionError({ httpStatus: 402 });
   clock.t += 60000;
@@ -277,7 +285,7 @@ test('a Key at zero for longer than the probe life: the lift restarts it, so fai
   store.close();
 });
 
-test('owner clear down to a residual that lasts past the probe life: the lift at the new day restarts it', async () => {
+test('owner clear down to a residual that lasts past the probe life: the pause did not age it', async () => {
   const { ledger, store, key, clock } = setup();
   await ledger.reconcile(clock.t);
   ledger.pausePaid('openrouter_credits');
@@ -299,7 +307,7 @@ for (const [how, lift] of [
   ['accept-unsettled', (ledger) => ledger.acceptUnsettled('test')],
   ['late usage', (ledger) => ledger.applyLateUsage('E', { actualMicros: 1000, source: 'host' })],
 ]) {
-  test(`a settlement pause past the probe life, lifted by ${how}, restarts it too`, () => {
+  test(`a settlement pause past the probe life, lifted by ${how}, does not age it either`, () => {
     const { ledger, store, clock } = setup();
     unsettledHold(ledger);
     ledger.pausePaid('openrouter_credits');
@@ -612,4 +620,126 @@ test('clo budget clear-pause with nothing else in the way still says it is lifte
   const unavailable = await clo(r, ['budget', 'clear-pause']);
   assert.match(unavailable.out, /还没有恢复/);
   assert.match(unavailable.out, /需要重启 Gateway/);
+});
+
+// --- the probe keeps exactly the life it had ---
+
+const PROBE = 'credits_probe';
+// An event in dispatching with a hold: the restart writes crash_unsettled from inside the store.
+const crash = (h) => {
+  h.store.claimEvent({ eventKey: 'C', groupKey: 'G', msgTs: h.clock.t, receivedAt: h.clock.t });
+  h.store.transition('C', ['received'], 'dispatching');
+  h.ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: 360000, eventKey: 'C' });
+  h.restart();
+  assert.equal(paused(h.store), 'crash_unsettled');
+};
+const startProbe = async (h) => {
+  h.ledger.pausePaid('openrouter_credits');
+  h.clock.t += HOUR;
+  assert.equal((await h.ledger.reconcile(h.clock.t)).paused, false);
+};
+
+test('a short pause gives back what the probe had left, and does not start it again', async () => {
+  for (const [wait, want] of [[4 * HOUR - 1, 'openrouter_credits'], [4 * HOUR, 'provider_fail']]) {
+    const h = setup();
+    await startProbe(h);
+    h.clock.t += 20 * HOUR;
+    h.state.fail = true;
+    await h.ledger.reconcile(h.clock.t);
+    await h.ledger.reconcile(h.clock.t);
+    assert.equal(paused(h.store), 'key_read_failed');
+    h.clock.t += 30 * 60000;
+    h.state.fail = false;
+    assert.equal((await h.ledger.reconcile(h.clock.t)).paused, false);
+    h.clock.t += wait;
+    fail(h.ledger, 3);
+    assert.equal(paused(h.store), want, String(wait));
+    h.store.close();
+  }
+});
+
+test('a pause the store wrote at recovery does not bring back a probe already dead', async () => {
+  const h = setup();
+  await startProbe(h);
+  h.clock.t += 25 * HOUR;
+  crash(h);
+  h.ledger.acceptUnsettled('test');
+  assert.equal(paused(h.store), null);
+  assert.equal(h.store.getControl(PROBE), null);
+  fail(h.ledger, 3);
+  assert.equal(paused(h.store), 'provider_fail');
+  h.store.close();
+});
+
+test('a pause the store wrote at recovery stops the clock of a live probe', async () => {
+  for (const [wait, want] of [[HOUR - 1, 'openrouter_credits'], [HOUR, 'provider_fail']]) {
+    const h = setup();
+    await startProbe(h);
+    h.clock.t += 23 * HOUR;
+    crash(h);
+    h.clock.t += 30 * HOUR;
+    h.ledger.acceptUnsettled('test');
+    h.clock.t += wait;
+    fail(h.ledger, 3);
+    assert.equal(paused(h.store), want, String(wait));
+    h.store.close();
+  }
+});
+
+test('a store pause relabelled by the ledger counts from when the store wrote it', async () => {
+  const h = setup();
+  await startProbe(h);
+  h.clock.t += 23 * HOUR;
+  crash(h);
+  h.clock.t += 10 * HOUR;
+  h.ledger.pausePaid('usage_unavailable', 'services');
+  assert.equal(h.store.getControl(PROBE), `f${HOUR}`);
+  h.store.close();
+});
+
+test('the time left survives a restart during the pause', async () => {
+  for (const [wait, want] of [[4 * HOUR - 1, 'openrouter_credits'], [4 * HOUR, 'provider_fail']]) {
+    const h = setup();
+    await startProbe(h);
+    h.clock.t += 20 * HOUR;
+    h.ledger.pausePaid('residual');
+    h.restart();
+    h.clock.t += 2 * HOUR;
+    assert.equal((await h.ledger.reconcile(h.clock.t)).paused, false);
+    h.clock.t += wait;
+    fail(h.ledger, 3);
+    assert.equal(paused(h.store), want, String(wait));
+    h.store.close();
+  }
+});
+
+test('a probe written before the expiry was stored lives from when it was written', async () => {
+  for (const [age, want] of [[24 * HOUR - 1, 'openrouter_credits'], [24 * HOUR, 'provider_fail']]) {
+    const { ledger, store, clock } = setup();
+    store.setControl(PROBE, '1', 'ledger');
+    clock.t += age;
+    fail(ledger, 3);
+    assert.equal(paused(store), want, String(age));
+    store.close();
+  }
+  const h = setup();
+  h.store.setControl(PROBE, '1', 'ledger');
+  h.clock.t += 25 * HOUR;
+  crash(h);
+  h.ledger.acceptUnsettled('test');
+  assert.equal(h.store.getControl(PROBE), null);
+  h.store.close();
+});
+
+test('a pause that fails to commit freezes nothing, so the probe keeps running', async () => {
+  const h = setup();
+  await startProbe(h);
+  const running = h.store.getControl(PROBE);
+  const addAlert = h.store.addAlert;
+  h.store.addAlert = () => { throw new Error('disk'); };
+  assert.throws(() => h.ledger.pausePaid('residual'), /disk/);
+  h.store.addAlert = addAlert;
+  assert.equal(paused(h.store), null);
+  assert.equal(h.store.getControl(PROBE), running);
+  h.store.close();
 });

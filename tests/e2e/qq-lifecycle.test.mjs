@@ -1,5 +1,6 @@
 // TQ11: startAccount lifecycle under the real Gateway.
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { after, before, describe, test } from 'node:test';
 import { fullAt, nextId, push } from '../fixtures/qq-events.mjs';
 import { assertEveryPostLegal, deepMerge, sleep, startStack, unexpectedNetAttempts, until } from '../harness/gateway.mjs';
@@ -198,6 +199,36 @@ describe('connection failures', () => {
       }
     });
   }
+});
+
+describe('fatal close while the database is locked', () => {
+  test('4914 with the write lock held: the code is not lost, and a restart does not reconnect', async () => {
+    const s = await startStack({ label: 'fatallock', script: () => ({ text: '好。' }) });
+    let other = null;
+    try {
+      await s.waitConnected();
+      const opened = s.qq.opened();
+      other = new DatabaseSync(s.paths.db);
+      other.exec('PRAGMA busy_timeout=0');
+      other.exec('BEGIN IMMEDIATE');
+      s.qq.closeAll(4914);
+      await until(() => s.event('connection_fatal').some((e) => e.closeCode === 4914), 'fatal close seen', 90000);
+      await sleep(9000);
+      assert.equal(s.qq.opened(), opened, 'the host did not restart it');
+      other.exec('ROLLBACK');
+      other.close();
+      other = null;
+      await s.restart();
+      await until(() => s.event('start_refused').some((e) => e.reason === 'terminal'), 'refused start', 60000);
+      await sleep(6000);
+      assert.equal(s.qq.opened(), opened, 'no connection after the restart');
+      assert.equal(s.control('terminal_close'), '4914');
+    } finally {
+      other?.close();
+      await s.stop();
+      s.cleanup();
+    }
+  });
 });
 
 describe('qq disabled at startup', () => {

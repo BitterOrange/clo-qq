@@ -3,6 +3,7 @@ import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { POLICY_CATEGORIES, POLICY_V1_SHA256 } from './contentPolicy.js';
+import { usdToMicros } from './ledger.js';
 
 export class ConfigError extends Error {}
 
@@ -93,6 +94,8 @@ const isPosInt = (v) => Number.isInteger(v) && v > 0;
 const isStr = (v) => typeof v === 'string' && v.length > 0;
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const hasSpace = (v) => /\s/u.test(v);
+// Nothing reads a local number: wiring one in would change what someone in danger is told.
+const noLocalNumbers = (v) => v === undefined || v === '';
 
 function findSecretKeys(node, path, out) {
   if (!isObj(node)) return;
@@ -137,12 +140,16 @@ export function validateBusinessConfig(cfg, { env = process.env } = {}) {
 
   if (!tiersValid(cfg.budget)) err('budget', 'needs interjectUsd <= searchUsd <= namedUsd <= addressedUsd = dailyUsd, all non-negative');
   if (cfg.budget?.keyDailyLimitUsd !== undefined && !isNonNeg(cfg.budget.keyDailyLimitUsd)) err('budget.keyDailyLimitUsd', 'must be non-negative');
+  // Left out, models.js uses its own default ceiling.
+  if (cfg.budget?.maxOutputUsdPerMtok !== undefined && !isPos(cfg.budget.maxOutputUsdPerMtok)) err('budget.maxOutputUsdPerMtok', 'must be a positive number');
   for (const f of BUDGET_WAITS) {
     if (cfg.budget?.[f] !== undefined && !(Number.isInteger(cfg.budget[f]) && cfg.budget[f] > 0)) err(`budget.${f}`, 'must be a positive integer');
   }
 
   validateModelBlock(cfg.claudeModel, 'claudeModel', err);
   if (isObj(cfg.claudeModel) && !isPosInt(cfg.claudeModel.contextTokens)) err('claudeModel.contextTokens', 'must be a positive integer');
+  // Holds are priced from the locked cache-write rate, which is the short one.
+  if (cfg.claudeModel?.cacheRetention !== undefined && cfg.claudeModel.cacheRetention !== 'short') err('claudeModel.cacheRetention', 'must be short');
   validateModelBlock(cfg.decisionModel, 'decisionModel', err);
   if (cfg.decisionModel?.id === 'opus-latest') err('decisionModel.id', 'the selector is for the primary model only');
 
@@ -163,6 +170,8 @@ export function validateBusinessConfig(cfg, { env = process.env } = {}) {
 
   const rt = cfg.retention;
   if (!isObj(rt) || !isPos(rt.eventDays) || !isPos(rt.sendDays) || !isPos(rt.reservationDays)) err('retention', 'eventDays, sendDays and reservationDays must be positive');
+  // The ledger's Key baseline can be 30 days old, and attribution needs every reservation made since it.
+  if (isPos(rt?.reservationDays) && rt.reservationDays <= 30) err('retention.reservationDays', 'must be above 30');
   if (!isPosInt(rt?.contextMaxItems) || rt.contextMaxItems > 40) err('retention.contextMaxItems', 'must be 1 to 40');
   if (!isPos(rt?.contextMaxAgeHours) || rt.contextMaxAgeHours > 24) err('retention.contextMaxAgeHours', 'must be above 0 and at most 24');
   if (!isPosInt(rt?.contextMaxTokens)) err('retention.contextMaxTokens', 'must be a positive integer');
@@ -239,7 +248,7 @@ export function validateBusinessConfig(cfg, { env = process.env } = {}) {
     const cats = cp.outputFilter?.categories;
     if (!Array.isArray(cats) || !cats.every((c) => POLICY_CATEGORIES.includes(c))) err('contentPolicy.outputFilter.categories', 'allowed: sexual, crime, privacy');
     if (!isStr(cp.crisis?.routeTermsFile)) err('contentPolicy.crisis.routeTermsFile', 'required');
-    if (isStr(cp.crisis?.localNumbers) && !isStr(cp.crisis?.numbersVerifiedOn)) err('contentPolicy.crisis.numbersVerifiedOn', 'required when localNumbers is set');
+    if (!noLocalNumbers(cp.crisis?.localNumbers)) err('contentPolicy.crisis.localNumbers', 'must be empty');
   }
 
   if (typeof cfg.privacy?.replaceSystemPrompt !== 'boolean') err('privacy.replaceSystemPrompt', 'must be a boolean');
@@ -410,6 +419,8 @@ export function liveConfigProblems(cfg) {
   const qq = cfg?.qq ?? {};
   const allowed = Array.isArray(qq.allowedGroupIds) ? qq.allowedGroupIds : [];
   const groups = isObj(qq.groups) ? qq.groups : {};
+  if (!(isPos(cfg?.budget?.dailyUsd) && tiersValid(cfg.budget))) failed.push('budget');
+  if (cfg?.contentPolicy?.enabled !== true) failed.push('policy');
   if (!(allowed.length > 0 && allowed.every((id) => ownersOf(qq, id).length > 0))) failed.push('targets');
   if (!(hasText(qq.appId) && cfg?.acks?.identityConfirmedAppId === qq.appId)) failed.push('identity');
   if (!(allowed.length > 0 && allowed.every((id) => groups[id]?.noticeGiven === true))) failed.push('notice');
@@ -418,7 +429,8 @@ export function liveConfigProblems(cfg) {
   return failed;
 }
 
-// facts: { now, key: readKey() result | null, reconciled, heartbeatAt, lastReadyAt, gatewayKeyMatches, policyOk, doctorOk, paidPaused, modelsLocked, env }
+// facts: { now, key: readKey() result | null, reconciled, heartbeatAt, lastReadyAt, gatewayKeyMatches, policyOk, doctorOk, paidPaused, modelsLocked, requiredHoldMicros, env }
+// requiredHoldMicros: the hold of one required reply, in micro-USD. Absent or null when it cannot be priced yet.
 export function livePreconditions(cfg, facts = {}) {
   const failed = [];
   const check = (code, ok) => { if (!ok) failed.push(code); };
@@ -428,12 +440,18 @@ export function livePreconditions(cfg, facts = {}) {
   const now = facts.now ?? Date.now();
   const testMode = Boolean(facts.env?.CLO_TEST_ROOT);
   const key = facts.key;
-  const cp = cfg?.contentPolicy;
+  const budget = cfg?.budget;
+  const hold = facts.requiredHoldMicros;
+  const keyDaily = isObj(key) && isNum(key.limitMicros) && key.limitReset === 'daily';
 
-  check('budget', isPos(cfg?.budget?.dailyUsd) && tiersValid(cfg.budget));
+  check('budget', !inConfig.includes('budget'));
+  // Below one hold, the ledger refuses every reply, and that only shows once someone asks.
+  check('daily_hold', hold === undefined || hold === null || (isNum(hold) && isNum(budget?.dailyUsd) && usdToMicros(budget.dailyUsd) >= hold));
   check('targets', !inConfig.includes('targets'));
   check('dm_closed', Array.isArray(qq.allowedDmUserIds) && qq.allowedDmUserIds.length === 0);
-  check('key_readable', isObj(key) && key.limitMicros !== null && key.limitMicros !== undefined && key.limitReset === 'daily');
+  check('key_readable', keyDaily);
+  // Only a readable daily limit can be compared. A limit below the local budget is fine, as long as it is the one declared.
+  check('key_limit', !keyDaily || budget?.keyDailyLimitUsd === undefined || usdToMicros(budget.keyDailyLimitUsd) === key.limitMicros);
   check('reconciled', facts.reconciled === true);
   check('heartbeat', isNum(facts.heartbeatAt) && now - facts.heartbeatAt <= HEARTBEAT_FRESH_MS && isNum(facts.lastReadyAt));
   check('gateway_key', facts.gatewayKeyMatches === true);
@@ -441,8 +459,8 @@ export function livePreconditions(cfg, facts = {}) {
   check('notice', !inConfig.includes('notice'));
   check('q0', !inConfig.includes('q0'));
   check('d3', !inConfig.includes('d3'));
-  check('policy', cp?.enabled === true && facts.policyOk === true);
-  check('numbers', !isStr(cp?.crisis?.localNumbers) || isStr(cp?.crisis?.numbersVerifiedOn));
+  check('policy', !inConfig.includes('policy') && facts.policyOk === true);
+  check('numbers', noLocalNumbers(cfg?.contentPolicy?.crisis?.localNumbers));
   check('doctor', facts.doctorOk === true);
   const urls = [qq.apiBaseUrl, qq.tokenBaseUrl, cfg?.openrouter?.baseUrl].filter((u) => u !== undefined && u !== '');
   check('base_urls', urls.length === 0 || testMode);

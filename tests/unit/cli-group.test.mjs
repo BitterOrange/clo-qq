@@ -151,3 +151,58 @@ test('--display-names: per group, on and off, shown by list and status, and a co
   writeFileSync(join(r, 'config.json'), JSON.stringify(bad));
   assert.notEqual((await clo(r, ['apply'])).code, 0, 'validation refuses anything but a boolean');
 });
+
+test('while live, the last group cannot be removed; another can, and dry-run opens the way', async () => {
+  const r = root('lastgroup');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  const cfg = configOf(r);
+  cfg.qq.groups.SECONDGROUP0000 = { label: '第二群', interject: false, nameMention: false, noticeGiven: true };
+  cfg.qq.allowedGroupIds.push('SECONDGROUP0000');
+  cfg.qq.owner.groupMember.SECONDGROUP0000 = ['SECONDOWNER0000'];
+  writeFileSync(join(r, 'config.json'), JSON.stringify(cfg));
+  assert.equal((await clo(r, ['mode', 'live'], { fetch: provider.fetch })).code, 0);
+
+  assert.equal((await clo(r, ['group', 'remove', '第二群'])).code, 0, 'a group that is not the last goes');
+  assert.equal(effectiveOf(r).qq.groups.SECONDGROUP0000, undefined);
+
+  const before = readFileSync(join(r, 'config.json'), 'utf8');
+  const refused = await clo(r, ['group', 'remove', '测试群']);
+  assert.equal(refused.code, 1);
+  assert.match(refused.err, /最后一个群/);
+  assert.match(refused.err, /clo mode dry-run/);
+  assert.equal(readFileSync(join(r, 'config.json'), 'utf8'), before, 'nothing written');
+  assert.equal(effectiveOf(r).mode, 'live');
+  assert.ok(effectiveOf(r).qq.groups[GROUP_ID]);
+
+  assert.equal((await clo(r, ['mode', 'dry-run'])).code, 0);
+  assert.equal((await clo(r, ['group', 'remove', '测试群'])).code, 0);
+  assert.deepEqual(effectiveOf(r).qq.groups, {});
+});
+
+test('a command refused by the config it would apply writes nothing, while live and over a model mismatch', async () => {
+  const r = root('nowrite');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  assert.equal((await clo(r, ['mode', 'live'], { fetch: provider.fetch })).code, 0);
+  assert.equal((await clo(r, ['group', 'set', '测试群', '--interject', 'on'])).code, 0, 'positive control: a clean config goes through');
+
+  const good = configOf(r);
+  for (const [mutate, pattern] of [
+    [(c) => { c.acks.d3 = '   '; }, /d3/],
+    [(c) => { c.claudeModel.id = 'anthropic/claude-sonnet-5.5'; }, /clo model refresh/],
+  ]) {
+    const edited = structuredClone(good);
+    mutate(edited);
+    writeFileSync(join(r, 'config.json'), JSON.stringify(edited));
+    const before = readFileSync(join(r, 'config.json'), 'utf8');
+    const effective = effectiveOf(r);
+    for (const args of [['group', 'set', '测试群', '--interject', 'off'], ['group', 'notice-done', '测试群'], ['owner', 'add', '测试群', '--id', 'ANOTHEROWNER000']]) {
+      const res = await clo(r, args);
+      assert.equal(res.code, 1, args.join(' '));
+      assert.match(res.err, pattern);
+      assert.equal(readFileSync(join(r, 'config.json'), 'utf8'), before, args.join(' '));
+    }
+    assert.deepEqual(effectiveOf(r), effective);
+  }
+});

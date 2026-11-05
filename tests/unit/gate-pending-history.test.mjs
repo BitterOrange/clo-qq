@@ -432,7 +432,8 @@ test('a folded line whose later line got no decision is still judged itself', as
   const earlier = `可洛 ${CRISIS}`;
   const later = `可洛 ${CRISIS}吧`;
   const second = `我也${CRISIS}`;
-  const eff = makeEffective({ limits: { ...makeEffective().limits, nameDecisionsPerGroupPerHour: 0 } });
+  // With the crisis caps spent too the refusal stands. Otherwise the crisis route would answer the line.
+  const eff = makeEffective({ limits: { ...makeEffective().limits, nameDecisionsPerGroupPerHour: 0, crisisRoutePerGroupPerDay: 0 } });
   const h = makeHarness({ effective: eff, decide: answersCrisis });
   const [first, danger] = await flushWindow(h, h.event({ text: earlier, senderId: MEMBER }), h.event({ text: later, senderId: MEMBER }), h.event({ text: second, senderId: MEMBER2 }));
   assert.equal(h.state(danger), 'skipped:decision_cap');

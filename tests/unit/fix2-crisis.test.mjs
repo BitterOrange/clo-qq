@@ -1,7 +1,9 @@
 // Crisis routing in the window flush and past the decision breaker: who is judged, who merges, what it costs in caps.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { decisionOf, deferred, GROUP_A, groupEntry, makeEffective, makeHarness, MEMBER, MEMBER2, USAGE } from '../fixtures/inbound.mjs';
+import { ApiError } from '@tencent-connect/qqbot-nodejs';
+import '../harness/net-guard.mjs';
+import { decisionOf, deferred, GROUP_A, groupEntry, makeEffective, makeHarness, MEMBER, MEMBER2, seamStack, USAGE } from '../fixtures/inbound.mjs';
 
 const MEMBER3 = 'THIRDMEMBER111122223333';
 const MEMBER4 = 'FOURTHMEMBER11122223333';
@@ -314,14 +316,214 @@ test('the later line, queued, is refused once the lane reaches it: the name mess
   await h.close();
 });
 
-test('the later line got its decision and the answer is no: the name message stays merged, one decision', async () => {
+test('the later line got its decision and the answer is no: nothing spoke, so the name message is judged itself', async () => {
   const h = makeHarness({ decide: async () => decisionOf({ action: 'skip' }) });
+  const last = `${CRISIS}吧`;
+  const name = `可洛 ${CRISIS}`;
+  const [a, b] = await flushWindow(h, h.event({ text: name }), h.event({ text: last }));
+  assert.deepEqual(triggers(h), [['ordinary', last], ['name', name]]);
+  assert.equal(h.state(b), 'skipped:decision_skip');
+  assert.equal(h.state(a), 'skipped:decision_skip');
+  assert.equal(h.row(a).merged_into, null);
+  await h.close();
+});
+
+test('the name message judged itself can still get the reply the later line did not', async () => {
+  const name = `可洛 ${CRISIS}`;
+  const h = makeHarness({ decide: async (req) => (req.current.text === name ? decisionOf({ crisis: true }) : decisionOf({ action: 'skip' })) });
+  const last = `${CRISIS}吧`;
+  const [a] = await flushWindow(h, h.event({ text: name }), h.event({ text: last }));
+  assert.equal(h.state(a), 'completed:sent');
+  assert.deepEqual(h.dispatched.map((t) => [t.cls, t.text]), [['crisis', name]]);
+  await h.close();
+});
+
+test('positive control: the later line got a turn, so the name message merges into it with no decision of its own', async () => {
+  const h = makeHarness({ decide: answersCrisis });
   const last = `${CRISIS}吧`;
   const [a, b] = await flushWindow(h, h.event({ text: `可洛 ${CRISIS}` }), h.event({ text: last }));
   assert.deepEqual(triggers(h), [['ordinary', last]]);
-  assert.equal(h.state(b), 'skipped:decision_skip');
   assert.equal(h.state(a), 'merged:merged');
   assert.equal(h.row(a).merged_into, h.row(b).event_key);
+  assert.equal(h.dispatched.length, 1);
+  await h.close();
+});
+
+// ---- what the later line's turn actually did ----
+
+const FOLD_NAME = `可洛 ${CRISIS}`;
+const FOLD_LAST = `${CRISIS}吧`;
+const replyNotCrisis = async () => decisionOf({ action: 'reply', crisis: false });
+const ranOk = { started: true, hostError: false, aborted: false, usage: USAGE };
+const foldAlerts = (h, kind) => h.store.listAlerts().filter((a) => a.kind === kind);
+
+// The later line takes a turn that is not required, ending as the case says. Every other turn runs and sends.
+function foldedHarness(first, exitResult = null, decide = replyNotCrisis) {
+  const h = makeHarness({
+    decide,
+    dispatch: async (turn) => {
+      h.exit.result = turn.cls === 'interject' ? exitResult : null;
+      return turn.cls === 'interject' ? first : ranOk;
+    },
+  });
+  return h;
+}
+
+test('the later line\'s turn said nothing: the name message is judged itself and gets the required turn', async () => {
+  const cases = [
+    ['the model returned nothing', ranOk, { state: 'silent', reason: 'no_reply' }, 'silent:no_reply', []],
+    ['the host failed', { ...ranOk, hostError: true, usage: null }, { state: 'silent', reason: 'host_error' }, 'silent:host_error', []],
+    ['the host ran nothing', { started: false, reason: 'ingress', hostError: false, aborted: false, usage: null }, null, 'skipped:ingress', ['host_refused']],
+  ];
+  for (const [title, first, exitResult, later, alertKinds] of cases) {
+    const h = foldedHarness(first, exitResult);
+    const [a, b] = await flushWindow(h, h.event({ text: FOLD_NAME }), h.event({ text: FOLD_LAST }));
+    assert.deepEqual(triggers(h), [['ordinary', FOLD_LAST], ['name', FOLD_NAME]], title);
+    assert.deepEqual(h.dispatched.map((t) => [t.cls, t.required]), [['interject', false], ['name_addressed', true]], title);
+    assert.equal(h.state(b), later, title);
+    assert.equal(h.state(a), 'completed:sent', title);
+    assert.equal(h.row(a).merged_into, null, title);
+    assert.deepEqual(h.store.listAlerts().map((x) => x.kind), alertKinds, title);
+    for (const e of [a, b]) assert.equal(ends(h, e), 1, title);
+    await h.close();
+  }
+});
+
+test('judged itself after a silent turn, the name message can still be the one the model calls danger', async () => {
+  const h = foldedHarness(ranOk, { state: 'silent', reason: 'no_reply' }, async (req) => decisionOf({ action: 'reply', crisis: req.current.text === FOLD_NAME }));
+  const [a] = await flushWindow(h, h.event({ text: FOLD_NAME }), h.event({ text: FOLD_LAST }));
+  assert.deepEqual(h.dispatched.map((t) => t.cls), ['interject', 'crisis']);
+  assert.equal(h.state(a), 'completed:sent');
+  await h.close();
+});
+
+test('the name message waits for the later line\'s turn to end, not just to start', async () => {
+  const hold = deferred();
+  const h = makeHarness({
+    decide: replyNotCrisis,
+    dispatch: async (turn) => {
+      if (turn.cls === 'interject') await hold.promise;
+      h.exit.result = turn.cls === 'interject' ? { state: 'silent', reason: 'no_reply' } : null;
+      return ranOk;
+    },
+  });
+  const a = await h.send(h.event({ text: FOLD_NAME }));
+  await h.send(h.event({ text: FOLD_LAST }));
+  h.advance(4000);
+  await until(() => h.dispatched.length === 1);
+  for (let i = 0; i < 50; i += 1) await tick();
+  assert.equal(h.decideCalls.length, 1, 'no decision for the name message while the turn is out');
+  assert.equal(h.row(a).state, 'queued');
+  hold.resolve();
+  await h.gate.idle();
+  assert.equal(h.state(a), 'completed:sent');
+  await h.close();
+});
+
+test('a required turn the host refused: the failure line speaks for the name message, unless it could not go out', async () => {
+  const refused = async () => ({ started: false, reason: 'ingress', hostError: false, aborted: false, usage: null });
+  const heard = makeHarness({ decide: answersCrisis, dispatch: refused });
+  const [a, b] = await flushWindow(heard, heard.event({ text: FOLD_NAME }), heard.event({ text: FOLD_LAST }));
+  assert.equal(heard.state(b), 'skipped:ingress');
+  assert.equal(heard.exit.fixed.length, 1);
+  assert.equal(heard.state(a), 'merged:merged');
+  assert.equal(heard.decideCalls.length, 1);
+  await heard.close();
+
+  const held = makeHarness({ decide: answersCrisis, dispatch: refused });
+  held.exit.sendFixed = async () => ({ sent: false, reason: 'failline_rate' });
+  const [c, d] = await flushWindow(held, held.event({ text: FOLD_NAME }), held.event({ text: FOLD_LAST }));
+  assert.equal(held.state(d), 'skipped:ingress');
+  assert.deepEqual(triggers(held), [['ordinary', FOLD_LAST], ['name', FOLD_NAME]]);
+  assert.equal(held.row(c).merged_into, null);
+  await held.close();
+});
+
+test('a failure line for the later line, through the real exit, speaks for the name message', async () => {
+  const h = await seamStack({ decide: answersCrisis });
+  h.replyText = null;
+  const [a, b] = await flushWindow(h, h.event({ text: FOLD_NAME }), h.event({ text: FOLD_LAST }));
+  assert.deepEqual(triggers(h), [['ordinary', FOLD_LAST]]);
+  assert.equal(h.state(b), 'failed:required_no_text');
+  assert.equal(h.posts().length, 1, 'the failure line');
+  assert.equal(h.state(a), 'merged:merged');
+  assert.equal(h.row(a).merged_into, h.row(b).event_key);
+  await h.close();
+});
+
+test('an empty turn that was not required, through the real exit: the name message gets its own reply', async () => {
+  const h = await seamStack({ decide: replyNotCrisis });
+  const script = h.script;
+  h.script = async (turn) => {
+    h.replyText = turn.cls === 'interject' ? null : '这是一条普通的回复。';
+    return script(turn);
+  };
+  const [a, b] = await flushWindow(h, h.event({ text: FOLD_NAME }), h.event({ text: FOLD_LAST }));
+  assert.equal(h.state(b), 'silent:no_reply');
+  assert.equal(h.state(a), 'completed:sent');
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.posts()[0].body.msg_id, a.messageId);
+  await h.close();
+});
+
+test('a post nobody can confirm may have reached the group: the name message merges, and no second reply is made', async () => {
+  const h = await seamStack({ decide: replyNotCrisis });
+  h.nextPostError = new Error('network timeout');
+  const [a, b] = await flushWindow(h, h.event({ text: FOLD_NAME }), h.event({ text: FOLD_LAST }));
+  assert.equal(h.state(b), 'failed:send_uncertain');
+  assert.equal(h.state(a), 'merged:merged');
+  assert.equal(h.seen.length, 1);
+  assert.equal(h.decideCalls.length, 1);
+  assert.equal(foldAlerts(h, 'crisis_refused').length, 0, 'something may have been said');
+  await h.close();
+});
+
+test('a reply cut off after its first part was still heard: the name message merges, and no second reply is made', async () => {
+  const h = await seamStack({ decide: answersCrisis });
+  h.replyText = '这是一句足够长的回复内容。'.repeat(200);
+  let failed = false;
+  Object.defineProperty(h, 'nextPostError', {
+    get: () => (h.posts().length === 1 && !failed ? new ApiError('expired', 400, '/v2/groups/x/messages', 40034128, 'detail') : null),
+    set: (v) => { if (v === null && h.posts().length === 1) failed = true; },
+  });
+  const [a, b] = await flushWindow(h, h.event({ text: FOLD_NAME }), h.event({ text: FOLD_LAST }));
+  assert.equal(h.state(b), 'failed:passive_expired');
+  assert.equal(h.posts().length, 1, 'positive control: one part got out');
+  assert.equal(h.state(a), 'merged:merged');
+  assert.equal(h.seen.length, 1);
+  await h.close();
+});
+
+test('a reply a content check refused is not tried again on the name message, and the operator hears of it', async () => {
+  const violation = () => new ApiError('content violation', 400, '/v2/groups/x/messages', 40034006, 'detail');
+  const cases = [
+    ['local rule', (h) => { h.replyText = '可以，加我 约炮'; }, /^policy_dropped:/u],
+    ['platform', (h) => { h.nextPostError = violation(); }, /^failed:platform_violation$/u],
+  ];
+  for (const [title, arrange, later] of cases) {
+    const h = await seamStack({ decide: replyNotCrisis });
+    arrange(h);
+    const [a, b] = await flushWindow(h, h.event({ text: FOLD_NAME }), h.event({ text: FOLD_LAST }));
+    assert.match(h.state(b), later, title);
+    assert.equal(h.state(a), 'merged:merged', title);
+    assert.equal(h.seen.length, 1, `${title}: one turn`);
+    assert.equal(h.decideCalls.length, 1, `${title}: one decision`);
+    assert.equal(h.posts().length, 0, title);
+    const refused = foldAlerts(h, 'crisis_refused');
+    assert.equal(refused.length, 1, title);
+    assert.match(JSON.stringify(refused[0]), /reply_dropped/u, title);
+    await h.close();
+  }
+});
+
+test('positive control: a refused reply on a required turn sends the fixed line, so there is nothing to alert', async () => {
+  const h = await seamStack({ decide: answersCrisis });
+  h.replyText = '可以，加我 约炮';
+  const [a, b] = await flushWindow(h, h.event({ text: FOLD_NAME }), h.event({ text: FOLD_LAST }));
+  assert.match(h.state(b), /^policy_dropped:/u);
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.state(a), 'merged:merged');
+  assert.equal(foldAlerts(h, 'crisis_refused').length, 0);
   await h.close();
 });
 
@@ -602,5 +804,374 @@ test('switched off before the flush, past the crisis caps: the window is one ord
   assert.equal(h.state(x), 'merged:merged');
   assert.equal(h.row(x).merged_into, h.row(y).event_key);
   assert.equal(h.state(y), 'completed:sent');
+  await h.close();
+});
+
+// ---- danger on the name path, and past the decision caps ----
+
+const alerts = (h, kind) => h.store.listAlerts().filter((a) => a.kind === kind);
+const detail = (a) => (typeof a.detail === 'string' ? JSON.parse(a.detail) : a.detail);
+
+for (const [title, effective] of [
+  ['the named tier spent', () => makeEffective({ budget: { namedUsd: 0 } })],
+  ['the name cap spent', () => makeEffective({ limits: { nameDecisionsPerGroupPerHour: 0 } })],
+  ['the group decision cap spent', () => makeEffective({ limits: { decisionsPerGroupPerHour: 0 } })],
+  ['the day decision cap spent', () => makeEffective({ limits: { decisionsPerDay: 0 } })],
+]) {
+  test(`${title}: a name message in danger goes by the crisis route`, async () => {
+    const h = makeHarness({ effective: effective(), decide: answersCrisis });
+    const text = `可洛 ${CRISIS}`;
+    const e = await h.sendAndFlush(h.event({ text }));
+    assert.deepEqual(triggers(h), [['crisis_route', text]]);
+    assert.deepEqual(h.dispatched.map((t) => [t.cls, t.tier]), [['crisis', 'addressed']]);
+    assert.equal(h.state(e), 'completed:sent');
+    assert.equal(crisisGroup(h), 1);
+    assert.equal(alerts(h, 'crisis_refused').length, 0);
+    await h.close();
+  });
+
+  test(`${title}: a name message with no danger words is refused, buys nothing and raises nothing`, async () => {
+    const h = makeHarness({ effective: effective(), decide: answersCrisis });
+    const e = await h.sendAndFlush(h.event({ text: NAME_A }));
+    assert.match(h.state(e), /^skipped:(budget|decision_cap)$/);
+    assert.equal(h.decideCalls.length, 0);
+    assert.equal(h.store.listAlerts().length, 0);
+    await h.close();
+  });
+}
+
+test('the decision cap spent: an ordinary message in danger goes by the crisis route', async () => {
+  const h = makeHarness({ effective: makeEffective({ limits: { decisionsPerGroupPerHour: 0 } }), decide: answersCrisis });
+  const e = await h.sendAndFlush(h.event({ text: CRISIS }));
+  assert.deepEqual(triggers(h), [['crisis_route', CRISIS]]);
+  assert.equal(h.state(e), 'completed:sent');
+  assert.equal(h.claims().filter((c) => c.status === 'consumed').length, 0, 'the refused claim went back with the refusal');
+  await h.close();
+});
+
+test('the fallback answers crisis and nothing else', async () => {
+  const h = makeHarness({ effective: makeEffective({ limits: { decisionsPerGroupPerHour: 0 } }), decide: async () => decisionOf({ action: 'reply' }) });
+  const e = await h.sendAndFlush(h.event({ text: `可洛 ${CRISIS}` }));
+  assert.equal(h.state(e), 'skipped:decision_skip');
+  assert.equal(h.dispatched.length, 0);
+  assert.equal(alerts(h, 'crisis_refused').length, 0, 'the model looked and said no');
+  await h.close();
+});
+
+test('danger refused all the way: skipped with the first refusal, no decision bought, and the owner hears', async () => {
+  const cases = [
+    ['no group room', { limits: { decisionsPerGroupPerHour: 0, crisisRoutePerGroupPerDay: 0 } }, 'decision_cap'],
+    ['no sender room', { limits: { decisionsPerGroupPerHour: 0, crisisRoutePerSenderPerHour: 0 } }, 'decision_cap'],
+    ['no money on any tier', { budget: { namedUsd: 0, addressedUsd: 0 } }, 'budget'],
+  ];
+  for (const [title, over, reason] of cases) {
+    const h = makeHarness({ effective: makeEffective(over), decide: answersCrisis });
+    const e = await h.sendAndFlush(h.event({ text: `可洛 ${CRISIS}` }));
+    assert.equal(h.state(e), `skipped:${reason}`, title);
+    assert.equal(h.decideCalls.length, 0, title);
+    const [alert] = alerts(h, 'crisis_refused');
+    assert.ok(alert, title);
+    assert.equal(detail(alert).reason, reason, title);
+    assert.equal(detail(alert).eventKey, h.row(e).event_key, title);
+    await h.close();
+  }
+});
+
+test('the decision failing on a line on the list raises the alert; on chat it does not', async () => {
+  const h = makeHarness({ decide: async () => failed() });
+  await h.sendAndFlush(h.event({ text: NAME_A }));
+  assert.equal(alerts(h, 'crisis_refused').length, 0, 'positive control');
+  const e = await h.sendAndFlush(h.event({ text: `可洛 ${CRISIS}`, senderId: MEMBER2 }));
+  assert.equal(h.state(e), 'skipped:decision_invalid');
+  assert.equal(detail(alerts(h, 'crisis_refused')[0]).reason, 'decision_invalid');
+  await h.close();
+});
+
+test('the model says danger with the crisis caps spent and the topic flagged: not answered, as decided, but the owner hears', async () => {
+  const h = makeHarness({
+    effective: makeEffective({ limits: { crisisRoutePerGroupPerDay: 0 } }),
+    decide: async () => decisionOf({ crisis: true, action: 'skip', skipClass: 'harm_person' }),
+  });
+  const e = await h.sendAndFlush(h.event({ text: NAME_A }));
+  assert.equal(h.state(e), 'skipped:decision_skip');
+  assert.equal(detail(alerts(h, 'crisis_refused')[0]).reason, 'decision_skip');
+  await h.close();
+});
+
+// ---- danger @ past the per-sender hourly count ----
+
+const oneAddressed = (over = {}) => makeEffective({ limits: { perSenderAddressedPerHour: 1, ...over } });
+
+async function overRate(h, text = CRISIS) {
+  await h.sendAndFlush(h.at({ text: '先问一个普通问题' }));
+  assert.equal(h.dispatched.length, 1, 'the premise: the first @ takes the only place');
+  return h.sendAndFlush(h.at({ text }));
+}
+
+test('danger @ past the hourly count: one decision on the crisis route, and a reply if the model agrees', async () => {
+  const h = makeHarness({ effective: oneAddressed(), decide: answersCrisis });
+  const e = await overRate(h);
+  assert.deepEqual(triggers(h), [['crisis_route', CRISIS]]);
+  assert.deepEqual(h.dispatched.at(-1).cls, 'crisis');
+  assert.equal(h.dispatched.at(-1).tier, 'addressed');
+  assert.equal(h.dispatched.at(-1).required, true);
+  assert.equal(h.state(e), 'completed:sent');
+  assert.equal(crisisGroup(h), 1);
+  assert.equal(h.row(e).cls, 'at', 'the row does not keep the route');
+  await h.close();
+});
+
+test('danger @ past the hourly count: the model says no, so no reply and no failure line', async () => {
+  const h = makeHarness({ effective: oneAddressed(), decide: async () => decisionOf({ action: 'reply', crisis: false }) });
+  const e = await overRate(h);
+  assert.equal(h.decideCalls.length, 1);
+  assert.equal(h.state(e), 'skipped:decision_skip');
+  assert.equal(h.dispatched.length, 1, 'never a reply without the model saying danger');
+  assert.deepEqual(h.exit.fixed, []);
+  await h.close();
+});
+
+test('chat @ past the hourly count buys nothing', async () => {
+  const h = makeHarness({ effective: oneAddressed(), decide: answersCrisis });
+  const e = await overRate(h, '再问一个普通问题');
+  assert.equal(h.state(e), 'skipped:sender_rate');
+  assert.equal(h.decideCalls.length, 0);
+  assert.equal(h.store.listAlerts().length, 0);
+  await h.close();
+});
+
+test('danger @ past the hourly count with no crisis room left: no decision, sender_rate, and the owner hears', async () => {
+  for (const over of [{ crisisRoutePerSenderPerHour: 0 }, { crisisRoutePerGroupPerDay: 0 }]) {
+    const h = makeHarness({ effective: oneAddressed(over), decide: answersCrisis });
+    const e = await overRate(h);
+    assert.equal(h.state(e), 'skipped:sender_rate', JSON.stringify(over));
+    assert.equal(h.decideCalls.length, 0, JSON.stringify(over));
+    assert.equal(detail(alerts(h, 'crisis_refused')[0]).reason, 'sender_rate', JSON.stringify(over));
+    await h.close();
+  }
+});
+
+// Queued behind a slow turn, so the world can change before it runs.
+async function queuedOverRate(change) {
+  const block = deferred();
+  let n = 0;
+  const h = makeHarness({
+    effective: oneAddressed(),
+    decide: answersCrisis,
+    dispatch: async () => {
+      n += 1;
+      if (n === 1) await block.promise;
+      return { started: true, hostError: false, aborted: false, usage: USAGE };
+    },
+  });
+  await h.send(h.at({ text: '先问一个普通问题' }));
+  await until(() => n === 1);
+  const e = await h.send(h.at({ text: CRISIS }));
+  assert.equal(h.state(e), 'queued');
+  change(h);
+  block.resolve();
+  await h.gate.idle();
+  return { h, e };
+}
+
+test('danger @ past the count, then the group is paused while it waits: no decision bought', async () => {
+  const { h, e } = await queuedOverRate((x) => x.store.setControl(`group_paused:${x.store.key(GROUP_A)}`, '1', 'test'));
+  assert.equal(h.state(e), 'paused:paused');
+  assert.equal(h.decideCalls.length, 0);
+  await h.close();
+});
+
+test('danger @ past the count, then it waits past the dispatch deadline: no decision bought, and the alert', async () => {
+  const { h, e } = await queuedOverRate((x) => x.advance(181000));
+  assert.equal(h.state(e), 'skipped:expired_before_dispatch');
+  assert.equal(h.decideCalls.length, 0);
+  assert.equal(alerts(h, 'expired_before_dispatch').length, 1);
+  await h.close();
+});
+
+test('danger @ past the count, then the mode goes to dry-run while it waits: no decision bought', async () => {
+  const { h, e } = await queuedOverRate((x) => { x.eff.current.mode = 'dry-run'; });
+  assert.equal(h.state(e), 'dry_run:would_at');
+  assert.equal(h.decideCalls.length, 0);
+  await h.close();
+});
+
+// ---- room for danger when the lane is full ----
+
+function fullLane() {
+  const block = deferred();
+  let n = 0;
+  const h = makeHarness({
+    effective: makeEffective({ window: { maxPending: 2 } }),
+    decide: answersCrisis,
+    dispatch: async () => {
+      n += 1;
+      if (n === 1) await block.promise;
+      return { started: true, hostError: false, aborted: false, usage: USAGE };
+    },
+  });
+  return {
+    h,
+    block,
+    fill: async () => {
+      await h.send(h.at({ text: '讲个长故事', senderId: MEMBER3 }));
+      await until(() => n === 1);
+      await h.send(h.at({ text: '排队的第一个问题', senderId: MEMBER3 }));
+      await h.send(h.at({ text: '排队的第二个问题', senderId: MEMBER3 }));
+    },
+  };
+}
+
+test('a danger @ behind a full lane has room; another @ does not', async () => {
+  const { h, block, fill } = fullLane();
+  await fill();
+  const chat = await h.send(h.at({ text: '排队的第三个问题', senderId: MEMBER4 }));
+  assert.equal(h.state(chat), 'skipped:queue_full', 'positive control: the lane is full');
+  assert.equal(alerts(h, 'crisis_queue_full').length, 0);
+  const danger = await h.send(h.at({ text: CRISIS, senderId: MEMBER }));
+  assert.equal(h.state(danger), 'queued');
+  block.resolve();
+  await h.gate.idle();
+  assert.equal(h.state(danger), 'completed:sent');
+  assert.equal(alerts(h, 'crisis_queue_full').length, 0);
+  await h.close();
+});
+
+test('one sender cannot take all the danger room: their third is refused with the alert, and another person still fits', async () => {
+  const { h, block, fill } = fullLane();
+  await fill();
+  const mine = [];
+  for (let i = 0; i < 3; i += 1) mine.push(await h.send(h.at({ text: `${CRISIS}${i}`, senderId: MEMBER })));
+  assert.deepEqual(mine.map((e) => h.state(e)), ['queued', 'queued', 'skipped:queue_full']);
+  assert.equal(alerts(h, 'crisis_queue_full').length, 1, 'that line may be the one that matters');
+  const other = await h.send(h.at({ text: CRISIS, senderId: MEMBER2 }));
+  assert.equal(h.state(other), 'queued');
+  block.resolve();
+  await h.gate.idle();
+  assert.equal(h.state(other), 'completed:sent');
+  await h.close();
+});
+
+test('a folded line finding no room is refused with no alert: the same person\'s later line is still judged', async () => {
+  const block = deferred();
+  let n = 0;
+  const senders = ['A', 'B', 'C'].map((s) => `FOLD${s}MEMBER1111222233334`);
+  const others = Array.from({ length: 12 }, (_, i) => `LATE${String(i).padStart(2, '0')}MEMBER111122223333`);
+  const h = makeHarness({
+    effective: makeEffective({ window: { maxPending: 12 }, limits: { floodPerWindow: 100 } }),
+    decide: async () => decisionOf({ action: 'skip' }),
+    dispatch: async () => {
+      n += 1;
+      if (n === 1) await block.promise;
+      return { started: true, hostError: false, aborted: false, usage: USAGE };
+    },
+  });
+  await h.send(h.at({ text: '讲个长故事', senderId: MEMBER }));
+  await until(() => n === 1);
+  // These fill each sender's share while their window waits, so the next lines take chat room instead of danger room.
+  const first = [];
+  for (const senderId of senders) {
+    first.push(await h.send(h.event({ text: CRISIS, senderId })));
+    first.push(await h.send(h.event({ text: `${CRISIS}呀`, senderId })));
+  }
+  h.advance(4000);
+  const folded = new Map();
+  for (const senderId of senders) {
+    folded.set(senderId, await h.send(h.event({ text: `可洛 ${CRISIS}`, senderId })));
+    await h.send(h.event({ text: `${CRISIS}吧`, senderId }));
+  }
+  block.resolve();
+  await until(() => first.every((e) => h.state(e) !== 'queued'));
+  for (const senderId of others) assert.equal(h.state(await h.send(h.event({ text: CRISIS, senderId }))), 'queued', senderId);
+  h.advance(4000);
+  await h.gate.idle();
+  const ended = senders.map((s) => h.state(folded.get(s)));
+  assert.deepEqual(ended.map((s) => s === 'skipped:queue_full'), [false, true, true], 'the premise: the danger room ran out on the last two');
+  assert.equal(alerts(h, 'crisis_queue_full').length, 0);
+  assert.equal(h.allEvents().filter((e) => e.reason === 'queue_full').length, 2, 'only the folded lines were refused');
+  await h.close();
+});
+
+// ---- danger at shutdown ----
+
+test('danger in an open window at shutdown raises crisis_dropped_on_stop; chat raises nothing', async () => {
+  const h = makeHarness({ decide: answersCrisis });
+  const chat = await h.send(h.event({ text: CHAT, senderId: MEMBER2 }));
+  const danger = await h.send(h.event({ text: CRISIS }));
+  await h.gate.stop();
+  assert.equal(h.state(chat), 'restart_dropped:restart');
+  assert.equal(h.state(danger), 'restart_dropped:restart');
+  const raised = alerts(h, 'crisis_dropped_on_stop');
+  assert.equal(raised.length, 1);
+  assert.equal(detail(raised[0]).eventKey, h.row(danger).event_key);
+  assert.equal(alerts(h, 'crisis_queue_full').length, 0, 'a kind of its own');
+  await h.close();
+});
+
+test('a queued danger @ at shutdown raises it too; a queued chat @ does not', async () => {
+  const block = deferred();
+  let n = 0;
+  const h = makeHarness({
+    dispatch: async () => {
+      n += 1;
+      await block.promise;
+      return { started: true, hostError: false, aborted: false, usage: USAGE };
+    },
+  });
+  await h.send(h.at({ text: '讲个长故事' }));
+  await until(() => n === 1);
+  const chat = await h.send(h.at({ text: '排队的问题' }));
+  assert.equal(alerts(h, 'crisis_dropped_on_stop').length, 0);
+  const danger = await h.send(h.at({ text: CRISIS, senderId: MEMBER2 }));
+  const stopping = h.gate.stop();
+  assert.equal(h.state(chat), 'restart_dropped:restart');
+  assert.equal(h.state(danger), 'restart_dropped:restart');
+  assert.equal(alerts(h, 'crisis_dropped_on_stop').length, 1);
+  block.resolve();
+  await stopping;
+  await h.close();
+});
+
+test('a decision out at shutdown on a line on the list raises it, and not crisis_refused', async () => {
+  const hold = deferred();
+  const h = makeHarness({ decide: async () => { await hold.promise; return failed(); } });
+  const danger = await h.send(h.event({ text: `可洛 ${CRISIS}` }));
+  h.advance(4000);
+  await until(() => h.decideCalls.length === 1);
+  const stopping = h.gate.stop();
+  hold.resolve();
+  await stopping;
+  assert.equal(h.state(danger), 'skipped:decision_invalid');
+  assert.equal(alerts(h, 'crisis_dropped_on_stop').length, 1);
+  assert.equal(alerts(h, 'crisis_refused').length, 0);
+  await h.close();
+});
+
+test('the model says danger as the shutdown lands: the turn does not start, and the owner hears', async () => {
+  const hold = deferred();
+  const h = makeHarness({ decide: async () => { await hold.promise; return decisionOf({ crisis: true }); } });
+  const danger = await h.send(h.event({ text: CRISIS }));
+  h.advance(4000);
+  await until(() => h.decideCalls.length === 1);
+  const stopping = h.gate.stop();
+  hold.resolve();
+  await stopping;
+  assert.equal(h.state(danger), 'restart_dropped:restart');
+  assert.equal(h.dispatched.length, 0);
+  assert.equal(alerts(h, 'crisis_dropped_on_stop').length, 1);
+  await h.close();
+});
+
+test('the same two moments on chat raise nothing', async () => {
+  const hold = deferred();
+  const h = makeHarness({ decide: async () => { await hold.promise; return decisionOf(); } });
+  const chat = await h.send(h.event({ text: CHAT }));
+  h.advance(4000);
+  await until(() => h.decideCalls.length === 1);
+  const stopping = h.gate.stop();
+  hold.resolve();
+  await stopping;
+  assert.equal(h.state(chat), 'restart_dropped:restart');
+  assert.equal(alerts(h, 'crisis_dropped_on_stop').length, 0);
   await h.close();
 });

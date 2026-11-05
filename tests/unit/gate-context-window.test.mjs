@@ -8,6 +8,7 @@ const CRISIS = '我真的不想活了';
 const CHAT = '今天中午吃什么好呢';
 const NAME = '可洛今天真好看';
 const MIN = 60000;
+const HOUR = 60 * MIN;
 
 async function flushWindow(h, ...events) {
   const sent = [];
@@ -248,4 +249,70 @@ test('a turn the provider stopped leaves its hold unsettled without pausing; a f
   assert.equal(silentBilling.reservations(c)[0].status, 'unsettled');
   assert.equal(silentBilling.store.getControl('paid_paused'), 'usage_missing', 'the reply went out and its cost is unknown');
   await silentBilling.close();
+});
+
+// ---- a changed config reaches the buffer and the window ----
+
+test('a lower item cap reaches the buffer on the next event', async () => {
+  const h = makeHarness();
+  for (const text of ['第一句提问内容', '第二句提问内容', '第三句提问内容']) await h.sendAndFlush(h.at({ text }));
+  assert.equal(h.dispatched.at(-1).history.length, 2, 'positive control: all there before the change');
+  h.eff.current.retention.contextMaxItems = 1;
+  await h.sendAndFlush(h.at({ text: '第四句提问内容' }));
+  assert.ok(h.dispatched.at(-1).history.length <= 1, JSON.stringify(h.dispatched.at(-1).history));
+  await h.close();
+});
+
+test('a lower token cap reaches the buffer on the next event', async () => {
+  const h = makeHarness();
+  const long = '很长的一句话'.repeat(40);
+  await h.sendAndFlush(h.at({ text: `${long}一` }));
+  await h.sendAndFlush(h.at({ text: `${long}二` }));
+  await h.sendAndFlush(h.at({ text: '看看前面' }));
+  assert.equal(h.dispatched.at(-1).history.length, 2, 'positive control');
+  h.eff.current.retention.contextMaxTokens = 600;
+  await h.sendAndFlush(h.at({ text: '再看看前面' }));
+  const bodies = JSON.stringify(h.dispatched.at(-1).history);
+  assert.equal(bodies.includes(long), false, 'over the new per-line cap');
+  await h.close();
+});
+
+test('a lower age cap reaches the buffer in the hourly sweep, with no event in between', async () => {
+  const h = makeHarness();
+  await h.sendAndFlush(h.at({ text: '早些时候说的话' }));
+  h.eff.current.retention.contextMaxAgeHours = 0.5;
+  h.advance(HOUR);
+  // Back up before the next event: only the sweep can have dropped the line by now.
+  h.eff.current.retention.contextMaxAgeHours = 24;
+  await h.sendAndFlush(h.at({ text: '现在问一句' }));
+  assert.deepEqual(h.dispatched.at(-1).history, []);
+  await h.close();
+});
+
+test('positive control for the sweep: with the cap unchanged the line is still there after the hour', async () => {
+  const h = makeHarness();
+  await h.sendAndFlush(h.at({ text: '早些时候说的话' }));
+  h.advance(HOUR);
+  await h.sendAndFlush(h.at({ text: '现在问一句' }));
+  assert.equal(h.dispatched.at(-1).history.length, 1);
+  await h.close();
+});
+
+test('a changed window length applies from the next window that opens', async () => {
+  const h = makeHarness();
+  await h.sendAndFlush(h.event({ text: '第一个窗口的问题', senderId: MEMBER }));
+  assert.equal(h.decideCalls.length, 1);
+  h.advance(10 * 60000);
+  h.eff.current.window.windowMs = 1000;
+  await h.send(h.event({ text: '第二个窗口的问题', senderId: MEMBER }));
+  h.advance(999);
+  const settle = async () => {
+    for (let i = 0; i < 50; i += 1) await new Promise((r) => setImmediate(r));
+  };
+  await settle();
+  assert.equal(h.decideCalls.length, 1, 'still open just before the new length');
+  h.advance(1);
+  await settle();
+  assert.equal(h.decideCalls.length, 2, 'closed at the new length, not the old one');
+  await h.close();
 });

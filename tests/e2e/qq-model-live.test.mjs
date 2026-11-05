@@ -35,6 +35,8 @@ before(async () => {
   cfg.qq.appId = APP_ID;
   cfg.qq.apiBaseUrl = qq.base;
   cfg.qq.tokenBaseUrl = qq.base;
+  // The mock Key's default limit differs from the example config, and clo mode live refuses a difference.
+  model.setKey({ limit: cfg.budget.keyDailyLimitUsd, limit_remaining: cfg.budget.keyDailyLimitUsd });
   r = makeRoot('model-live', cfg);
   env = { CLO_TEST_NODE_IMPORT: NET_GUARD, CLO_NET_GUARD_LOG: join(r.root, 'net-guard.jsonl') };
 });

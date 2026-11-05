@@ -55,6 +55,8 @@ test('starts with no model lock and no model key, and connects', { timeout: 3000
   const started = await run(['start']);
   assert.equal(started.code, 0, `${started.out}${started.err}`);
   assert.match(started.out, /模式 dry-run/);
+  assert.doesNotMatch(started.out, /\d+.\d+ 秒/, 'no connect time is promised: nothing on record backs one');
+  assert.equal(existsSync(join(r.root, '.runtime', 'pids', 'start.lock')), false, 'the start lock is released once the start is done');
   const rendered = openclawOf(r.root);
   assert.equal(rendered.agents.defaults.model, undefined, 'no model is rendered before the lock');
   assert.equal(rendered.models.providers, undefined);
@@ -139,6 +141,8 @@ test('stop ends it, the socket closes, and nothing is left running or outside th
   assert.equal(stopped.code, 0, stopped.err);
   assert.equal(pidAlive(rec.pid), false);
   assert.equal(existsSync(pidFile()), false);
+  assert.equal(withDb(r.root, (store) => store.getControl('heartbeat_at')), null, 'a stopped Gateway leaves no heartbeat to read as fresh');
+  assert.equal(JSON.parse((await run(['status', '--json'])).out).heartbeatFresh, false);
   await until(() => qq.connected() === 0, 'the socket to close', 15000);
   const doctor = await run(['doctor', '--config-only']);
   assert.ok(doctor.out.includes('[通过] render_fresh'), doctor.out);

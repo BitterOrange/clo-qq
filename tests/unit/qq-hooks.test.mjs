@@ -169,6 +169,18 @@ test('before_prompt_build returns the file when on, and nothing when off or unre
   assert.equal(gone.handlers.get('before_prompt_build')({}, {}), undefined);
 });
 
+test('before_prompt_build with an unreadable file alerts, still does not refuse the turn; the other two states stay quiet', () => {
+  const gone = hookStack({ systemPrompt: () => null });
+  assert.equal(gone.handlers.get('before_prompt_build')({}, {}), undefined);
+  assert.deepEqual(gone.alerts, [{ kind: 'prompt_replace', detail: { state: 'unreadable' } }]);
+  const on = hookStack();
+  on.handlers.get('before_prompt_build')({}, {});
+  assert.deepEqual(on.alerts, []);
+  const off = hookStack({ getEffective: () => ({ privacy: { replaceSystemPrompt: false } }), systemPrompt: () => null });
+  off.handlers.get('before_prompt_build')({}, {});
+  assert.deepEqual(off.alerts, []);
+});
+
 test('before_agent_run: pass when whole, block with no policy text otherwise, and alert', () => {
   const s = hookStack();
   const run = s.handlers.get('before_agent_run');
@@ -236,6 +248,148 @@ test('usage after close goes to the turn that just closed: one settled row and n
   t.stop();
   store.close();
   rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+});
+
+test('a run still going when its turn closed: its next usage goes back to it, with the next turn open or closed', async () => {
+  for (const nextIs of ['open', 'closed']) {
+    const bus = fakeBus();
+    const ledger = fakeLedger();
+    const t = tracker(bus, ledger);
+    t.open('S', { turnId: 'A', eventKey: 'EV-A' });
+    await t.close('A', { runActive: true });
+    t.open('S', { turnId: 'B', eventKey: 'EV-B' });
+    if (nextIs === 'closed') await t.close('B');
+    bus.emit(usageEvent('S'));
+    assert.equal(ledger.calls.at(-1)[1], 'EV-A', nextIs);
+    bus.emit(usageEvent('S'));
+    if (nextIs === 'open') {
+      assert.equal(ledger.calls.length, 1, 'only one event was owed');
+      assert.equal((await t.close('B')).input, 1000, 'the turn that came after keeps its own');
+    } else {
+      assert.equal(ledger.calls.at(-1)[1], 'EV-B', 'only one event was owed');
+    }
+    t.stop();
+  }
+});
+
+test('a run begun after the owed turn closed keeps its own usage, open or closed, and the old run still pays its debt', async () => {
+  for (const nextIs of ['open', 'closed']) {
+    const bus = fakeBus();
+    const ledger = fakeLedger();
+    let at = 10000;
+    const t = tracker(bus, ledger, { now: () => at });
+    t.open('S', { turnId: 'A', eventKey: 'EV-A' });
+    await t.close('A', { runActive: true });
+    at = 10500;
+    t.open('S', { turnId: 'B', eventKey: 'EV-B' });
+    if (nextIs === 'closed') await t.close('B');
+    at = 11000;
+    bus.emit(usageEvent('S', { ts: at, durationMs: 400 }));
+    if (nextIs === 'open') assert.equal(ledger.calls.length, 0, 'the next run is not billed to the aborted turn');
+    else assert.equal(ledger.calls.at(-1)[1], 'EV-B', 'the next run is not billed to the aborted turn');
+    const before = ledger.calls.length;
+    at = 11100;
+    bus.emit(usageEvent('S', { ts: at, durationMs: 9000 }));
+    assert.equal(ledger.calls.length, before + 1, nextIs);
+    assert.equal(ledger.calls.at(-1)[1], 'EV-A', 'positive control: the run from before the close is still owed');
+    if (nextIs === 'open') assert.equal((await t.close('B')).input, 1000, 'one event, not both');
+    t.stop();
+  }
+});
+
+test('usage from the old run does not stand in for the next turn, so a real gap in its usage still shows', async () => {
+  const bus = fakeBus();
+  const ledger = fakeLedger();
+  let at = 10000;
+  const t = tracker(bus, ledger, { now: () => at });
+  t.open('S', { turnId: 'A', eventKey: 'EV-A' });
+  await t.close('A', { runActive: true });
+  at = 10500;
+  t.open('S', { turnId: 'B', eventKey: 'EV-B' });
+  at = 11000;
+  bus.emit(usageEvent('S', { ts: at, durationMs: 1001 }));
+  assert.equal(ledger.calls.at(-1)[1], 'EV-A', 'one millisecond before the close is still the old run');
+  assert.equal(await t.close('B'), null);
+  t.stop();
+});
+
+test('a usage event delivered late is placed by when it fired, not by when it arrived', async () => {
+  const bus = fakeBus();
+  const ledger = fakeLedger();
+  let at = 10000;
+  const t = tracker(bus, ledger, { now: () => at });
+  t.open('S', { turnId: 'A', eventKey: 'EV-A' });
+  await t.close('A', { runActive: true });
+  t.open('S', { turnId: 'B', eventKey: 'EV-B' });
+  at = 20000;
+  bus.emit(usageEvent('S', { ts: 10100, durationMs: 5000 }));
+  assert.equal(ledger.calls.at(-1)[1], 'EV-A');
+  t.stop();
+});
+
+test('with no usable run age, the owed turn takes the event; a missing timestamp reads the clock', async () => {
+  for (const over of [{}, { durationMs: null }, { durationMs: '1' }, { durationMs: Number.NaN }, { durationMs: -1, ts: 99999 }]) {
+    const bus = fakeBus();
+    const ledger = fakeLedger();
+    let at = 10000;
+    const t = tracker(bus, ledger, { now: () => at });
+    t.open('S', { turnId: 'A', eventKey: 'EV-A' });
+    await t.close('A', { runActive: true });
+    at = 10500;
+    t.open('S', { turnId: 'B', eventKey: 'EV-B' });
+    at = 11000;
+    bus.emit(usageEvent('S', over));
+    assert.equal(ledger.calls.at(-1)[1], 'EV-A', JSON.stringify(over));
+    t.stop();
+  }
+  const bus = fakeBus();
+  const ledger = fakeLedger();
+  let at = 10000;
+  const t = tracker(bus, ledger, { now: () => at });
+  t.open('S', { turnId: 'A', eventKey: 'EV-A' });
+  await t.close('A', { runActive: true });
+  at = 11000;
+  t.open('S', { turnId: 'B', eventKey: 'EV-B' });
+  bus.emit(usageEvent('S', { durationMs: 400 }));
+  assert.equal(ledger.calls.length, 0, 'no ts: the clock says this run began after the close');
+  assert.equal((await t.close('B')).input, 1000);
+  t.stop();
+});
+
+test('a run that ended, or an owed event past the late window, no longer takes the next turn usage', async () => {
+  const bus = fakeBus();
+  const ledger = fakeLedger();
+  let at = 1000;
+  const t = tracker(bus, ledger, { now: () => at, lateUsageMs: 500 });
+  t.open('S', { turnId: 'A', eventKey: 'EV-A' });
+  await t.close('A', { runActive: true });
+  await t.runEnded('A');
+  t.open('S', { turnId: 'B', eventKey: 'EV-B' });
+  bus.emit(usageEvent('S'));
+  assert.equal(ledger.calls.length, 0, 'ended: B keeps it');
+  assert.equal((await t.close('B')).input, 1000);
+
+  t.open('S', { turnId: 'C', eventKey: 'EV-C' });
+  await t.close('C', { runActive: true });
+  at += 501;
+  t.open('S', { turnId: 'D', eventKey: 'EV-D' });
+  bus.emit(usageEvent('S'));
+  assert.equal(ledger.calls.length, 0, 'too old: D keeps it');
+  assert.equal((await t.close('D')).input, 1000);
+  t.stop();
+});
+
+test('an owed usage event with no usable figure leaves the debt in place', async () => {
+  const bus = fakeBus();
+  const ledger = fakeLedger();
+  const t = createUsageTracker({ onInternalDiagnosticEvent: bus.on, ledger, price: () => null, drainWaitMs: 10 });
+  t.open('S', { turnId: 'A', eventKey: 'EV-A' });
+  await t.close('A', { runActive: true });
+  bus.emit(usageEvent('S'));
+  assert.equal(ledger.calls.length, 0);
+  bus.emit(usageEvent('S', { costUsd: 0.01 }));
+  assert.equal(ledger.calls.at(-1)[1], 'EV-A');
+  t.stop();
 });
 
 test('usage after the late window, or for a session never seen, stays unattributed', async () => {

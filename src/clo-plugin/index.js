@@ -1,4 +1,5 @@
 // The clo-qq channel on @tencent-connect/qqbot-nodejs, for OpenClaw. Group chat only in this build.
+import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import {
   createChannelPluginBase,
   createChatChannelPlugin,
@@ -7,7 +8,7 @@ import {
 import { defineStableChannelIngressIdentity } from 'openclaw/plugin-sdk/channel-ingress-runtime';
 import { createGate } from './lib/core/gate.js';
 import { utcDay } from './lib/core/ids.js';
-import { runConnection } from './lib/channels/qq/connection.js';
+import { createDownWatch, runConnection } from './lib/channels/qq/connection.js';
 import { createDispatcher } from './lib/channels/qq/dispatch.js';
 import { registerHooks } from './lib/channels/qq/hooks.js';
 import { attachUsage, getServices, liveSecrets, stopServices } from './lib/channels/qq/services.js';
@@ -18,6 +19,7 @@ const ACCOUNT_ID = 'default';
 const USER_AGENT = `clo-qq/1 (Node/${process.versions.node})`;
 const HEARTBEAT_MS = 30000;
 const JANITOR_MS = 3600000;
+const DOWN_CHECK_MS = 60000;
 // Well below the 1000 a day session_start_limit the plan records. The SDK's own reconnects also count.
 const LIVENESS_RESTARTS_PER_DAY = 100;
 
@@ -66,7 +68,67 @@ function terminal(ctx, lastError) {
   ctx.setStatus({ ...ctx.getStatus(), running: false, connected: false, terminalDisconnect: true, lastError });
 }
 
-async function startAccount(ctx) {
+// A fatal close must outlive a database that cannot be written, or the next start would reconnect to the
+// account the platform just closed. The file is written first and dropped once the store holds the code.
+// The last resort, for when the file cannot be written either, lasts as long as this module instance.
+let unsavedClose = null;
+const closeFilePath = (dbPath) => `${dbPath}.terminal_close`;
+
+function saveCloseFile(dbPath, code) {
+  try {
+    const path = closeFilePath(dbPath);
+    writeFileSync(`${path}.tmp`, String(code));
+    renameSync(`${path}.tmp`, path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Fails closed: a file that exists but cannot be read still counts as a latch.
+function readCloseFile(dbPath) {
+  try {
+    return readFileSync(closeFilePath(dbPath), 'utf8').trim() || 'unknown';
+  } catch (err) {
+    return err?.code === 'ENOENT' ? null : 'unknown';
+  }
+}
+
+function dropCloseFile(dbPath) {
+  try {
+    rmSync(closeFilePath(dbPath), { force: true });
+  } catch {
+    // The next start reads it as a latch, which is the safe direction.
+  }
+}
+
+/** Wraps dispatchTurn so the host's health policy sees a running turn as busy, not as a channel to restart. */
+export function trackRuns(dispatchTurn, ctx, now = Date.now) {
+  let active = 0;
+  let startedAt = null;
+  // A status report must not change how a turn ends.
+  const report = (at) => {
+    try {
+      ctx.setStatus({ ...ctx.getStatus(), busy: active > 0, activeRuns: active, activeRunStartedAt: active > 0 ? startedAt : null, lastRunActivityAt: at });
+    } catch {
+      // Without the report the host may restart the channel mid-turn, and nothing here can prevent that.
+    }
+  };
+  return async (...args) => {
+    const at = now();
+    if (active === 0) startedAt = at;
+    active += 1;
+    report(at);
+    try {
+      return await dispatchTurn(...args);
+    } finally {
+      active -= 1;
+      report(now());
+    }
+  };
+}
+
+export async function startAccount(ctx) {
   const { account } = ctx;
   const rt = pickChannelRuntime(ctx.channelRuntime, pluginRuntime?.channel, testOverride());
   let services;
@@ -96,7 +158,21 @@ async function startAccount(ctx) {
     terminal(ctx, 'account does not match configuration');
     return;
   }
-  const latched = store.getControl('terminal_close');
+  const dbPath = getEffective().paths.db;
+  const stored = store.getControl('terminal_close');
+  const filed = readCloseFile(dbPath);
+  const latched = stored ?? filed ?? unsavedClose;
+  if (filed !== null) {
+    try {
+      if (stored === null) {
+        store.setControl('terminal_close', filed, 'connection');
+        store.addAlert('terminal_close', { closeCode: Number(filed) });
+      }
+      dropCloseFile(dbPath);
+    } catch {
+      log('status_error', { reason: 'terminal_close' });
+    }
+  }
   if (latched !== null) {
     log('start_refused', { reason: 'terminal', closeCode: Number(latched) });
     terminal(ctx, `gateway closed with code ${latched}`);
@@ -111,19 +187,29 @@ async function startAccount(ctx) {
   const usage = await attachUsage(services);
 
   let exitRef = null;
-  const dispatchTurn = createDispatcher({ rt, getCfg: () => ctx.cfg, account, getExit: () => exitRef, identity, usage, log });
+  const dispatchTurn = trackRuns(createDispatcher({ rt, getCfg: () => ctx.cfg, account, getExit: () => exitRef, identity, usage, log }), ctx);
   const gate = createGate({ store, ledger, policy, getEffective, decide, dispatchTurn, log });
 
+  const downWatch = createDownWatch({ store, log });
+  let connectedNow = false;
+
+  // The host's view comes first: a locked database must not leave it believing an old state.
   const onStatus = ({ connected, lastReadyAt, lastResumedAt, lastDisconnectCode, username }) => {
-    store.setControl('connected', connected ? 'true' : 'false', 'connection');
-    if (lastReadyAt) store.setControl('last_ready_at', lastReadyAt, 'connection');
-    if (username) store.setControl('ready_username', username, 'connection');
+    connectedNow = connected;
     ctx.setStatus({
       ...ctx.getStatus(),
       connected,
       lastConnectedAt: lastResumedAt ?? lastReadyAt ?? undefined,
       lastDisconnect: lastDisconnectCode === null ? undefined : { at: Date.now(), status: lastDisconnectCode },
     });
+    try {
+      store.setControl('connected', connected ? 'true' : 'false', 'connection');
+      if (lastReadyAt) store.setControl('last_ready_at', lastReadyAt, 'connection');
+      if (username) store.setControl('ready_username', username, 'connection');
+    } catch {
+      log('status_error', { reason: 'connection' });
+    }
+    downWatch.check(connected);
   };
 
   const beat = () => {
@@ -133,9 +219,13 @@ async function startAccount(ctx) {
       log('heartbeat_error', {});
     }
   };
+  downWatch.begin(store.getControl('heartbeat_at'));
   beat();
+  downWatch.check(false);
   const heartbeat = setInterval(beat, HEARTBEAT_MS);
   heartbeat.unref?.();
+  const downTimer = setInterval(() => downWatch.check(connectedNow), DOWN_CHECK_MS);
+  downTimer.unref?.();
   const janitor = setInterval(() => {
     try {
       const eff = getEffective();
@@ -147,23 +237,40 @@ async function startAccount(ctx) {
   janitor.unref?.();
   ledger.startTimers();
 
-  ctx.setStatus({ ...ctx.getStatus(), running: true, connected: false, lastStartAt: started, terminalDisconnect: false, lastError: null });
+  ctx.setStatus({ ...ctx.getStatus(), running: true, connected: false, lastStartAt: started, terminalDisconnect: false, lastError: null, busy: false, activeRuns: 0, activeRunStartedAt: null });
 
   const takeRestartSlot = () => {
     const at = Date.now();
     return store.bumpCounter(`conn_restart:${utcDay(at)}`, at + 2 * 86400000, LIVENESS_RESTARTS_PER_DAY).ok;
   };
+  // Every step runs, whatever the one before it did: the caller still has to report terminal to the host.
   const stopAll = async () => {
     clearInterval(heartbeat);
     clearInterval(janitor);
-    exitRef?.stop();
-    await gate.stop();
+    clearInterval(downTimer);
+    try {
+      exitRef?.stop();
+      await gate.stop();
+    } catch {
+      log('status_error', { reason: 'stop' });
+    }
     try {
       store.setControl('connected', 'false', 'connection');
     } catch {
-      log('status_error', {});
+      log('status_error', { reason: 'connection' });
     }
-    stopServices();
+    try {
+      stopServices();
+    } catch {
+      log('status_error', { reason: 'services' });
+    }
+  };
+  const alertQuietly = (kind, detail) => {
+    try {
+      store.addAlert(kind, detail);
+    } catch {
+      log('status_error', { reason: 'alert' });
+    }
   };
 
   try {
@@ -177,7 +284,7 @@ async function startAccount(ctx) {
         gate.attachExit(exit);
       },
       onStatus,
-      onAlert: (kind, detail) => store.addAlert(kind, detail),
+      onAlert: alertQuietly,
       takeRestartSlot,
       log,
       userAgent: USER_AGENT,
@@ -185,14 +292,22 @@ async function startAccount(ctx) {
   } catch (err) {
     // A fatal close stays stopped. The code is quoted as is; the cause is not inferred.
     if (typeof err?.closeCode === 'number') {
-      store.setControl('terminal_close', err.closeCode, 'connection');
-      store.addAlert('terminal_close', { closeCode: err.closeCode });
+      const savedToFile = saveCloseFile(dbPath, err.closeCode);
+      try {
+        store.setControl('terminal_close', err.closeCode, 'connection');
+        if (savedToFile) dropCloseFile(dbPath);
+      } catch {
+        log('status_error', { reason: 'terminal_close' });
+        if (!savedToFile) unsavedClose = err.closeCode;
+      }
+      alertQuietly('terminal_close', { closeCode: err.closeCode });
       log('connection_fatal', { closeCode: err.closeCode });
       await stopAll();
       terminal(ctx, `gateway closed with code ${err.closeCode}`);
       return;
     }
     log('connection_error', { kind: String(err?.name ?? 'Error').slice(0, 32) });
+    alertQuietly('connection_failed', { kind: String(err?.name ?? 'Error').slice(0, 32) });
     await stopAll();
     terminal(ctx, 'connection failed');
     return;

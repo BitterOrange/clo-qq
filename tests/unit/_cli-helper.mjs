@@ -118,7 +118,7 @@ export const CATALOG = () => [
 const jsonRes = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
 // A loopback-shaped provider. Records calls, so a test can prove one did or did not happen.
-export function fakeProvider({ catalog = CATALOG(), key = { usage: 0, limit: 3.25, limit_remaining: 3.25, limit_reset: 'daily', usage_daily: 0 } } = {}) {
+export function fakeProvider({ catalog = CATALOG(), key = { usage: 0, limit: 1.6, limit_remaining: 1.6, limit_reset: 'daily', usage_daily: 0 } } = {}) {
   const calls = [];
   const state = { catalog, key };
   const fetch = async (url, init) => {

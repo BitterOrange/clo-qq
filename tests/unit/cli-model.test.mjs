@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
-import { baseConfig, CATALOG, catalogRow, clo, configOf, effectiveOf, enabledConfig, fakeProvider, makeRoot, openclawOf, readJson } from './_cli-helper.mjs';
+import { baseConfig, CATALOG, catalogRow, clo, configOf, effectiveOf, enabledConfig, fakeProvider, makeRoot, openclawOf, readJson, readyForLive } from './_cli-helper.mjs';
 
 const roots = [];
 const root = (label, cfg) => {
@@ -194,4 +194,104 @@ test('a budget too small for one required turn is called out', async () => {
   const res = await clo(r, ['model', 'refresh'], { fetch: fakeProvider().fetch });
   assert.equal(res.code, 0);
   assert.match(res.out, /永远得不到额度/);
+});
+
+const newOpus = (p) => {
+  p.state.catalog.push(catalogRow('anthropic/claude-opus-5.6', 200));
+  p.state.catalog.find((m) => m.id.startsWith('~')).created = 200;
+};
+
+test('set-primary to the same selector counts as a change when it resolves to a new model', async () => {
+  const r = root('sameselector', enabledConfig());
+  const p = fakeProvider();
+  await clo(r, ['model', 'refresh'], { fetch: p.fetch });
+  const same = await clo(r, ['model', 'set-primary', 'opus-latest'], { fetch: p.fetch });
+  assert.equal(same.code, 0, `positive control, nothing new: ${same.out}${same.err}`);
+  assert.equal(lockOf(r).changes.length, 0);
+
+  newOpus(p);
+  const before = snapshot(r);
+  const refused = await clo(r, ['model', 'set-primary', 'opus-latest'], { fetch: p.fetch });
+  assert.equal(refused.code, 1);
+  assert.match(refused.err, /--qq-platform-notified/);
+  assert.deepEqual(snapshot(r), before);
+  assert.equal(effectiveOf(r).models.primary.id, 'anthropic/claude-opus-5.5');
+
+  assert.equal((await clo(r, ['model', 'set-primary', 'opus-latest', '--qq-platform-notified'], { fetch: p.fetch })).code, 0);
+  assert.equal(lockOf(r).lock.primary.id, 'anthropic/claude-opus-5.6');
+  assert.equal(lockOf(r).changes.length, 1);
+});
+
+test('a set command does not carry along the other model: it refuses and points at refresh', async () => {
+  const r = root('otherslot', enabledConfig());
+  const p = fakeProvider();
+  await clo(r, ['model', 'refresh'], { fetch: p.fetch });
+  newOpus(p);
+  let before = snapshot(r);
+  // With the flag given, so that this refusal cannot be the platform-notice one.
+  const decision = await clo(r, ['model', 'set-decision', 'anthropic/claude-sonnet-5.5', '--qq-platform-notified'], { fetch: p.fetch });
+  assert.equal(decision.code, 1);
+  assert.match(decision.err, /主模型现在解析到 anthropic\/claude-opus-5\.6/);
+  assert.match(decision.err, /clo model refresh/);
+  assert.deepEqual(snapshot(r), before);
+
+  await clo(r, ['model', 'refresh', '--qq-platform-notified'], { fetch: p.fetch });
+  const cfg = configOf(r);
+  cfg.decisionModel.id = 'anthropic/claude-sonnet-5.5';
+  writeFileSync(join(r, 'config.json'), JSON.stringify(cfg));
+  before = snapshot(r);
+  const primary = await clo(r, ['model', 'set-primary', 'anthropic/claude-opus-5', '--qq-platform-notified'], { fetch: p.fetch });
+  assert.equal(primary.code, 1);
+  assert.match(primary.err, /判定模型现在解析到/);
+  assert.deepEqual(snapshot(r), before);
+});
+
+test('a bad id on a set command still reports through the model check, with a lock in place', async () => {
+  const r = root('badset');
+  const p = fakeProvider();
+  await clo(r, ['model', 'refresh'], { fetch: p.fetch });
+  for (const sub of ['set-primary', 'set-decision']) {
+    const res = await clo(r, ['model', sub, 'openrouter/auto'], { fetch: p.fetch });
+    assert.equal(res.code, 1, sub);
+    assert.match(res.err, /模型检查没有通过/, sub);
+  }
+});
+
+test('a model change that the resulting config would refuse writes neither config nor lock', async () => {
+  const r = root('commitrefused');
+  const p = fakeProvider();
+  await readyForLive(r, p);
+  assert.equal((await clo(r, ['mode', 'live'], { fetch: p.fetch })).code, 0);
+  const notified = ['--qq-platform-notified'];
+  const cfg = configOf(r);
+  cfg.acks.d3 = '   ';
+  writeFileSync(join(r, 'config.json'), JSON.stringify(cfg));
+  const before = snapshot(r);
+  const res = await clo(r, ['model', 'set-primary', 'anthropic/claude-sonnet-5.5', ...notified], { fetch: p.fetch });
+  assert.equal(res.code, 1);
+  assert.match(res.err, /d3/);
+  assert.deepEqual(snapshot(r), before);
+
+  cfg.acks.d3 = 'test-only decision';
+  writeFileSync(join(r, 'config.json'), JSON.stringify(cfg));
+  const ok = await clo(r, ['model', 'set-primary', 'anthropic/claude-sonnet-5.5', ...notified], { fetch: p.fetch });
+  assert.equal(ok.code, 0, `positive control, the new model renders under its new lock while live: ${ok.out}${ok.err}`);
+  assert.equal(effectiveOf(r).mode, 'live');
+  assert.equal(effectiveOf(r).models.primary.id, 'anthropic/claude-sonnet-5.5');
+});
+
+test('check compares prices when the model is the same', async () => {
+  const r = root('checkprice');
+  const p = fakeProvider();
+  await clo(r, ['model', 'refresh'], { fetch: p.fetch });
+  assert.match((await clo(r, ['model', 'check'], { fetch: p.fetch })).out, /与锁定一致/, 'positive control');
+  for (const m of p.state.catalog) {
+    if (m.id.includes('opus')) m.pricing = { ...m.pricing, completion: '0.000025' };
+  }
+  const before = snapshot(r);
+  const res = await clo(r, ['model', 'check'], { fetch: p.fetch });
+  assert.equal(res.code, 0);
+  assert.doesNotMatch(res.out, /与锁定一致/);
+  assert.match(res.out, /目录价格和锁定时不同/);
+  assert.deepEqual(snapshot(r), before);
 });

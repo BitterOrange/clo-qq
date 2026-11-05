@@ -30,7 +30,9 @@ after(async () => {
 
 // Real gate, store, ledger, policy and exit. Only the host and the QQ API are fake. holdFirst keeps the first model turn
 // running until it is released, the way a slow reply does.
-function stack({ decide, effective, holdFirst = false } = {}) {
+// holdAfterReply: the first run hands over its whole reply, then dispatchTurn waits on h.hold, as it does while the
+// usage stream drains after the host run has ended.
+function stack({ decide, effective, holdFirst = false, holdAfterReply = false } = {}) {
   const posts = [];
   const results = [];
   const hold = deferred();
@@ -59,6 +61,10 @@ function stack({ decide, effective, holdFirst = false } = {}) {
     if (holdFirst && host.ran.length === 1) await hold.promise;
     h.onModelRun?.();
     h.exit.collect(turn.turnId, { text: REPLY }, { kind: 'final' });
+    if (holdAfterReply && host.ran.length === 1) {
+      h.replyHandedOver = true;
+      await hold.promise;
+    }
     return { started: true, hostError: false, aborted: false, usage: USAGE };
   };
   h = makeHarness({ decide, effective, dispatch, attach: false });
@@ -453,6 +459,46 @@ test('positive control: with no /stop the waiting reply posts', async () => {
   assert.deepEqual(h.postedTo(e), [REPLY]);
 });
 
+// ---- /stop after the host run has ended, before the turn reaches the exit ----
+
+async function stopAfterReply(text) {
+  const h = stack({ holdAfterReply: true });
+  const e = await h.send(h.at({ text, senderId: MEMBER }));
+  await until(() => h.replyHandedOver === true);
+  const stop = await h.stop();
+  h.hold.resolve();
+  await h.gate.idle();
+  return { h, e, stop };
+}
+
+test('a reply for a person in danger handed over before /stop still goes out', async () => {
+  const { h, e, stop } = await stopAfterReply(CRISIS);
+  assert.equal(h.state(e), 'completed:sent');
+  assert.deepEqual(h.postedTo(e), [REPLY], 'the reply, not the failure line');
+  assert.equal(h.alertKinds().includes('crisis_refused'), false);
+  assert.equal(h.postedTo(stop).length, 1);
+  assert.equal(h.pausedBy(), null);
+});
+
+test('an ordinary reply handed over before /stop stays silent', async () => {
+  const { h, e } = await stopAfterReply('讲个长故事');
+  assert.equal(h.state(e), 'failed:aborted');
+  assert.deepEqual(h.postedTo(e), []);
+  assert.deepEqual(h.alertKinds(), []);
+});
+
+test('positive control: a person in danger whose run /stop cut off before any reply gets the failure line', async () => {
+  const h = stack({ holdFirst: true });
+  const e = await h.send(h.at({ text: CRISIS, senderId: MEMBER }));
+  await until(() => h.host.ran.length === 1);
+  await h.stop();
+  h.hold.resolve();
+  await h.gate.idle();
+  assert.equal(h.state(e), 'failed:aborted');
+  assert.deepEqual(h.postedTo(e), [LINES.modelFailed]);
+  assert.deepEqual(h.alertKinds(), ['crisis_refused']);
+});
+
 // ---- a member's /stop ----
 
 test("a member's /stop leaves a running turn, a queued @ and queued names alone", async () => {
@@ -610,4 +656,82 @@ test('QQ switched off during a connect retry: the retry does not go out', async 
   h.onPost = () => switchOff(h);
   assert.deepEqual(await h.exit.commandAck(refOf(h), '好'), { sent: false, reason: 'send_not_connected' });
   assert.equal(h.posts.length, 1);
+});
+
+// ---- /stop across a restart ----
+
+async function stoppedThenRestarted(over = {}) {
+  const first = makeHarness();
+  const stop = await first.send(first.at({ text: '/stop', senderId: OWNER }));
+  await first.gate.idle();
+  assert.equal(first.dispatched.at(-1).authorizedCommand, '/stop', 'the premise');
+  const stopTs = stop.timestampMs;
+  const { file } = first;
+  await first.close();
+  const h = makeHarness({ dbFile: file, start: stopTs + 5000, ...over });
+  open.push(h);
+  return { h, stopTs };
+}
+
+test('after a restart, an @ older than /stop does not reach the host: it would meet the cutoff the host kept', async () => {
+  const { h, stopTs } = await stoppedThenRestarted();
+  const e = await h.send(h.at({ text: '迟到的问题', timestampMs: stopTs - 1000 }));
+  await h.gate.idle();
+  assert.equal(h.state(e), 'skipped:owner_stop');
+  assert.equal(h.dispatched.length, 0);
+  assert.equal(h.reservations(e).length, 0);
+});
+
+test('after a restart, a late ordinary message older than /stop buys nothing', async () => {
+  const { h, stopTs } = await stoppedThenRestarted();
+  const e = await h.send(h.event({ text: '迟到的普通消息内容', timestampMs: stopTs - 1000 }));
+  h.advance(4000);
+  await h.gate.idle();
+  assert.equal(h.state(e), 'skipped:owner_stop');
+  assert.equal(h.decideCalls.length, 0);
+  assert.equal(h.store.getControl('paid_paused'), null);
+});
+
+test('after a restart, words of danger older than /stop still go on', async () => {
+  const { h, stopTs } = await stoppedThenRestarted();
+  const e = await h.send(h.at({ text: CRISIS, timestampMs: stopTs - 1000 }));
+  await h.gate.idle();
+  assert.equal(h.state(e), 'completed:sent');
+  assert.equal(h.dispatched.length, 1);
+});
+
+test('after a restart, an @ in the same second or later is answered: arrival order is gone, and it may be newer', async () => {
+  const { h, stopTs } = await stoppedThenRestarted();
+  const same = await h.send(h.at({ text: '同一秒的问题', timestampMs: stopTs }));
+  const after2 = await h.send(h.at({ text: '之后的问题', timestampMs: stopTs + 1000 }));
+  await h.gate.idle();
+  assert.equal(h.state(same), 'completed:sent');
+  assert.equal(h.state(after2), 'completed:sent');
+});
+
+test('after a restart, another group knows nothing of this /stop', async () => {
+  const { h, stopTs } = await stoppedThenRestarted();
+  const e = await h.send(h.at({ text: '另一个群的问题', conversationId: GROUP_B, timestampMs: stopTs - 1000 }));
+  await h.gate.idle();
+  assert.equal(h.state(e), 'completed:sent');
+});
+
+test('only an authorized /stop is kept, and only as a message time', async () => {
+  const h = makeHarness();
+  open.push(h);
+  await h.send(h.at({ text: '/stop', senderId: MEMBER }));
+  await h.gate.idle();
+  assert.equal(h.control().some((c) => c.key.startsWith('owner_stop:')), false, 'a member\'s /stop leaves nothing');
+  const stop = await h.send(h.at({ text: '/stop', senderId: OWNER }));
+  await h.gate.idle();
+  assert.deepEqual(h.control().filter((c) => c.key.startsWith('owner_stop:')).map((c) => c.value), [String(stop.timestampMs)]);
+});
+
+test('an unreadable saved value is no /stop at all', async () => {
+  const h = makeHarness();
+  open.push(h);
+  h.store.setControl(`owner_stop:${h.store.key(GROUP_A)}`, 'not-a-time', 'test');
+  const e = await h.send(h.at({ text: '一个问题' }));
+  await h.gate.idle();
+  assert.equal(h.state(e), 'completed:sent');
 });

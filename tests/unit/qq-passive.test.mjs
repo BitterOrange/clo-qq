@@ -284,3 +284,35 @@ test('the URL guard removes anything the member did not send, in any case', () =
   assert.equal(removeUrls('a https://x.example b http://y.example c'), `a ${URL_REMOVED} b ${URL_REMOVED} c`);
   assert.equal(guardUrls('没有网址', []), '没有网址');
 });
+
+test('splitParts never cuts inside a URL, judging by the whole remaining text', () => {
+  const url = 'https://a.example/x?y=1';
+  // The limit falls right after the question mark. From the head alone the URL looks finished there.
+  assert.deepEqual(splitParts(`一二三四五 ${url}`, 26, 5), ['一二三四五', url]);
+  // No boundary at all: the hard cut moves back to where the URL starts.
+  const chars = '一'.repeat(25);
+  assert.deepEqual(splitParts(`${chars}${url}`, 30, 5), [chars, url]);
+  assert.deepEqual(splitParts(`${url}。后面还有一些话`, 26, 5), [`${url}。`, '后面还有一些话']);
+  // A sentence end before the URL is used, one inside it is not.
+  assert.deepEqual(splitParts(`一句话说完了。${url}`, 24, 5), ['一句话说完了。', url]);
+});
+
+test('a URL longer than a part is cut, since nothing else can be done, and the split still ends', () => {
+  const url = `https://a.example/${'x'.repeat(40)}`;
+  const parts = splitParts(url, 20, 5);
+  assert.equal(parts.join(''), url);
+  assert.ok(parts.every((part) => [...part].length <= 20));
+});
+
+test('clipToSentence does not end an interjection inside a URL', () => {
+  assert.deepEqual(clipToSentence('看 https://a.example/x?y=1', 22), ['看']);
+  assert.deepEqual(clipToSentence('看过了。https://a.example/x?y=1', 24), ['看过了。']);
+});
+
+test('the dot of a list number is not a sentence end; any other line-end dot still is', () => {
+  const parts = splitParts('引子一句话。\n1. 甲乙\n2. 丙丁戊己', 17, 5);
+  assert.deepEqual(parts, ['引子一句话。', '1. 甲乙\n2. 丙丁戊己']);
+  assert.deepEqual(clipToSentence('一句话。\n2. 后面很长', 8), ['一句话。']);
+  assert.deepEqual(clipToSentence('一句。\n  3. 后面很长', 9), ['一句。']);
+  assert.deepEqual(clipToSentence('版本是 2. 后面很长的内容', 8), ['版本是 2.']);
+});

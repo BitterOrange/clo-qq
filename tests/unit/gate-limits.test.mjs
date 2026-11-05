@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createGate } from '../../src/clo-plugin/lib/core/gate.js';
-import { decisionOf, deferred, fakeExit, GROUP_A, GROUP_B, groupEntry, makeEffective, makeHarness, MEMBER, MEMBER2, T0, USAGE } from '../fixtures/inbound.mjs';
+import { decisionOf, deferred, fakeExit, GROUP_A, GROUP_B, groupEntry, makeEffective, makeHarness, MEMBER, MEMBER2, OWNER, T0, USAGE } from '../fixtures/inbound.mjs';
 
 const MIN = 60000;
 const HOUR = 3600000;
@@ -594,14 +594,77 @@ test('a dispatch that threw settles as if the model ran, and the required turn e
   await h.close();
 });
 
-test('a turn the host refused at ingress releases its hold and ends skipped:ingress', async () => {
-  const h = makeHarness({ dispatch: async () => ({ started: false, reason: 'ingress', hostError: false, aborted: false, usage: null }) });
+const refusedByHost = (reason = 'ingress') => async () => ({ started: false, reason, hostError: false, aborted: false, usage: null });
+const alertsOf = (h, kind) => h.store.listAlerts().filter((a) => a.kind === kind);
+
+test('a turn the host refused at ingress releases its hold, ends skipped:ingress, and is not silent', async () => {
+  const h = makeHarness({ dispatch: refusedByHost() });
   const e = await h.sendAndFlush(h.at());
   assert.equal(h.state(e), 'skipped:ingress');
   assert.equal(h.reservations(e)[0].status, 'released');
   assert.equal(h.store.getControl('paid_paused'), null);
   assert.equal(h.exit.finished[0].aborted, true, 'the exit dropped it without sending');
+  assert.equal(alertsOf(h, 'host_refused').length, 1);
+  assert.deepEqual(h.exit.fixed.map((f) => [f.ref.eventKey, f.lineKey]), [[h.row(e).event_key, 'modelFailed']], 'the person hears something');
   await h.close();
+});
+
+test('positive control: a turn the host ran raises no host_refused and sends no failure line', async () => {
+  const h = makeHarness();
+  await h.sendAndFlush(h.at());
+  assert.equal(alertsOf(h, 'host_refused').length, 0);
+  assert.deepEqual(h.exit.fixed, []);
+  await h.close();
+});
+
+test('an interjection the host refused: the alert only, no failure line, and the spent claim stays spent', async () => {
+  const h = makeHarness({ dispatch: refusedByHost() });
+  const e = await h.sendAndFlush(h.event({ text: '有人知道怎么退货吗' }));
+  assert.equal(h.state(e), 'skipped:ingress');
+  assert.equal(alertsOf(h, 'host_refused').length, 1);
+  assert.deepEqual(h.exit.fixed, []);
+  assert.equal(h.claims()[0].status, 'consumed', 'giving it back would buy a decision for every message while the host refuses');
+  h.advance(MIN);
+  const next = await h.sendAndFlush(h.event({ text: '又来一个问题了' }));
+  assert.equal(h.state(next), 'skipped:cooldown');
+  assert.equal(h.decideCalls.length, 1);
+  await h.close();
+});
+
+test('a command the host refused: the alert only, no failure line', async () => {
+  const h = makeHarness({ dispatch: refusedByHost() });
+  const e = await h.send(h.at({ text: '/new', senderId: OWNER }));
+  await h.gate.idle();
+  assert.equal(h.state(e), 'skipped:ingress');
+  assert.equal(alertsOf(h, 'host_refused').length, 1);
+  assert.deepEqual(h.exit.fixed, []);
+  await h.close();
+});
+
+test('a turn the dispatcher found already expired raises the same alert as the gate\'s own expiry, danger included', async () => {
+  const h = makeHarness({ dispatch: refusedByHost('expired_before_dispatch') });
+  for (const text of ['你好，帮我看个问题', '我真的不想活了']) {
+    const e = await h.sendAndFlush(h.at({ text }));
+    assert.equal(h.state(e), 'skipped:expired_before_dispatch', text);
+  }
+  assert.equal(alertsOf(h, 'expired_before_dispatch').length, 2);
+  assert.equal(alertsOf(h, 'host_refused').length, 0);
+  assert.equal(h.exit.fixed.length, 2, 'the exit decides whether the line can still go');
+  await h.close();
+});
+
+test('a refused turn that /stop reached sends no failure line, unless the person is in danger', async () => {
+  for (const [text, lines] of [['讲个长故事', 0], ['我真的不想活了', 1]]) {
+    const block = deferred();
+    const h = makeHarness({ dispatch: async (turn) => (turn.authorizedCommand ? { started: true, hostError: false, aborted: false, usage: null } : block.promise) });
+    await h.send(h.at({ text }));
+    await tick();
+    await h.send(h.at({ text: '/stop', senderId: OWNER }));
+    block.resolve({ started: false, reason: 'ingress', hostError: false, aborted: false, usage: null });
+    await h.gate.idle();
+    assert.equal(h.exit.fixed.length, lines, text);
+    await h.close();
+  }
 });
 
 test('NO_REPLY on an interjection: silent, settled, cooldown still runs', async () => {
@@ -861,5 +924,80 @@ test('a member never gets a higher tier from their text alone', async () => {
   assert.equal(h.decideCalls[0].trigger, 'ordinary');
   assert.equal(h.state(e), 'skipped:decision_skip');
   assert.equal(h.dispatched.length, 0);
+  await h.close();
+});
+
+// ---- how the decision caps are shared ----
+
+const openGroup = (limits) => makeEffective({ limits, qq: { groups: { [GROUP_A]: groupEntry({ cooldownMinutes: 0, perHour: 100, perDay: 100 }) } } });
+const countOf = (h, prefix) => h.counters().filter((c) => c.key.startsWith(prefix)).reduce((n, c) => n + Number(c.value), 0);
+
+test('ordinary messages stop at five sixths of the group hour cap, and the rest stays open for names', async () => {
+  const h = makeHarness({ effective: openGroup({ decisionsPerGroupPerHour: 6 }), decide: async () => decisionOf({ action: 'skip' }) });
+  for (let i = 0; i < 5; i += 1) assert.equal(h.state(await h.sendAndFlush(h.event({ text: `普通消息第${i}条内容` }))), 'skipped:decision_skip', String(i));
+  const refused = await h.sendAndFlush(h.event({ text: '普通消息再来一条内容' }));
+  assert.equal(h.state(refused), 'skipped:decision_cap');
+  assert.equal(h.decideCalls.length, 5);
+  const name = await h.sendAndFlush(h.event({ text: '可洛你看看这个怎么办' }));
+  assert.equal(h.state(name), 'skipped:decision_skip', 'a name takes the sixth');
+  assert.equal(h.decideCalls.length, 6);
+  const over = await h.sendAndFlush(h.event({ text: '可洛你再看看这个怎么办' }));
+  assert.equal(h.state(over), 'skipped:decision_cap', 'a name still has the whole cap as its limit');
+  await h.close();
+});
+
+test('ordinary messages stop at five sixths of the day cap too, and names go on', async () => {
+  const h = makeHarness({ effective: openGroup({ decisionsPerDay: 6 }), decide: async () => decisionOf({ action: 'skip' }) });
+  for (let i = 0; i < 5; i += 1) await h.sendAndFlush(h.event({ text: `普通消息第${i}条内容` }));
+  assert.equal(h.state(await h.sendAndFlush(h.event({ text: '普通消息再来一条内容' }))), 'skipped:decision_cap');
+  assert.equal(h.state(await h.sendAndFlush(h.event({ text: '可洛你看看这个怎么办' }))), 'skipped:decision_skip');
+  await h.close();
+});
+
+test('the share at the real caps is 50 of 60 and 250 of 300', async () => {
+  const h = makeHarness({ effective: openGroup({}), decide: async () => decisionOf({ action: 'skip' }) });
+  await h.sendAndFlush(h.event({ text: '先有一条普通消息' }));
+  const { key: hourKey } = h.counters().find((c) => c.key.startsWith('dec_group:'));
+  const { key: dayKey } = h.counters().find((c) => c.key.startsWith('dec_day:'));
+  h.store.q('UPDATE counters SET value=49 WHERE key=?').run(hourKey);
+  assert.equal(h.state(await h.sendAndFlush(h.event({ text: '第五十条普通消息' }))), 'skipped:decision_skip');
+  assert.equal(h.state(await h.sendAndFlush(h.event({ text: '第五十一条普通消息' }))), 'skipped:decision_cap');
+  h.store.q('UPDATE counters SET value=0 WHERE key=?').run(hourKey);
+  h.store.q('UPDATE counters SET value=249 WHERE key=?').run(dayKey);
+  assert.equal(h.state(await h.sendAndFlush(h.event({ text: '第二百五十条普通消息' }))), 'skipped:decision_skip');
+  assert.equal(h.state(await h.sendAndFlush(h.event({ text: '第二百五十一条普通消息' }))), 'skipped:decision_cap');
+  await h.close();
+});
+
+test('the crisis route has no decision cap, and what it spends is still counted against the others', async () => {
+  // All day quiet, so these words reach a decision only by the crisis route.
+  const eff = makeEffective({ limits: { decisionsPerGroupPerHour: 2, decisionsPerDay: 2 }, quietHours: { start: '00:00', end: '23:59', timezone: 'Asia/Shanghai' } });
+  const h = makeHarness({ effective: eff, decide: async () => decisionOf({ crisis: true }) });
+  for (const senderId of [MEMBER, MEMBER2, 'THIRDMEMBER111122223333']) {
+    assert.equal(h.state(await h.sendAndFlush(h.event({ text: '我真的不想活了', senderId }))), 'completed:sent', senderId);
+  }
+  assert.equal(h.decideCalls.length, 3);
+  assert.deepEqual(h.decideCalls.map((c) => c.trigger), ['crisis_route', 'crisis_route', 'crisis_route']);
+  assert.equal(countOf(h, 'dec_group:'), 3, 'past the cap, and counted');
+  assert.equal(countOf(h, 'dec_day:'), 3);
+  const name = await h.sendAndFlush(h.event({ text: '可洛你看看这个怎么办', senderId: MEMBER2 }));
+  assert.equal(h.state(name), 'skipped:decision_cap', 'names see what the route spent');
+  await h.close();
+});
+
+test('an empty interjection with no usage figure leaves its hold unsettled and pauses nothing', async () => {
+  const h = makeHarness({ dispatch: async () => ({ started: true, hostError: false, aborted: false, usage: null }) });
+  h.exit.result = SILENT;
+  const e = await h.sendAndFlush(h.event({ text: '有人知道怎么退货吗' }));
+  assert.equal(h.state(e), 'silent:no_reply');
+  assert.equal(h.reservations(e).find((r) => r.category === 'reply').status, 'unsettled', 'never zeroed');
+  assert.equal(h.store.getControl('paid_paused'), null);
+  await h.close();
+});
+
+test('positive control: a reply that went out with no usage figure still pauses paid work', async () => {
+  const h = makeHarness({ dispatch: async () => ({ started: true, hostError: false, aborted: false, usage: null }) });
+  await h.sendAndFlush(h.at());
+  assert.equal(h.store.getControl('paid_paused'), 'usage_missing');
   await h.close();
 });

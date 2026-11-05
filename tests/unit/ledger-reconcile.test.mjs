@@ -15,7 +15,8 @@ const FAKE_KEY = 'sk-or-v1-FAKE-RECONCILE-KEY';
 
 function setup({ mode = 'live', key = FAKE_KEY } = {}) {
   const clock = { t: T0 };
-  const store = openStore(join(dir, `r${++n}.db`), { runGen: 'g', now: () => clock.t });
+  const file = join(dir, `r${++n}.db`);
+  const store = openStore(file, { runGen: 'g', now: () => clock.t });
   const eff = { mode, budget: { dailyUsd: 2.5, interjectUsd: 0.75, searchUsd: 2.1, namedUsd: 2.25, addressedUsd: 2.5, residualMinUsd: 0.25, residualPct: 0.15, providerFailStreakPause: 3 }, openrouter: { baseUrl: 'http://mock/api/v1' } };
   const key_ = { usage: 0, limit: 3.25, limit_remaining: 3.25, limit_reset: 'daily', usage_daily: 0 };
   const calls = [];
@@ -28,8 +29,17 @@ function setup({ mode = 'live', key = FAKE_KEY } = {}) {
     return { ok: true, status: 200, json: async () => ({ data: { ...key_ } }) };
   };
   const logFile = join(dir, `r${n}.jsonl`);
-  const ledger = createLedger({ store, getEffective: () => eff, fetch: fetchStub, getKey: () => key, log: createLog(logFile), now: () => clock.t });
-  return { store, ledger, clock, eff, key: key_, calls, state, logFile };
+  const secret = { value: key };
+  const open = (s) => createLedger({ store: s, getEffective: () => eff, fetch: fetchStub, getKey: () => secret.value, log: createLog(logFile), now: () => clock.t });
+  const h = { store, ledger: open(store), clock, eff, key: key_, calls, state, logFile, secret };
+  // A process that died: nothing is closed down in order, and the next one recovers what the last one left.
+  h.restart = () => {
+    h.store.close();
+    h.store = openStore(file, { runGen: `g${++n}`, now: () => clock.t });
+    h.store.recoverOnStart(clock.t);
+    h.ledger = open(h.store);
+  };
+  return h;
 }
 const row = (store, id) => store.q('SELECT * FROM reservations WHERE id=?').get(id);
 const unsettledHold = (ledger, usd, eventKey = 'E') => {
@@ -784,5 +794,353 @@ test('the owner can lift usage_unavailable, and nothing a read could lift', () =
     assert.deepEqual(ledger.clearOwnerPause(), { cleared: false, reason });
     assert.equal(store.getControl('paid_paused'), reason);
   }
+  store.close();
+});
+
+// --- the baseline: when it may move, and what it belongs to ---
+
+const DAY = 24 * 3600000;
+const baseline = (store) => JSON.parse(store.getMeta('key_baseline'));
+const stray = (store) => store.q("SELECT actual_micros FROM reservations WHERE category='unattributed' ORDER BY created_at").all().map((s) => s.actual_micros);
+const RETENTION = { eventDays: 14, sendDays: 14, reservationDays: 90 };
+
+test('with nothing open, a read past the rebase age moves the baseline, and one at the age does not', async () => {
+  const { ledger, store, key, clock } = setup();
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  clock.t = T0 + 30 * DAY;
+  await ledger.reconcile(clock.t);
+  assert.equal(baseline(store).at, T0);
+  clock.t += 1;
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  assert.equal(baseline(store).at, clock.t);
+  store.close();
+});
+
+test('a rebase waits for an unsettled row, so a row with no charge can still settle at zero', async () => {
+  const { ledger, store, key, clock } = setup();
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  clock.t += 31 * DAY;
+  const a = unsettledHold(ledger, 0.2, 'A');
+  await ledger.reconcile(clock.t);
+  assert.equal(baseline(store).at, T0, 'not past an open row');
+  for (let i = 0; i < 20; i += 1) {
+    clock.t += MIN;
+    await ledger.reconcile(clock.t);
+  }
+  assert.equal(row(store, a).status, 'settled');
+  assert.equal(row(store, a).source, 'key_delta_none');
+  assert.ok(baseline(store).at > T0, 'and moves once nothing is open');
+  store.close();
+});
+
+test('a rebase waits for a call in flight: its charge is not absorbed, so it cannot hide a later one', async () => {
+  const { ledger, store, key, clock } = setup();
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  clock.t += 31 * DAY;
+  const { id } = ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: 360000, eventKey: 'E' });
+  key.usage = 1.1;
+  await ledger.reconcile(clock.t);
+  assert.equal(baseline(store).at, T0);
+  ledger.settle(id, { actualMicros: 100000, source: 'model.usage' });
+  clock.t += MIN;
+  key.usage = 1.2;
+  await ledger.reconcile(clock.t);
+  assert.deepEqual(stray(store), [100000], 'the charge nothing explains is seen in full');
+  store.close();
+});
+
+test('a call in flight at the rebase age that ends with no usage still settles from the Key', async () => {
+  const { ledger, store, key, clock } = setup();
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  clock.t += 31 * DAY;
+  const { id } = ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: 360000, eventKey: 'E' });
+  key.usage = 1.1;
+  await ledger.reconcile(clock.t);
+  ledger.markUnsettled(id);
+  clock.t += MIN;
+  await ledger.reconcile(clock.t);
+  assert.equal(row(store, id).status, 'settled');
+  assert.equal(row(store, id).source, 'key_delta');
+  assert.equal(row(store, id).actual_micros, 100000);
+  store.close();
+});
+
+test('a rebase waits out a charge that lags its settlement, so that charge is not a residual', async () => {
+  const { ledger, store, key, clock } = setup();
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  clock.t += 31 * DAY;
+  const { id } = ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: 500000, eventKey: 'E' });
+  ledger.settle(id, { actualMicros: 400000, source: 'model.usage' });
+  clock.t += MIN;
+  await ledger.reconcile(clock.t);
+  assert.equal(baseline(store).at, T0, 'the Key has not shown it yet');
+  clock.t += MIN;
+  key.usage = 1.4;
+  await ledger.reconcile(clock.t);
+  assert.deepEqual(stray(store), []);
+  clock.t += 15 * MIN;
+  await ledger.reconcile(clock.t);
+  assert.equal(baseline(store).at, clock.t);
+  assert.deepEqual(stray(store), []);
+  store.close();
+});
+
+test('a crash with a call in flight at the rebase age: the restart keeps the baseline and the Key still settles the row', async () => {
+  const h = setup();
+  h.key.usage = 1;
+  await h.ledger.reconcile(h.clock.t);
+  h.clock.t += 31 * DAY;
+  const { id } = h.ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: 360000, eventKey: 'E' });
+  h.key.usage = 1.1;
+  h.restart();
+  assert.equal(row(h.store, id).status, 'unsettled');
+  await h.ledger.reconcile(h.clock.t);
+  assert.equal(row(h.store, id).source, 'key_delta');
+  assert.equal(row(h.store, id).actual_micros, 100000);
+  assert.equal(baseline(h.store).at, T0, 'a row settled just now still holds it');
+  h.clock.t += 16 * MIN;
+  await h.ledger.reconcile(h.clock.t);
+  assert.equal(baseline(h.store).at, h.clock.t);
+  assert.deepEqual(stray(h.store), []);
+  h.store.close();
+});
+
+test('a new Key with a higher lifetime figure is a new Key, not a charge', async () => {
+  const { ledger, store, key, clock, secret } = setup();
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  clock.t += MIN;
+  const old = unsettledHold(ledger, 0.36, 'OLD');
+  clock.t += MIN;
+  secret.value = 'sk-or-v1-FAKE-SECOND-KEY';
+  key.usage = 50;
+  for (let i = 0; i < 2; i += 1) {
+    await ledger.reconcile(clock.t);
+    clock.t += MIN;
+  }
+  assert.equal(store.listAlerts().filter((a) => a.kind === 'key_changed').length, 1);
+  assert.equal(row(store, old).source, 'key_changed');
+  assert.equal(row(store, old).actual_micros, row(store, old).held_micros, 'never free');
+  assert.deepEqual(stray(store), []);
+  assert.equal(ledger.spent(clock.t).providerMicros, 0);
+  assert.equal(store.getControl('paid_paused'), null);
+  key.usage = 50.1;
+  await ledger.reconcile(clock.t);
+  assert.deepEqual(stray(store), [100000]);
+  assert.equal(ledger.spent(clock.t).providerMicros, 100000);
+  store.close();
+});
+
+test('after a new Key with a lower figure, the provider day counts its charges, not the old figure', async () => {
+  const { ledger, store, key, clock, secret } = setup();
+  key.usage = 9;
+  await ledger.reconcile(clock.t);
+  clock.t += MIN;
+  secret.value = 'sk-or-v1-FAKE-SECOND-KEY';
+  key.usage = 0.5;
+  await ledger.reconcile(clock.t);
+  assert.equal(store.q('SELECT COUNT(*) AS n FROM key_snapshots').get().n, 1);
+  clock.t += MIN;
+  key.usage = 0.8;
+  await ledger.reconcile(clock.t);
+  assert.equal(ledger.spent(clock.t).providerMicros, 300000);
+  store.close();
+});
+
+test('the same Key after a restart is not a change, and the baseline holds no key', async () => {
+  const h = setup();
+  h.key.usage = 1;
+  await h.ledger.reconcile(h.clock.t);
+  assert.ok(!h.store.getMeta('key_baseline').includes(FAKE_KEY));
+  h.restart();
+  h.clock.t += MIN;
+  await h.ledger.reconcile(h.clock.t);
+  assert.equal(h.store.listAlerts().filter((a) => a.kind === 'key_changed').length, 0);
+  h.store.close();
+});
+
+test('a baseline from before it carried an id keeps counting, takes the current id, and then sees a rotation', async () => {
+  const { ledger, store, key, clock, secret } = setup();
+  store.setMeta('key_baseline', JSON.stringify({ usage: 1000000, at: T0 }));
+  clock.t += MIN;
+  key.usage = 1.1;
+  await ledger.reconcile(clock.t);
+  assert.equal(store.listAlerts().filter((a) => a.kind === 'key_changed').length, 0);
+  assert.deepEqual(stray(store), [100000], 'still measured from the old figure');
+  assert.equal(baseline(store).keyId, store.key(FAKE_KEY));
+  assert.equal(baseline(store).at, T0);
+  clock.t += MIN;
+  secret.value = 'sk-or-v1-FAKE-SECOND-KEY';
+  await ledger.reconcile(clock.t);
+  assert.equal(store.listAlerts().filter((a) => a.kind === 'key_changed').length, 1);
+  store.close();
+});
+
+test('a baseline older than the rows: spend already swept is not read as a new charge', async () => {
+  const { ledger, store, key, clock, eff } = setup();
+  eff.retention = RETENTION;
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  const { id } = ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: 500000, eventKey: 'E' });
+  ledger.settle(id, { actualMicros: 400000, source: 'model.usage' });
+  clock.t += MIN;
+  key.usage = 1.4;
+  await ledger.reconcile(clock.t);
+  clock.t += 91 * DAY;
+  assert.equal(store.janitor(clock.t, eff.retention).reservations, 1);
+  const r = await ledger.reconcile(clock.t);
+  assert.equal(r.residualMicros, 0);
+  assert.deepEqual(stray(store), []);
+  assert.equal(baseline(store).at, clock.t);
+  clock.t += MIN;
+  key.usage = 1.5;
+  await ledger.reconcile(clock.t);
+  assert.deepEqual(stray(store), [100000], 'and charges from here on count');
+  store.close();
+});
+
+test('a baseline exactly as old as the rows is still in use: nothing it covers can have been swept', async () => {
+  const { ledger, store, key, clock, eff } = setup();
+  eff.retention = RETENTION;
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  clock.t = T0 + 90 * DAY;
+  key.usage = 1.1;
+  await ledger.reconcile(clock.t);
+  assert.deepEqual(stray(store), [100000]);
+  store.close();
+});
+
+test('a baseline older than the rows, after a crash: open rows stay counted at their hold and the pause lifts', async () => {
+  const { ledger, store, key, clock, eff } = setup();
+  eff.retention = RETENTION;
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  const a = unsettledHold(ledger, 0.36, 'A');
+  pause(store, 'crash_unsettled');
+  const before = ledger.spent(clock.t).localMicros;
+  const day = clock.t;
+  clock.t += 100 * DAY;
+  key.usage = 1.3;
+  const r = await ledger.reconcile(clock.t);
+  assert.equal(r.paused, false);
+  assert.equal(row(store, a).status, 'settled');
+  assert.equal(row(store, a).source, 'baseline_expired');
+  assert.equal(row(store, a).actual_micros, 360000, 'never free');
+  assert.equal(ledger.spent(day).localMicros, before, 'its day still counts it');
+  assert.deepEqual(stray(store), [], 'the figure is too old to name');
+  clock.t += MIN;
+  key.usage = 1.4;
+  await ledger.reconcile(clock.t);
+  assert.deepEqual(stray(store), [100000], 'the old row explains nothing new');
+  store.close();
+});
+
+test('a baseline older than the rows waits for a call in flight, attributing nothing until then', async () => {
+  const { ledger, store, key, clock, eff } = setup();
+  eff.retention = RETENTION;
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  clock.t += 100 * DAY;
+  const { id } = ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: 500000, eventKey: 'E' });
+  key.usage = 3;
+  await ledger.reconcile(clock.t);
+  assert.equal(baseline(store).at, T0);
+  assert.deepEqual(stray(store), []);
+  assert.equal(row(store, id).status, 'held');
+  ledger.settle(id, { actualMicros: 100000, source: 'model.usage' });
+  clock.t += MIN;
+  await ledger.reconcile(clock.t);
+  assert.equal(baseline(store).at, clock.t);
+  assert.deepEqual(stray(store), []);
+  store.close();
+});
+
+// --- the configured Key limit ---
+
+const limitAlerts = (store) => store.listAlerts().filter((a) => a.kind === 'key_limit_mismatch');
+
+test('a Key limit that differs from the configured one alerts once per difference and stops nothing', async () => {
+  const h = setup();
+  h.eff.budget.keyDailyLimitUsd = 3.25;
+  await h.ledger.reconcile(h.clock.t);
+  assert.deepEqual(limitAlerts(h.store), [], 'the same figure says nothing');
+
+  h.key.limit = 1;
+  h.key.limit_remaining = 1;
+  h.clock.t += MIN;
+  const r = await h.ledger.reconcile(h.clock.t);
+  assert.equal(r.paused, false);
+  assert.deepEqual(limitAlerts(h.store).map((a) => a.detail), [{ reason: 'amount', actualMicros: 1000000 }]);
+  assert.equal(h.ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: 1000 }).ok, true);
+
+  h.clock.t += MIN;
+  await h.ledger.reconcile(h.clock.t);
+  h.restart();
+  h.clock.t += MIN;
+  await h.ledger.reconcile(h.clock.t);
+  assert.equal(limitAlerts(h.store).length, 1, 'not again on later reads or after a restart');
+
+  h.key.limit = 2;
+  h.clock.t += MIN;
+  await h.ledger.reconcile(h.clock.t);
+  assert.equal(limitAlerts(h.store).length, 2, 'a different figure is a new difference');
+
+  h.key.limit = 3.25;
+  h.clock.t += MIN;
+  await h.ledger.reconcile(h.clock.t);
+  h.key.limit = 2;
+  h.clock.t += MIN;
+  await h.ledger.reconcile(h.clock.t);
+  assert.equal(limitAlerts(h.store).length, 3, 'corrected and then wrong again is new too');
+  h.store.close();
+});
+
+test('a limit below the local budget that matches the configured one is not an error', async () => {
+  const { ledger, store, key, clock, eff } = setup();
+  eff.budget.keyDailyLimitUsd = 1.6;
+  key.limit = 1.6;
+  key.limit_remaining = 1.6;
+  const r = await ledger.reconcile(clock.t);
+  assert.equal(r.paused, false);
+  assert.deepEqual(limitAlerts(store), []);
+  store.close();
+});
+
+test('a Key with no limit, or one that does not reset daily, differs from a configured daily limit', async () => {
+  const none = setup();
+  none.eff.budget.keyDailyLimitUsd = 3.25;
+  none.key.limit = null;
+  none.key.limit_remaining = null;
+  await none.ledger.reconcile(none.clock.t);
+  assert.deepEqual(limitAlerts(none.store).map((a) => a.detail), [{ reason: 'amount', actualMicros: null }]);
+  none.store.close();
+
+  const monthly = setup();
+  monthly.eff.budget.keyDailyLimitUsd = 3.25;
+  monthly.key.limit_reset = 'monthly';
+  await monthly.ledger.reconcile(monthly.clock.t);
+  assert.deepEqual(limitAlerts(monthly.store).map((a) => a.detail), [{ reason: 'reset', actualMicros: 3250000 }]);
+  monthly.store.close();
+});
+
+test('with no configured limit, or no read, there is nothing to compare', async () => {
+  const { ledger, store, key, clock, state, eff } = setup();
+  key.limit = 7;
+  await ledger.reconcile(clock.t);
+  eff.budget.keyDailyLimitUsd = null;
+  clock.t += MIN;
+  await ledger.reconcile(clock.t);
+  eff.budget.keyDailyLimitUsd = 3.25;
+  state.fail = true;
+  clock.t += MIN;
+  await ledger.reconcile(clock.t);
+  assert.deepEqual(limitAlerts(store), []);
   store.close();
 });

@@ -300,3 +300,252 @@ test('a crisis message refused once its own room is full leaves an alert; chat r
   await drain();
   await h.close();
 });
+
+// A running task holds the lane still, so what is queued can be counted before anything starts.
+async function heldLane(over = {}) {
+  const set = queues({ urgentExtra: 2, urgentPerSender: 1, urgentKey: (r) => r.sender ?? null, ...over });
+  const hold = deferred();
+  const ran = [];
+  const task = (name) => async () => {
+    ran.push(name);
+  };
+  set.q.addressed('g', () => hold.promise, { sender: 'running' });
+  await tick();
+  return { ...set, hold, ran, task };
+}
+
+test('a full lane still takes urgent work in its own small count, and refuses the rest', async () => {
+  const { q, hold, task, ran } = await heldLane();
+  const at = (n) => q.addressed('g', task(n), { sender: n });
+  const danger = (n) => q.addressed('g', task(n), { sender: n }, { urgent: true });
+  assert.equal(at('at1').ok, true);
+  assert.equal(at('at2').ok, true);
+  assert.deepEqual(at('at3'), { ok: false, reason: 'queue_full' }, 'the premise: the lane is full');
+  assert.deepEqual(danger('d1'), { ok: true });
+  assert.deepEqual(danger('d2'), { ok: true });
+  assert.deepEqual(danger('d3'), { ok: false, reason: 'queue_full' }, 'still bounded');
+  hold.resolve();
+  await q.idle();
+  assert.deepEqual(ran, ['at1', 'at2', 'd1', 'd2'], 'urgent work does not pass what is already queued');
+});
+
+test('urgent work with ordinary room left does not use up the extra places', async () => {
+  const { q, hold, task, ran } = await heldLane({ maxPending: 3 });
+  const danger = (n) => q.addressed('g', task(n), { sender: 'same' }, { urgent: true });
+  for (const n of ['d1', 'd2', 'd3']) assert.equal(danger(n).ok, true, n);
+  assert.equal(danger('d4').ok, true, 'the first extra place, still free');
+  assert.equal(danger('d5').ok, false, 'the sender holds their one extra place');
+  hold.resolve();
+  await q.idle();
+  assert.deepEqual(ran, ['d1', 'd2', 'd3', 'd4']);
+});
+
+test('the extra places take no room from a later real @', async () => {
+  const { q, hold, task, ran } = await heldLane();
+  const second = deferred();
+  q.addressed('g', () => second.promise, { sender: 'at1' });
+  q.addressed('g', task('at2'), { sender: 'at2' });
+  assert.equal(q.addressed('g', task('d1'), { sender: 'd1' }, { urgent: true }).ok, true);
+  hold.resolve();
+  await settle();
+  assert.equal(q.addressed('g', task('at3'), { sender: 'at3' }).ok, true, 'one ordinary place freed, and it is counted without d1');
+  assert.equal(q.addressed('g', task('at4'), { sender: 'at4' }).ok, false);
+  second.resolve();
+  await q.idle();
+  assert.deepEqual(ran, ['at2', 'd1', 'at3']);
+});
+
+test('an extra place and its sender allowance come back when the task starts', async () => {
+  const { q, hold, task } = await heldLane({ urgentExtra: 1 });
+  const danger = (n) => q.addressed('g', task(n), { sender: 'same' }, { urgent: true });
+  q.addressed('g', task('at1'), { sender: 'at1' });
+  q.addressed('g', task('at2'), { sender: 'at2' });
+  assert.equal(danger('d1').ok, true);
+  assert.equal(danger('d2').ok, false, 'the premise: the one place is taken');
+  hold.resolve();
+  await q.idle();
+  const held = deferred();
+  q.addressed('g', () => held.promise, { sender: 'at3' });
+  await tick();
+  q.addressed('g', task('at4'), { sender: 'at4' });
+  q.addressed('g', task('at5'), { sender: 'at5' });
+  assert.equal(q.addressed('g', task('at6'), { sender: 'at6' }).ok, false, 'ordinary room is counted in full again');
+  assert.equal(danger('d3').ok, true);
+  held.resolve();
+  await q.idle();
+});
+
+test('urgent work does not yield, even when asked to', async () => {
+  const { q, hold, task, ran } = await heldLane();
+  q.addressed('g', task('name'), { sender: 'n' }, { yielding: true });
+  q.addressed('g', task('danger'), { sender: 'd' }, { urgent: true, yielding: true });
+  hold.resolve();
+  await q.idle();
+  assert.deepEqual(ran, ['danger', 'name']);
+});
+
+test('one sender cannot take all the extra places from another person in danger', async () => {
+  const { q, hold, task, ran } = await heldLane();
+  q.addressed('g', task('at1'), { sender: 'at1' });
+  q.addressed('g', task('at2'), { sender: 'at2' });
+  assert.equal(q.addressed('g', task('a1'), { sender: 'A' }, { urgent: true }).ok, true);
+  assert.deepEqual(q.addressed('g', task('a2'), { sender: 'A' }, { urgent: true }), { ok: false, reason: 'queue_full' });
+  assert.equal(q.addressed('g', task('b1'), { sender: 'B' }, { urgent: true }).ok, true, 'the other person is still taken');
+  hold.resolve();
+  await q.idle();
+  assert.deepEqual(ran, ['at1', 'at2', 'a1', 'b1']);
+});
+
+test('a sender that cannot be told apart has no allowance to run out of, only the shared count', async () => {
+  const { q, hold, task } = await heldLane({ urgentKey: () => null });
+  q.addressed('g', task('at1'), {});
+  q.addressed('g', task('at2'), {});
+  assert.equal(q.addressed('g', task('d1'), {}, { urgent: true }).ok, true);
+  assert.equal(q.addressed('g', task('d2'), {}, { urgent: true }).ok, true);
+  assert.equal(q.addressed('g', task('d3'), {}, { urgent: true }).ok, false);
+  hold.resolve();
+  await q.idle();
+});
+
+const dangerFrom = (sender) => ({ danger: true, sender });
+const windowLane = (over = {}) => heldLane({ isUrgent: (records) => records.some((r) => r.danger), urgentPerSender: 2, ...over });
+
+test('window lane: one sender repeating danger words cannot fill the room another person needs', async () => {
+  const { q, fire, hold } = await windowLane({ maxPending: 3 });
+  const seen = [];
+  const onFlush = (records) => {
+    seen.push(records.map((r) => r.sender));
+  };
+  q.ordinary('g', { sender: 'chat1' }, onFlush);
+  q.ordinary('g', { sender: 'chat2' }, onFlush);
+  q.ordinary('g', dangerFrom('A'), onFlush);
+  assert.equal(q.ordinary('g', { sender: 'chat3' }, onFlush).reason, 'queue_full', 'the premise: chat is at its cap');
+  assert.equal(q.ordinary('g', dangerFrom('A'), onFlush).ok, true, 'the second of the allowance');
+  assert.deepEqual(q.ordinary('g', dangerFrom('A'), onFlush), { ok: false, reason: 'queue_full' }, 'past it, and no chat room');
+  assert.equal(q.ordinary('g', dangerFrom('B'), onFlush).ok, true, 'the other person is still taken');
+  fire();
+  hold.resolve();
+  await q.idle();
+  assert.deepEqual(seen, [['chat1', 'chat2', 'A', 'A', 'B']]);
+});
+
+test('window lane: past the allowance a record is plain chat and does not move its window up', async () => {
+  const { q, fire, hold, task, ran } = await windowLane({ maxPending: 5 });
+  const flush = (name) => () => {
+    ran.push(name);
+  };
+  q.addressed('g', task('name'), { sender: 'n' }, { yielding: true });
+  q.ordinary('g', dangerFrom('A'), flush('first'));
+  q.ordinary('g', dangerFrom('A'), flush('first'));
+  fire();
+  assert.equal(q.ordinary('g', dangerFrom('A'), flush('later')).ok, true, 'there is chat room for it');
+  fire();
+  hold.resolve();
+  await q.idle();
+  assert.deepEqual(ran, ['first', 'name', 'later'], 'only the window holding the allowance goes ahead of the name');
+});
+
+test('window lane: the allowance comes back when the window starts, and stop clears it', async () => {
+  const { q, fire, hold, dropped } = await windowLane({ maxPending: 2 });
+  const noop = () => {};
+  q.ordinary('g', dangerFrom('A'), noop);
+  q.ordinary('g', dangerFrom('A'), noop);
+  assert.equal(q.ordinary('g', dangerFrom('A'), noop).ok, false, 'the premise: the allowance is used');
+  fire();
+  hold.resolve();
+  await q.idle();
+  q.ordinary('g', { sender: 'chat1' }, noop);
+  q.ordinary('g', { sender: 'chat2' }, noop);
+  assert.equal(q.ordinary('g', dangerFrom('A'), noop).ok, true, 'free again: chat is full, so only the allowance can take it');
+  const stopping = q.stop();
+  assert.equal(dropped.length, 3);
+  await stopping;
+});
+
+test('a line past the chat cap counts against the extra @ place', async () => {
+  const { q, hold, task } = await windowLane({ maxPending: 2, urgentPerSender: 1 });
+  q.ordinary('g', { sender: 'chat1' }, () => {});
+  q.ordinary('g', { sender: 'chat2' }, () => {});
+  assert.equal(q.ordinary('g', dangerFrom('A'), () => {}).ok, true, 'taken past the chat cap');
+  q.addressed('g', task('at1'), { sender: 'at1' });
+  q.addressed('g', task('at2'), { sender: 'at2' });
+  assert.equal(q.addressed('g', task('a'), dangerFrom('A'), { urgent: true }).ok, false, 'A already holds room in the window lane');
+  assert.equal(q.addressed('g', task('b'), dangerFrom('B'), { urgent: true }).ok, true);
+  const stopping = q.stop();
+  hold.resolve();
+  await stopping;
+});
+
+test('lines that fitted in chat room do not cost the sender an extra @ place', async () => {
+  const { q, hold, task, dropped } = await windowLane({ maxPending: 2 });
+  assert.equal(q.ordinary('g', dangerFrom('A'), () => {}).ok, true);
+  assert.equal(q.ordinary('g', dangerFrom('A'), () => {}).ok, true);
+  q.addressed('g', task('at1'), { sender: 'at1' });
+  q.addressed('g', task('at2'), { sender: 'at2' });
+  assert.equal(q.addressed('g', task('at3'), { sender: 'at3' }).reason, 'queue_full', 'the premise: the lane is full');
+  assert.deepEqual(q.addressed('g', task('a'), dangerFrom('A'), { urgent: true }), { ok: true });
+  const stopping = q.stop();
+  assert.equal(dropped.length, 5);
+  hold.resolve();
+  await stopping;
+});
+
+test('a line past the chat cap gives its @ place back when its window starts', async () => {
+  const { q, fire, hold, task } = await windowLane({ maxPending: 2, urgentPerSender: 1 });
+  q.ordinary('g', { sender: 'chat1' }, () => {});
+  q.ordinary('g', { sender: 'chat2' }, () => {});
+  q.ordinary('g', dangerFrom('A'), () => {});
+  fire();
+  hold.resolve();
+  await q.idle();
+  const held = deferred();
+  q.addressed('g', () => held.promise, { sender: 'running' });
+  await tick();
+  q.addressed('g', task('at1'), { sender: 'at1' });
+  q.addressed('g', task('at2'), { sender: 'at2' });
+  assert.equal(q.addressed('g', task('a'), dangerFrom('A'), { urgent: true }).ok, true);
+  held.resolve();
+  await q.idle();
+});
+
+test('an extra @ place still counts toward moving a window up', async () => {
+  const { q, fire, hold, task, ran } = await windowLane({ maxPending: 2, urgentPerSender: 1 });
+  const flush = (name) => () => {
+    ran.push(name);
+  };
+  assert.equal(q.addressed('g', task('name'), { sender: 'n' }, { yielding: true }).ok, true);
+  q.addressed('g', task('at1'), { sender: 'at1' });
+  q.addressed('g', task('at2'), { sender: 'at2' });
+  assert.equal(q.addressed('g', task('a'), dangerFrom('A'), { urgent: true }).ok, true);
+  assert.equal(q.ordinary('g', dangerFrom('A'), flush('window')).ok, true);
+  fire();
+  hold.resolve();
+  await q.idle();
+  assert.deepEqual(ran, ['at1', 'at2', 'a', 'name', 'window'], 'the window stays behind the name');
+});
+
+test('lines in chat room leave the sender only their own share of the extra places', async () => {
+  const { q, hold, task } = await windowLane({ maxPending: 2, urgentExtra: 3, urgentPerSender: 1 });
+  q.ordinary('g', dangerFrom('A'), () => {});
+  q.addressed('g', task('at1'), { sender: 'at1' });
+  q.addressed('g', task('at2'), { sender: 'at2' });
+  assert.equal(q.addressed('g', task('a1'), dangerFrom('A'), { urgent: true }).ok, true);
+  assert.equal(q.addressed('g', task('a2'), dangerFrom('A'), { urgent: true }).reason, 'queue_full');
+  const stopping = q.stop();
+  hold.resolve();
+  await stopping;
+});
+
+test('every extra task is dropped once at stop', async () => {
+  const { q, hold, task, dropped } = await heldLane();
+  const at1 = { sender: 'at1' };
+  const at2 = { sender: 'at2' };
+  const d1 = { sender: 'd1' };
+  q.addressed('g', task('at1'), at1);
+  q.addressed('g', task('at2'), at2);
+  q.addressed('g', task('d1'), d1, { urgent: true });
+  const stopping = q.stop();
+  assert.deepEqual(dropped, [at1, at2, d1]);
+  hold.resolve();
+  await stopping;
+});

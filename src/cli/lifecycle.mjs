@@ -1,7 +1,7 @@
 // Starts and stops the project's one Gateway. It only ever signals a PID it recorded itself.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -23,6 +23,8 @@ const STOP_WAIT_MS = 15000;
 
 const OUTPUT_FILTER = fileURLToPath(new URL('./host-output-filter.mjs', import.meta.url));
 const START_LOOKUP_TRIES = 3;
+const START_LOCK_TRIES = 5;
+const START_LOCK_RETRY_MS = 100;
 
 export const privateNode = (paths) => join(paths.repoRoot, '.runtime', 'node', 'node.exe');
 export const openclawEntry = (paths) => join(paths.repoRoot, '.runtime', 'pkg', 'node_modules', 'openclaw', 'openclaw.mjs');
@@ -195,15 +197,18 @@ export function readPidRecord(paths) {
   }
 }
 
-// 'none' | 'gone' | 'mismatch' (the PID now belongs to something else) | 'running' | 'unknown' (could not look)
+// 'none' | 'gone' | 'mismatch' (the PID now belongs to something else) | 'running' | 'unknown' (could not tell).
+// An 'unknown' result also has cause: 'lookup_failed', or 'cmdline_unreadable' when the start time matches but the OS
+// withholds the command line, as it does for a more privileged process. That is no evidence the PID changed hands.
 export function inspectGateway(paths, env = process.env) {
   const record = readPidRecord(paths);
   if (!record) return { state: 'none', record: null };
   const { outcome, info } = lookupProcess(record.pid, env);
-  if (outcome === 'unknown') return { state: 'unknown', record };
+  if (outcome === 'unknown') return { state: 'unknown', cause: 'lookup_failed', record };
   if (outcome === 'gone') return { state: 'gone', record };
-  const same = info.startTime === record.startTime && digestOf(info.commandLine) === record.commandDigest;
-  return { state: same ? 'running' : 'mismatch', record };
+  if (info.startTime !== record.startTime) return { state: 'mismatch', record };
+  if (!info.commandLine) return { state: 'unknown', cause: 'cmdline_unreadable', record };
+  return { state: digestOf(info.commandLine) === record.commandDigest ? 'running' : 'mismatch', record };
 }
 
 function portFree(port) {
@@ -292,36 +297,156 @@ export async function startGateway(ctx, cfg, { secrets, lookup = processInfo }) 
   if (spawnError) throw new CliError(`Gateway 启动失败：${spawnError.code ?? '未知错误'}`);
   if (exited) throw new CliError(`Gateway 启动后立刻退出，退出码 ${exited.code}。详情见日志：${paths.gatewayLog}`);
 
+  // With no PID record, nothing could stop it later. This is the child we just spawned, by its handle.
+  // Unref too, or a child that survived the kill would hold this command open until it exits.
+  const endChild = () => {
+    const ended = child.kill();
+    child.unref();
+    return ended ? '已结束刚启动的进程。' : `进程 ${child.pid} 可能还在运行，请手动结束。`;
+  };
+  // A record with no command line could never be matched again, so it counts as no information.
+  const readable = (i) => Boolean(i?.startTime && i?.commandLine);
   let info = null;
-  for (let i = 0; i < START_LOOKUP_TRIES && !info; i += 1) info = lookup(child.pid, env);
-  if (!info) {
-    // With no PID record, nothing could stop it later. This is the child we just spawned, by its handle.
-    child.kill();
-    throw new CliError('读不到 Gateway 进程信息，无法记录 PID，已结束刚启动的进程。');
+  for (let i = 0; i < START_LOOKUP_TRIES && !readable(info); i += 1) info = lookup(child.pid, env);
+  if (!readable(info)) throw new CliError(`读不到 Gateway 进程信息，无法记录 PID，${endChild()}`);
+  try {
+    writeAtomic(paths.pidFile, `${JSON.stringify({
+      pid: child.pid, startTime: info.startTime, commandDigest: digestOf(info.commandLine), port, startedAt: new Date(ctx.now()).toISOString(),
+    }, null, 2)}\n`);
+  } catch (e) {
+    throw new CliError(`写不进 PID 文件（${e.code ?? '未知错误'}），${endChild()}`);
   }
-  writeAtomic(paths.pidFile, `${JSON.stringify({
-    pid: child.pid, startTime: info.startTime, commandDigest: digestOf(info.commandLine), port, startedAt: new Date(ctx.now()).toISOString(),
-  }, null, 2)}\n`);
   child.unref();
   ctx.log('gateway_started', { count: child.pid });
   return { pid: child.pid, port };
+}
+
+const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+
+export const startLockFile = (paths) => join(dirname(paths.pidFile), 'start.lock');
+
+// null when there is no file. A file that cannot be read yet reads as empty, which counts as held.
+function readLockText(file) {
+  try {
+    return readFileSync(file, 'utf8');
+  } catch (e) {
+    return e.code === 'ENOENT' ? null : '';
+  }
+}
+
+// { state: 'free' } | { state: 'stale', text, record } | { state: 'held', cause, text, record }.
+// Stale only on proof the holder ended: the OS says the PID is gone, or the PID now has another start time.
+// Anything less counts as held. cause is 'running', 'lookup_failed' or 'unreadable' (record is null for that one).
+export function inspectStartLock(ctx, { lookup = lookupProcess } = {}) {
+  const text = readLockText(startLockFile(ctx.paths));
+  if (text === null) return { state: 'free' };
+  let record = null;
+  try {
+    const parsed = JSON.parse(text);
+    if (Number.isInteger(parsed?.pid)) record = parsed;
+  } catch {
+    // Same as a lock with no PID in it: a holder may be between creating the file and writing it.
+  }
+  if (!record) return { state: 'held', cause: 'unreadable', text, record };
+  const { outcome, info } = lookup(record.pid, ctx.env);
+  if (outcome === 'gone') return { state: 'stale', text, record };
+  if (outcome !== 'found') return { state: 'held', cause: 'lookup_failed', text, record };
+  const reused = Boolean(record.startTime && info?.startTime) && record.startTime !== info.startTime;
+  return { state: reused ? 'stale' : 'held', cause: reused ? undefined : 'running', text, record };
+}
+
+function startLockBusyError(file, seen) {
+  if (seen.cause === 'running') return new CliError(`另一个 clo start 正在运行（进程 ${seen.record.pid}），等它结束再试。`);
+  if (seen.cause === 'lookup_failed') return new CliError(`查不到持有启动锁的进程 ${seen.record.pid} 的状态，它可能还在运行。启动锁保留，请稍后再试。`);
+  return new CliError(`启动锁读不出内容，可能有另一个 clo start 正在运行。如果确认没有，删除 ${file} 后再试。`);
+}
+
+// Two starts can both judge one lock stale. Removal happens under a guard and only if the file still holds the text
+// that was judged, so the slower one cannot delete the lock the faster one has just created.
+function removeStaleLock(file, text) {
+  const guard = `${file}.reclaim`;
+  try {
+    closeSync(openSync(guard, 'wx'));
+  } catch {
+    return;
+  }
+  try {
+    if (readLockText(file) === text) rmSync(file, { force: true });
+  } catch {
+    // A reader holds it. The caller tries again.
+  } finally {
+    rmSync(guard, { force: true });
+  }
+}
+
+function acquireStartLock(ctx, lookup) {
+  const file = startLockFile(ctx.paths);
+  mkdirSync(dirname(file), { recursive: true });
+  // Looked up before the file exists, so the file stays empty for as short a time as possible.
+  const self = lookup(process.pid, ctx.env).info;
+  const text = JSON.stringify({ pid: process.pid, startTime: self?.startTime ?? null, token: randomBytes(8).toString('hex'), startedAt: new Date(ctx.now()).toISOString() });
+  for (let attempt = 0; attempt < START_LOCK_TRIES; attempt += 1) {
+    if (attempt > 0) sleepSync(START_LOCK_RETRY_MS);
+    let fd;
+    try {
+      fd = openSync(file, 'wx');
+    } catch (e) {
+      if (e.code === 'EEXIST') {
+        const seen = inspectStartLock(ctx, { lookup });
+        if (seen.state === 'held') throw startLockBusyError(file, seen);
+        if (seen.state === 'stale') removeStaleLock(file, seen.text);
+        continue;
+      }
+      // On Windows a file being deleted refuses new opens until its last reader closes it.
+      if (['EPERM', 'EACCES', 'EBUSY'].includes(e.code)) continue;
+      throw new CliError(`建不了启动锁（${e.code ?? '未知错误'}）。`);
+    }
+    try {
+      writeSync(fd, text);
+    } catch (e) {
+      closeSync(fd);
+      rmSync(file, { force: true });
+      throw new CliError(`写不进启动锁（${e.code ?? '未知错误'}）。`);
+    }
+    closeSync(fd);
+    return text;
+  }
+  throw new CliError(`拿不到启动锁。如果确认没有 clo start 在运行，删除 ${file} 和 ${file}.reclaim 后再试。`);
+}
+
+// Runs fn while this process alone holds the project's start lock, and returns what fn returns.
+// A second caller gets a CliError and its fn does not run. The lock is released when fn settles. A process that dies
+// holding it leaves a lock the next caller can reclaim.
+export async function withStartLock(ctx, fn, { lookup = lookupProcess } = {}) {
+  const file = startLockFile(ctx.paths);
+  const text = acquireStartLock(ctx, lookup);
+  try {
+    return await fn();
+  } finally {
+    // Never someone else's lock. A release that fails leaves a lock the next caller can prove stale.
+    try {
+      if (readLockText(file) === text) rmSync(file, { force: true });
+    } catch {
+      // See above.
+    }
+  }
 }
 
 function waitForGone(pid, env) {
   const end = Date.now() + STOP_WAIT_MS;
   while (Date.now() < end) {
     if (lookupProcess(pid, env).outcome === 'gone') return true;
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+    sleepSync(250);
   }
   return false;
 }
 
 export function stopGateway(ctx) {
   const { paths, env } = ctx;
-  const { state, record } = inspectGateway(paths, env);
+  const { state, cause, record } = inspectGateway(paths, env);
   if (state === 'none') return { stopped: false, reason: 'no_pid_file' };
   // Nothing is known about the process, so the record stays and nothing is signalled.
-  if (state === 'unknown') return { stopped: false, reason: 'lookup_failed' };
+  if (state === 'unknown') return { stopped: false, reason: 'lookup_failed', cause };
   if (state === 'gone') {
     rmSync(paths.pidFile, { force: true });
     return { stopped: false, reason: 'not_running' };

@@ -1,9 +1,15 @@
 // TQ17 and TQ24: the section 6.3 table, row by row, on real SQLite with the real gate and a scripted SDK.
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { ApiError } from '@tencent-connect/qqbot-nodejs';
 import { createExit, isDefinitelyNotSent } from '../../src/clo-plugin/lib/channels/qq/exit.js';
-import { GROUP_A, makeHarness, USAGE } from '../fixtures/inbound.mjs';
+import { GROUP_A, makeEffective, makeHarness, MEMBER, MEMBER2, OWNER, ROOT, USAGE } from '../fixtures/inbound.mjs';
+
+const LINES = JSON.parse(readFileSync(join(ROOT, 'persona', 'policy-lines.zh.json'), 'utf8'));
+const CRISIS = '我真的不想活了';
+const THREE_PARTS = '第一句话有十一个字。\n\n第二句话有十一个字。\n\n第三句话有十一个字。';
 
 const bizError = (code, status = 400) => new ApiError(`API Error [/x]: PLATFORM-TEXT-${code}`, status, '/x', code, `PLATFORM-TEXT-${code}`);
 // The shape of the message from the real SDK, with documentation addresses.
@@ -22,7 +28,7 @@ function stack(effective) {
     api: {
       post: async (path, body) => {
         posts.push({ path, body });
-        h.onPost?.();
+        await h.onPost?.();
         const r = results.shift();
         if (r instanceof Error) throw r;
         return r ?? { id: `SENT${posts.length}` };
@@ -32,11 +38,12 @@ function stack(effective) {
   const slept = [];
   let h;
   const dispatch = async (turn) => {
+    await h.mid?.(turn);
     h.exit.collect(turn.turnId, { text: h.replyText }, { kind: 'final' });
     return { started: true, hostError: false, aborted: false, usage: USAGE };
   };
   h = makeHarness({ effective, dispatch, attach: false });
-  h.exit = createExit({ bot, store: h.store, policy: h.policy, getEffective: () => h.eff.current, secrets: [], log: h.log, now: h.now, sleep: async (ms) => { slept.push(ms); h.onSleep?.(); } });
+  h.exit = createExit({ bot, store: h.store, policy: h.policy, getEffective: () => h.eff.current, secrets: [], log: h.log, now: h.now, sleep: async (ms) => { slept.push(ms); await h.onSleep?.(ms); } });
   h.gate.attachExit(h.exit);
   h.replyText = '这是一条普通的回复。';
   h.slept = slept;
@@ -280,18 +287,295 @@ test('40054010 removes every URL, resends once under a new seq, and never disgui
   assert.deepEqual(h.sends(e).map((r) => [r.kind, r.state, r.qq_code]), [['reply', 'failed', 40054010], ['reply_url_stripped', 'sent', null]]);
 });
 
-test('40054010 twice is group_error, with no third post', async () => {
+test('40054010 twice is group_error: no third try of the text, and the failure line says it could not answer', async () => {
   const h = stack();
   h.replyText = '看 https://a.example/x';
-  const e = await ask(h, { inbound: { text: 'https://a.example/x 呢' } }, bizError(40054010), bizError(40054010), { id: 'never' });
+  const e = await ask(h, { inbound: { text: 'https://a.example/x 呢' } }, bizError(40054010), bizError(40054010));
+  assert.equal(h.state(e), 'failed:group_error');
+  assert.equal(h.posts.length, 3);
+  assert.equal(h.posts[2].body.content, LINES.modelFailed);
+  assert.deepEqual(h.sends(e).map((r) => r.kind), ['reply', 'reply_url_stripped', 'fixed_line']);
+});
+
+test('40054010 on text with no URL: nothing to remove, so no resend, only the failure line', async () => {
+  const h = stack();
+  const e = await ask(h, bizError(40054010));
+  assert.equal(h.state(e), 'failed:group_error');
+  assert.deepEqual(h.posts.map((p) => p.body.content), [h.replyText, LINES.modelFailed]);
+});
+
+test('40054010 with part of the reply already out: no failure line, the answer did reach them', async () => {
+  const h = stack();
+  h.eff.current.qq.maxPartChars = 30;
+  h.replyText = '第一句话没有任何链接。\n\n第二句话在这 https://a.example/x 里。';
+  const e = await ask(h, { inbound: { text: 'https://a.example/x 呢' } }, { id: 'S1' }, bizError(40054010), bizError(40054010));
+  assert.equal(h.state(e), 'failed:group_error');
+  assert.equal(h.posts.length, 3, 'the first part, the refused part, its one resend');
+  assert.ok(!h.posts.some((p) => p.body.content === LINES.modelFailed));
+});
+
+test('40054010 refused twice on an interjection stays silent', async () => {
+  const h = stack();
+  h.replyText = '看 https://a.example/x';
+  const e = await ask(h, { inbound: { text: 'https://a.example/x 有人知道怎么退货吗', isRealAt: false } }, bizError(40054010), bizError(40054010));
+  h.advance(4000);
+  await h.gate.idle();
   assert.equal(h.state(e), 'failed:group_error');
   assert.equal(h.posts.length, 2);
 });
 
-test('40054010 on text with no URL: nothing to remove, so no resend', async () => {
+// One long reply against the default four sends a minute: each part holds a URL, so all four are resent.
+const FOUR_PARTS = [1, 2, 3, 4].map((n) => `第${n}段看这里 https://a.example/x 就行。`).join('\n\n');
+const WITH_URL = { inbound: { text: 'https://a.example/x 呢' } };
+const fourParts = (h) => {
+  h.eff.current.qq.maxPartChars = 40;
+  h.replyText = FOUR_PARTS;
+};
+
+test('40054010 at the send rate: a required answer waits once for room and goes out whole', async () => {
   const h = stack();
-  const e = await ask(h, bizError(40054010), { id: 'never' });
-  assert.equal(h.state(e), 'failed:group_error');
+  fourParts(h);
+  h.onSleep = (ms) => { h.clock.t += ms; };
+  const e = await ask(h, WITH_URL, bizError(40054010));
+  assert.equal(h.state(e), 'completed:sent');
+  assert.equal(h.slept.length, 1, 'it did wait');
+  assert.ok(h.slept[0] > 0 && h.slept[0] <= 60000, String(h.slept[0]));
+  assert.equal(h.posts.length, 5);
+  assert.ok(h.posts.slice(1).every((p) => !p.body.content.includes('http')));
+  assert.deepEqual(h.sends(e).map((r) => [r.kind, r.state]), [
+    ['reply', 'failed'], ['reply', 'aborted'], ['reply', 'aborted'], ['reply', 'aborted'],
+    ['reply_url_stripped', 'sent'], ['reply_url_stripped', 'sent'], ['reply_url_stripped', 'sent'], ['reply_url_stripped', 'sent'],
+  ]);
+  assert.equal(h.store.listAlerts().some((a) => a.kind === 'send_rate'), false);
+});
+
+test('40054010 with no time left to wait: refused for rate, and the failure line goes out as nothing else did', async () => {
+  const h = stack();
+  fourParts(h);
+  h.mid = () => { h.clock.t += 270000; };
+  const e = await ask(h, WITH_URL, bizError(40054010));
+  assert.equal(h.state(e), 'failed:send_rate');
+  assert.deepEqual(h.slept, []);
+  assert.equal(h.posts.length, 2);
+  assert.equal(h.posts[1].body.content, LINES.modelFailed);
+  assert.ok(h.store.listAlerts().some((a) => a.kind === 'send_rate'));
+});
+
+test('40054010 with no time left and part of the reply out: refused for rate, with no failure line', async () => {
+  const h = stack();
+  fourParts(h);
+  h.mid = () => { h.clock.t += 270000; };
+  const e = await ask(h, WITH_URL, { id: 'S1' }, bizError(40054010));
+  assert.equal(h.state(e), 'failed:send_rate');
+  assert.equal(h.posts.length, 2);
+  assert.ok(!h.posts.some((p) => p.body.content === LINES.modelFailed));
+});
+
+test('40054010 at the rate on an interjection: no wait, no line', async () => {
+  const h = stack(makeEffective({ limits: { sendGroupPerMin: 1, sendAccountPerMin: 100 } }));
+  h.replyText = '看 https://a.example/x';
+  const e = await ask(h, { inbound: { text: 'https://a.example/x 有人知道怎么退货吗', isRealAt: false } }, bizError(40054010));
+  h.advance(4000);
+  await h.gate.idle();
+  assert.equal(h.state(e), 'failed:send_rate');
+  assert.deepEqual(h.slept, []);
+  assert.equal(h.posts.length, 1);
+});
+
+test('a pause during the URL-refused post stops the resend before it takes any send row', async () => {
+  const h = stack();
+  h.replyText = '看 https://a.example/x';
+  h.onPost = () => h.store.setControl('global_paused', 'test', 'test');
+  const e = await ask(h, WITH_URL, bizError(40054010));
+  assert.equal(h.state(e), 'paused:paused');
+  assert.equal(h.posts.length, 1);
+  assert.deepEqual(h.sends(e).map((r) => r.kind), ['reply']);
+});
+
+test('a pause during the wait for resend room stops the resend', async () => {
+  const h = stack();
+  fourParts(h);
+  h.onSleep = (ms) => {
+    h.clock.t += ms;
+    h.store.setControl('global_paused', 'test', 'test');
+  };
+  const e = await ask(h, WITH_URL, bizError(40054010));
+  assert.equal(h.slept.length, 1, 'it did wait');
+  assert.equal(h.state(e), 'paused:paused');
+  assert.equal(h.posts.length, 1);
+  assert.equal(h.sends(e).some((r) => r.kind === 'reply_url_stripped'), false);
+});
+
+// ---- the hard stops between parts ----
+
+const threeParts = (h) => {
+  h.eff.current.qq.maxPartChars = 12;
+  h.replyText = THREE_PARTS;
+};
+
+test('positive control: with nothing in the way all three parts go out', async () => {
+  const h = stack();
+  threeParts(h);
+  const e = await ask(h);
+  assert.equal(h.state(e), 'completed:sent');
+  assert.deepEqual(h.sends(e).map((r) => r.state), ['sent', 'sent', 'sent']);
+});
+
+for (const [name, expected, stop] of [
+  ['global pause', 'paused:paused', (h) => h.store.setControl('global_paused', 'test', 'test')],
+  ['group pause', 'paused:paused', (h) => h.store.setControl(`group_paused:${h.store.key(GROUP_A)}`, 'test', 'test')],
+  ['dry-run', 'failed:exit_refused', (h) => { h.eff.current = { ...h.eff.current, mode: 'dry-run' }; }],
+  ['terminal latch', 'failed:exit_refused', (h) => h.store.setControl('terminal_close', '4914', 'test')],
+  ['group removed', 'failed:exit_refused', (h) => { h.eff.current = { ...h.eff.current, qq: { ...h.eff.current.qq, groups: {} } }; }],
+  ['a different bot', 'failed:exit_refused', (h) => { h.eff.current = { ...h.eff.current, qq: { ...h.eff.current.qq, appId: 'OTHER-APP' } }; }],
+  ['exit stopped', 'failed:exit_refused', (h) => h.exit.stop()],
+  ['deadline', 'failed:deadline', (h) => { h.clock.t += 400000; }],
+  ['deadline and a pause: the deadline is what gets reported', 'failed:deadline', (h) => {
+    h.clock.t += 400000;
+    h.store.setControl('global_paused', 'test', 'test');
+  }],
+]) {
+  test(`${name} between two parts stops the rest: ${expected}`, async () => {
+    const h = stack();
+    threeParts(h);
+    h.onPost = () => stop(h);
+    const e = await ask(h);
+    assert.equal(h.state(e), expected);
+    assert.equal(h.posts.length, 1);
+    assert.deepEqual(h.sends(e).map((r) => r.state), ['sent', 'aborted', 'aborted']);
+  });
+}
+
+// The owner's /stop lands while the first part is on the wire.
+function stopDuringFirstPost(h, senderId = OWNER) {
+  let sent = false;
+  h.onPost = async () => {
+    if (sent) return;
+    sent = true;
+    h.clock.t += 1000;
+    await h.send(h.at({ text: '/stop', senderId }));
+  };
+}
+
+test('/stop between two parts: the rest stay unsent and the ack goes out', async () => {
+  const h = stack();
+  threeParts(h);
+  stopDuringFirstPost(h);
+  const e = await ask(h, { inbound: { senderId: MEMBER } });
+  await h.gate.idle();
+  assert.equal(h.state(e), 'failed:aborted');
+  assert.deepEqual(h.sends(e).map((r) => r.state), ['sent', 'aborted', 'aborted']);
+  assert.equal(h.posts.filter((p) => p.body.msg_id === e.messageId).length, 1);
+  assert.equal(h.posts.length, 2, 'the part and the ack');
+});
+
+test('/stop between two parts of a reply to a person in danger: it still goes out whole', async () => {
+  const h = stack();
+  threeParts(h);
+  stopDuringFirstPost(h);
+  const e = await ask(h, { inbound: { senderId: MEMBER, text: CRISIS } });
+  await h.gate.idle();
+  assert.equal(h.state(e), 'completed:sent');
+  assert.deepEqual(h.sends(e).map((r) => r.state), ['sent', 'sent', 'sent']);
+});
+
+test("a member's /stop between two parts changes nothing", async () => {
+  const h = stack();
+  threeParts(h);
+  stopDuringFirstPost(h, MEMBER2);
+  const e = await ask(h, { inbound: { senderId: MEMBER } });
+  await h.gate.idle();
+  assert.equal(h.state(e), 'completed:sent');
+  assert.equal(h.posts.length, 3);
+});
+
+test('/stop during a connect retry: not tried again, no alert about the connection', async () => {
+  const h = stack();
+  h.onSleep = async () => {
+    h.clock.t += 1000;
+    await h.send(h.at({ text: '/stop', senderId: OWNER }));
+  };
+  const e = await ask(h, { inbound: { senderId: MEMBER } }, connectTimeout());
+  await h.gate.idle();
+  assert.equal(h.state(e), 'failed:aborted');
+  assert.equal(h.posts.filter((p) => p.body.msg_id === e.messageId).length, 1);
+  assert.equal(h.sends(e)[0].state, 'failed');
+  assert.equal(h.store.listAlerts().some((a) => a.kind === 'send_not_connected'), false);
+});
+
+// ---- the wait for send-rate room can be cut short ----
+
+const fillRate = (h) => {
+  h.store.insertSendParts({ eventKey: 'filler', groupKey: h.store.key(GROUP_A), kind: 'reply', parts: [1, 2, 3, 4].map((n) => ({ textSha: String(n) })), now: h.now() });
+};
+const within = (promise, ms = 5000) => {
+  let timer;
+  const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('it was still asleep')), ms); });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+};
+
+test('/stop wakes a reply waiting for send-rate room: the queue is free long before the wait would end', async () => {
+  const h = stack();
+  fillRate(h);
+  let parked = false;
+  // The wait never ends by itself. Only the ack, which waits as well, moves the clock on.
+  h.onSleep = (ms) => {
+    if (parked) {
+      h.clock.t += ms;
+      return undefined;
+    }
+    parked = true;
+    setImmediate(() => {
+      h.clock.t += 1000;
+      h.send(h.at({ text: '/stop', senderId: OWNER }));
+    });
+    return new Promise(() => {});
+  };
+  h.clock.t += 1000;
+  const e = await h.send(h.at({ senderId: MEMBER }));
+  await within(h.gate.idle());
+  assert.equal(h.state(e), 'failed:aborted');
+  assert.equal(h.posts.filter((p) => p.body.msg_id === e.messageId).length, 0);
+});
+
+test('exit.stop() wakes a reply waiting for send-rate room', async () => {
+  const h = stack();
+  fillRate(h);
+  h.onSleep = () => {
+    setImmediate(() => h.exit.stop());
+    return new Promise(() => {});
+  };
+  h.clock.t += 1000;
+  const e = await h.send(h.at({ senderId: MEMBER }));
+  await within(h.gate.idle(), 200);
+  assert.equal(h.state(e), 'failed:exit_refused');
+  assert.equal(h.posts.length, 0);
+});
+
+// ---- the failure line's hourly slot ----
+
+test('a failure line refused for send rate does not spend the hourly slot, and one that goes out does', async () => {
+  const h = stack();
+  h.eff.current.limits.failureLinePerGroupPerHour = 1;
+  fillRate(h);
+  const ref = { eventKey: h.store.key('EVENT'), groupKey: h.store.key(GROUP_A), groupId: GROUP_A, messageId: 'MESSAGE', receivedAt: h.now(), msgTs: h.now() };
+  const key = `failline:${ref.groupKey}:${Math.floor(h.now() / 3600000)}`;
+
+  const refused = await h.exit.sendFixed(ref, 'modelFailed');
+  assert.deepEqual([refused.sent, refused.reason], [false, 'send_rate']);
+  assert.equal(h.store.peekCounter(key), 0);
+  assert.equal(h.posts.length, 0);
+
+  h.clock.t += 61000;
+  ref.receivedAt = h.now();
+  ref.msgTs = h.now();
+  const sent = await h.exit.sendFixed(ref, 'modelFailed');
+  assert.equal(sent.sent, true);
+  assert.equal(h.store.peekCounter(key), 1);
+  assert.equal(h.posts.length, 1);
+
+  const spent = await h.exit.sendFixed(ref, 'modelFailed');
+  assert.deepEqual([spent.sent, spent.reason], [false, 'failline_rate']);
   assert.equal(h.posts.length, 1);
 });
 

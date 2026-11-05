@@ -7,9 +7,9 @@ import { checkSentinels, loadPolicy, sha256Hex } from '../clo-plugin/lib/core/co
 import { createLedger } from '../clo-plugin/lib/core/ledger.js';
 import { callWorstMicros, fetchCatalog, lockFromCatalog, resolveSelector, validateModels } from '../clo-plugin/lib/core/models.js';
 import { extractPolicySection, writeAtomic } from '../clo-plugin/lib/core/render.js';
-import { apply, assertValid, CliError, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, renderAll, usd, withStore, withStoreAsync, writeConfig, writeModelsLock } from './common.mjs';
+import { apply, assertApplicable, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, renderAll, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock } from './common.mjs';
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, runDoctor } from './doctor.mjs';
-import { assertTestModeWired, inspectGateway, parseEnvFile, renamedEnvNames, renamedKeyHint, requireSecrets, startGateway, stopGateway } from './lifecycle.mjs';
+import { assertTestModeWired, inspectGateway, inspectStartLock, parseEnvFile, renamedEnvNames, renamedKeyHint, requireSecrets, startGateway, startLockFile, stopGateway, withStartLock } from './lifecycle.mjs';
 import { collectStatus, formatStatus, RESIDUAL_EXIT, residualBehind } from './status.mjs';
 
 const USAGE = `用法：clo <命令>
@@ -66,6 +66,7 @@ function printWarnings(ctx, cfg) {
 }
 
 function saveAndApply(ctx, cfg) {
+  assertApplicable(ctx, cfg);
   writeConfig(ctx, cfg);
   printWarnings(ctx, cfg);
   return apply(ctx, cfg);
@@ -83,23 +84,31 @@ function cmdApply(ctx) {
 
 const LIVE_HINTS = {
   budget: '预算必须大于 0，且层级顺序正确',
+  daily_hold: '日预算（budget.dailyUsd）不够一次必答回复的预留，@ 永远得不到额度。调高日预算，或调小 claudeModel 的 contextTokens、maxTokens',
   targets: '至少一个群，且每个群都有 owner（clo group add、clo owner add）',
   dm_closed: 'allowedDmUserIds 必须为空',
   key_readable: '读取这个 Key 的信息失败（D3 没有记录时不会去读），或这个 Key 没有每日限额（limit 不能为空，limit_reset 必须是 daily）',
+  key_limit: 'config.json 的 budget.keyDailyLimitUsd 和 OpenRouter 上这个 Key 的每日限额不一样。限额低于本地预算没有问题，但两边要写同一个数：改 OpenRouter 上的限额，或改配置后 clo apply',
   reconciled: '对账没有成功',
   heartbeat: 'Gateway 没有在运行，或还没收到过 READY（先在 dry-run 下 clo start）',
-  gateway_key: '运行中的 Gateway 没有 .env 里这个 CLO_CHAT_API_KEY。它的环境在启动时固定，改过 .env 要先 clo stop 再 clo start',
+  gateway_key: '运行中的 Gateway 还没有记录 .env 里这个 CLO_CHAT_API_KEY。刚启动的 Gateway 要先连接完成，等 clo status 显示已连接再试。如果已经连上，它用的就不是这个 Key：Gateway 的环境在启动时固定，改过 .env 要先 clo stop 再 clo start',
   identity: '机器人身份没有确认（看 clo status，再 clo ack identity）',
   notice: '有群没有确认告知（clo group notice-done <群>）',
   q0: 'Q0 没有确认：你还没有确认看过自己的群能收到什么（clo ack q0）',
   d3: 'D3 没有记录。QQ 协议 §4.2（模型资质）的决定要由你本人做出（clo ack d3 <决定>）',
   policy: '内容策略未启用、哈希不符，或 policy-ok 有误拦',
-  numbers: 'crisis.localNumbers 填了但没有核实日期',
+  numbers: 'contentPolicy.crisis.localNumbers 必须留空：回复里不写未经核实的求助号码',
   doctor: 'doctor 配置检查没有通过（clo doctor）',
   base_urls: '配置里有地址覆盖，只有测试模式允许',
   no_paid_pause: '付费已暂停（看 clo status）',
   models: '模型没有锁定（clo model refresh）',
 };
+
+function liveHint(code, failed, hasKey) {
+  if (code === 'key_readable' && !hasKey) return '.env 里没有 CLO_CHAT_API_KEY';
+  if (code === 'reconciled' && failed.includes('gateway_key')) return '这次没有对账：Gateway 用的 Key 和 .env 对不上时不对账，先解决 gateway_key';
+  return LIVE_HINTS[code] ?? '';
+}
 
 export function policyPasses(ctx, cfg) {
   try {
@@ -119,7 +128,10 @@ async function gatherLiveFacts(ctx, cfg) {
   const facts = { now: ctx.now(), env: ctx.env };
   facts.doctorOk = runDoctor(ctx, { level: CONFIG_LEVEL }).ok;
   facts.policyOk = policyPasses(ctx, cfg);
-  facts.modelsLocked = lockMatches(cfg, readModelsLock(ctx.paths));
+  const lock = usableLock(cfg, readModelsLock(ctx.paths));
+  facts.modelsLocked = Boolean(lock);
+  // The same figure as ledger.holdMicros('reply_required'). Without a price, 'models' or the ledger refuses anyway.
+  if (lock?.primary?.price) facts.requiredHoldMicros = 2 * callWorstMicros(lock.primary.price, cfg.claudeModel);
   const secrets = parseEnvFile(ctx.paths.envFile);
   return withStoreAsync(ctx, async (store) => {
     const number = (k) => {
@@ -136,7 +148,8 @@ async function gatherLiveFacts(ctx, cfg) {
       const ledger = createLedger({ store, getEffective: () => readEffective(ctx), fetch: ctx.fetch, getKey: () => secrets.CLO_CHAT_API_KEY, log: ctx.log, now: ctx.now });
       try {
         facts.key = await ledger.readKey();
-        facts.reconciled = (await ledger.reconcile(ctx.now())).ok;
+        // The baseline belongs to the Key that spends. Reconciling with another one would read as a Key change.
+        if (facts.gatewayKeyMatches) facts.reconciled = (await ledger.reconcile(ctx.now())).ok;
       } catch {
         facts.key = null;
       }
@@ -152,26 +165,47 @@ async function cmdModeLive(ctx) {
     ctx.out('已经是 live。');
     return 0;
   }
-  assertValid(ctx, { ...cfg, mode: 'dry-run' });
+  const dry = { ...cfg, mode: 'dry-run' };
+  assertValid(ctx, dry);
+  // A hand-edited 'live' goes first, or a refusal below would leave a config that apply and start both refuse.
+  if (cfg.mode !== 'dry-run') writeConfig(ctx, dry);
   // Fresh render first, so doctor and the ledger read this config and not a stale one.
-  apply(ctx, { ...cfg, mode: 'dry-run' });
+  apply(ctx, dry);
   const facts = await gatherLiveFacts(ctx, cfg);
   const result = livePreconditions(cfg, facts);
   if (!result.ok) {
     ctx.out('拒绝进入 live，以下条件未满足：');
     const hasKey = Boolean(parseEnvFile(ctx.paths.envFile).CLO_CHAT_API_KEY);
-    for (const code of result.failed) ctx.out(`  ${code}：${code === 'key_readable' && !hasKey ? '.env 里没有 CLO_CHAT_API_KEY' : LIVE_HINTS[code] ?? ''}`);
+    for (const code of result.failed) ctx.out(`  ${code}：${liveHint(code, result.failed, hasKey)}`);
     const hint = hasKey ? '' : renamedKeyHint(renamedEnvNames(ctx.paths.envFile), ['CLO_CHAT_API_KEY']);
     if (hint) ctx.out(hint);
     ctx.log('cli_mode_refused', { count: result.failed.length });
     return 1;
   }
   const next = { ...cfg, mode: 'live' };
+  assertApplicable(ctx, next, { allowLive: true });
   writeConfig(ctx, next);
   withStore(ctx, (store) => store.clearDiscovery());
   apply(ctx, next, { allowLive: true });
   ctx.log('cli_mode', { state: 'live' });
   ctx.out('已进入 live。可洛会回复准入群里的 @，这会产生费用。暂停：clo pause --all');
+  return 0;
+}
+
+function cmdModeDryRun(ctx) {
+  // First, and on its own: nothing that can go wrong below may keep the bot replying.
+  forceEffectiveDryRun(ctx);
+  try {
+    const cfg = { ...readConfig(ctx), mode: 'dry-run' };
+    writeConfig(ctx, cfg);
+    printWarnings(ctx, cfg);
+    apply(ctx, cfg);
+  } catch (e) {
+    if (!readEffective(ctx)) throw e;
+    throw new CliError(`已经进入 dry-run：不调用模型，不发送。但配置没有更新完：\n${e.message}`);
+  }
+  ctx.log('cli_mode', { state: 'dry-run' });
+  ctx.out('已切到 dry-run：不调用模型，不发送。');
   return 0;
 }
 
@@ -183,13 +217,7 @@ async function cmdMode(ctx, { positional }) {
     return 0;
   }
   if (sub === 'live') return cmdModeLive(ctx);
-  if (sub === 'dry-run') {
-    const cfg = { ...readConfig(ctx), mode: 'dry-run' };
-    saveAndApply(ctx, cfg);
-    ctx.log('cli_mode', { state: 'dry-run' });
-    ctx.out('已切到 dry-run：不调用模型，不发送。');
-    return 0;
-  }
+  if (sub === 'dry-run') return cmdModeDryRun(ctx);
   throw new CliError(`不认识的模式：${sub}`);
 }
 
@@ -218,7 +246,19 @@ function cmdPause(ctx, { flags }) {
   return 0;
 }
 
-function cmdResume(ctx, { flags }) {
+// A resume reaches further than it looks: whatever pauseTarget cannot read would mean every group.
+function assertResumeArgs(positional, flags) {
+  const names = Object.keys(flags);
+  const known = names.every((n) => ['--group', '--all', '--interject'].includes(n));
+  const groupNamed = flags['--group'] === undefined || typeof flags['--group'] === 'string';
+  const interjectAlone = flags['--interject'] === undefined || (flags['--interject'] === true && names.length === 1);
+  if (positional.length > 0 || !known || !groupNamed || !interjectAlone) {
+    throw new CliError('resume 的写法：clo resume、clo resume --all、clo resume --group <群> 或 clo resume --interject。这次什么都没有恢复。');
+  }
+}
+
+function cmdResume(ctx, { positional, flags }) {
+  assertResumeArgs(positional, flags);
   if (flags['--interject']) {
     withStore(ctx, (store) => store.delControl('interject_paused'));
     ctx.log('cli_resume', { kind: 'interject' });
@@ -249,7 +289,8 @@ function cmdStatus(ctx, { flags }) {
   else ctx.out(formatStatus(report));
   if (flags['--ack'] && report.db?.alerts?.length) {
     withStore(ctx, (store) => store.ackAlerts(report.db.alerts.map((a) => a.id)));
-    ctx.out(`已把 ${report.db.alerts.length} 条告警标记为已读。`);
+    // Standard output stays one JSON document under --json.
+    (flags['--json'] ? ctx.err : ctx.out)(`已把 ${report.db.alerts.length} 条告警标记为已读。`);
   }
   return 0;
 }
@@ -282,6 +323,7 @@ function cmdGroup(ctx, { positional, flags }) {
   }
   if (sub === 'remove') {
     const { id, group } = groupByLabel(cfg, need(positional[1], '群的名称'));
+    if (cfg.mode === 'live' && qq.allowedGroupIds.every((g) => g === id)) throw new CliError('live 下不能移除最后一个群：live 至少要有一个群。先 clo mode dry-run，再移除。');
     delete qq.groups[id];
     qq.allowedGroupIds = qq.allowedGroupIds.filter((g) => g !== id);
     if (qq.owner?.groupMember) delete qq.owner.groupMember[id];
@@ -371,14 +413,19 @@ function cmdBudget(ctx, { positional }) {
       ctx.out(`今日（上海日）有效花费：${usd(s.effectiveMicros)}（本地 ${usd(s.localMicros)}，供应商 ${usd(s.providerMicros)}）`);
       ctx.out(`分层：插话 ${usd(s.byTier.interject)}${b ? ` / $${b.interjectUsd}` : ''}，点名 ${usd(s.byTier.named)}${b ? ` / 全部到 $${b.namedUsd} 停` : ''}，@ ${usd(s.byTier.addressed)}${b ? ` / 全部到 $${b.addressedUsd} 停` : ''}`);
       ctx.out(`未结算：${s.unsettled} 笔，${usd(s.unsettledMicros)}。付费暂停：${store.getControl('paid_paused') ?? '否'}`);
-      if (b?.keyDailyLimitUsd !== null && b?.keyDailyLimitUsd !== undefined) ctx.out(`Key 日限额应设为 $${b.keyDailyLimitUsd}（在 OpenRouter 上设置，这里只记录）。`);
+      if (b?.keyDailyLimitUsd !== null && b?.keyDailyLimitUsd !== undefined) ctx.out(`配置写的 Key 日限额：$${b.keyDailyLimitUsd}。要和 OpenRouter 上的限额一样，不一样时 clo mode live 拒绝。`);
       ctx.out('本地花费是保守估算：未结算的按预留额计。真实数字以 OpenRouter 账单为准。');
       return 0;
     }
     if (sub === 'accept-unsettled') {
+      const before = store.getControl('paid_paused');
       const n = ledger.acceptUnsettled('cli');
-      const held = store.getControl('paid_paused') === 'residual' ? `但付费工作还没有恢复：现在的暂停原因是 residual。${RESIDUAL_EXIT}` : '崩溃或缺 usage 造成的付费暂停随之解除。';
-      ctx.out(`已按预留额结清 ${n} 笔未结算记录。${held}`);
+      const after = store.getControl('paid_paused');
+      let note = '现在没有付费暂停。';
+      if (after === 'residual') note = `但付费工作还没有恢复：现在的暂停原因是 residual。${RESIDUAL_EXIT}`;
+      else if (after !== null) note = `但付费工作还没有恢复：现在的暂停原因是 ${after}，这个命令不动它（看 clo status）。`;
+      else if (before !== null) note = '崩溃或缺 usage 造成的付费暂停随之解除。';
+      ctx.out(`已按预留额结清 ${n} 笔未结算记录。${note}`);
       return 0;
     }
     if (sub === 'clear-pause') {
@@ -483,26 +530,42 @@ async function loadCatalog(ctx, cfg) {
 }
 
 // Same model, higher price. A different model is judged by its own ceiling in validateModels.
+const PRICE_KEYS = ['inputPerM', 'outputPerM', 'cacheReadPerM', 'cacheWritePerM'];
+
 function raisedPrice(oldLock, lock) {
   if (!oldLock) return false;
-  const dearer = (a, b) => a.id === b.id && ['inputPerM', 'outputPerM', 'cacheReadPerM', 'cacheWritePerM'].some((k) => b.price[k] > a.price[k]);
+  const dearer = (a, b) => a.id === b.id && PRICE_KEYS.some((k) => b.price[k] > a.price[k]);
   return dearer(oldLock.primary, lock.primary) || dearer(oldLock.decision, lock.decision);
 }
+
+const samePrice = (a, b) => PRICE_KEYS.every((k) => a.price[k] === b.price[k]);
 
 function budgetWarning(ctx, cfg, lock) {
   const worst = 2 * callWorstMicros(lock.primary.price, cfg.claudeModel);
   if (worst > cfg.budget.addressedUsd * 1e6) ctx.out(`提醒：一次必答回合预留 ${usd(worst)}，超过日预算 $${cfg.budget.addressedUsd}，这样 @ 永远得不到额度。`);
 }
 
-function commitModels(ctx, next, catalog, flags, { changed }) {
+// slot names the one model a set command is about: the other must still resolve to what is locked, and this one counts
+// as changed when it resolves differently, even under the same selector. Without a slot the caller has decided both.
+function commitModels(ctx, next, catalog, flags, { changed: named, slot = null }) {
+  const oldLock = readModelsLock(ctx.paths);
+  let changed = named;
+  const resolved = slot && oldLock ? tryResolve(next, catalog) : null;
+  if (resolved) {
+    const other = slot === 'primary' ? 'decision' : 'primary';
+    if (oldLock[other]?.id !== resolved[other]) {
+      throw new CliError(`${other === 'primary' ? '主模型' : '判定模型'}现在解析到 ${resolved[other]}，和锁定的 ${oldLock[other]?.id} 不同。这个命令只改一个模型，要一起换就运行 clo model refresh（启用 QQ 时要加 --qq-platform-notified）。`);
+    }
+    if (oldLock[slot]?.id !== resolved[slot]) changed = true;
+  }
   const confirmPrice = Boolean(flags['--confirm-price']);
   const qqPlatformNotified = Boolean(flags['--qq-platform-notified']);
   const v = validateModels(next, catalog, { confirmPrice, qqPlatformNotified, change: changed });
   if (!v.ok) throw new CliError(printModelErrors(v));
   for (const w of v.warnings) ctx.out(`提醒：${w.path} ${w.message}`);
-  const oldLock = readModelsLock(ctx.paths);
   const lock = lockFromCatalog(next, catalog);
   if (raisedPrice(oldLock, lock) && !confirmPrice) throw new CliError('目录价格比锁定时高，加 --confirm-price 才接受。');
+  assertApplicable(ctx, next, { lock });
   writeConfig(ctx, next);
   writeModelsLock(ctx, lock, { qqPlatformNotified, changed });
   apply(ctx, next);
@@ -518,6 +581,15 @@ function resolvedPair(cfg, catalog) {
     return { primary: resolveSelector(cfg.claudeModel.id, catalog), decision: resolveSelector(cfg.decisionModel.id, catalog) };
   } catch (e) {
     throw new CliError(e.message);
+  }
+}
+
+// Null when a selector does not resolve. validateModels then reports that in its usual form.
+function tryResolve(cfg, catalog) {
+  try {
+    return resolvedPair(cfg, catalog);
+  } catch {
+    return null;
   }
 }
 
@@ -542,7 +614,7 @@ async function cmdModel(ctx, { positional, flags }) {
     const changed = cfg[block].id !== id;
     const next = { ...cfg, [block]: { ...cfg[block], id } };
     const catalog = await loadCatalog(ctx, next);
-    return commitModels(ctx, next, catalog, flags, { changed });
+    return commitModels(ctx, next, catalog, flags, { changed, slot: sub === 'set-primary' ? 'primary' : 'decision' });
   }
   if (sub === 'refresh') {
     const catalog = await loadCatalog(ctx, cfg);
@@ -562,13 +634,27 @@ async function cmdModel(ctx, { positional, flags }) {
     ctx.out(`目录里可用：主模型 ${pair.primary}，判定模型 ${pair.decision}。`);
     if (!lock) ctx.out('还没有锁定。运行 clo model refresh。');
     else if (lock.primary.id !== pair.primary || lock.decision.id !== pair.decision) ctx.out(`与锁定不同（锁定 ${lock.primary.id}、${lock.decision.id}）。refresh 才会切换，不会自动换。`);
-    else ctx.out('与锁定一致。');
+    else {
+      const fresh = lockFromCatalog(cfg, catalog);
+      if (samePrice(lock.primary, fresh.primary) && samePrice(lock.decision, fresh.decision)) ctx.out('与锁定一致。');
+      else ctx.out('模型没变，但目录价格和锁定时不同。现在仍按锁定的价格计算；refresh 才会更新，涨价时要加 --confirm-price。');
+    }
     return 0;
   }
   throw new CliError(USAGE);
 }
 
 // --- ack ---
+
+const closeFile = (ctx) => `${ctx.paths.db}.terminal_close`;
+
+function filedCloseCode(ctx) {
+  try {
+    return readFileSync(closeFile(ctx), 'utf8').trim() || 'unknown';
+  } catch (e) {
+    return e.code === 'ENOENT' ? null : 'unknown';
+  }
+}
 
 function cmdAck(ctx, { positional }) {
   const sub = positional[0];
@@ -577,7 +663,9 @@ function cmdAck(ctx, { positional }) {
       const c = store.getControl('terminal_close');
       store.delControl('terminal_close');
       return c;
-    });
+    }) ?? filedCloseCode(ctx);
+    // A close the store could not take waits in this file, and the next start would read it as a latch.
+    rmSync(closeFile(ctx), { force: true });
     if (code) ctx.log('cli_ack_terminal', { closeCode: code });
     ctx.out(code ? `已解除关闭码 ${code} 的锁存。下次 clo start 会再连接；如果平台仍拒绝，还会锁存。` : '没有锁存的关闭码。');
     return 0;
@@ -615,12 +703,18 @@ function cmdDoctor(ctx, { flags }) {
   return report.ok ? 0 : 1;
 }
 
-async function cmdStart(ctx) {
+const CMDLINE_HINT = '读不到它的命令行，它很可能是用更高权限启动的，还在运行。从启动它的 shell 里运行这个命令。';
+
+async function startLocked(ctx) {
   const cfg = readConfig(ctx);
   assertTestModeWired(cfg, ctx.env);
   const current = inspectGateway(ctx.paths, ctx.env);
   if (current.state === 'running') throw new CliError(`Gateway 已在运行（进程 ${current.record.pid}）。`);
-  if (current.state === 'unknown') throw new CliError(`查不到进程 ${current.record.pid} 的状态，可能还在运行。PID 文件保留，请稍后再试。`);
+  if (current.state === 'unknown') {
+    throw new CliError(current.cause === 'cmdline_unreadable'
+      ? `进程 ${current.record.pid} 可能还在运行。PID 文件保留。${CMDLINE_HINT}`
+      : `查不到进程 ${current.record.pid} 的状态，可能还在运行。PID 文件保留，请稍后再试。`);
+  }
   if (current.state !== 'none') rmSync(ctx.paths.pidFile, { force: true });
 
   const secrets = parseEnvFile(ctx.paths.envFile);
@@ -638,14 +732,30 @@ async function cmdStart(ctx) {
   }
   const { pid, port } = await startGateway(ctx, cfg, { secrets });
   ctx.out(`Gateway 已启动：进程 ${pid}，端口 ${port}（仅 loopback），模式 ${cfg.mode}。`);
-  ctx.out('连上 QQ 通常要 30–45 秒，用 clo status 确认“心跳新鲜”和“已连接”。');
+  ctx.out('连上 QQ 要等一会儿，用 clo status 确认“心跳新鲜”和“已连接”。');
   return 0;
 }
 
+// The check for a running Gateway is inside the lock: two starts must not both find none.
+const cmdStart = (ctx) => withStartLock(ctx, () => startLocked(ctx));
+
 function cmdStop(ctx) {
+  // A start that is under way has a Gateway the PID file may not show yet, and a stop now would miss it.
+  const lock = inspectStartLock(ctx);
+  if (lock.state === 'held') {
+    ctx.out(lock.cause === 'unreadable'
+      ? `启动锁读不出内容，可能有 clo start 正在运行。没有动任何进程。如果确认没有，删除 ${startLockFile(ctx.paths)} 后再试。`
+      : `clo start 可能还在运行（进程 ${lock.record.pid}）。没有动任何进程，等它结束再 clo stop。`);
+    return 1;
+  }
   const r = stopGateway(ctx);
   const noteDown = () => {
-    if (existsSync(ctx.paths.db)) withStore(ctx, (store) => store.setControl('connected', 'false', 'cli'));
+    if (!existsSync(ctx.paths.db)) return;
+    withStore(ctx, (store) => {
+      store.setControl('connected', 'false', 'cli');
+      // A heartbeat only says something while the Gateway runs. A leftover one would read as fresh for a while.
+      store.delControl('heartbeat_at');
+    });
   };
   if (r.stopped) {
     noteDown();
@@ -653,7 +763,9 @@ function cmdStop(ctx) {
     return 0;
   }
   if (r.reason === 'lookup_failed') {
-    ctx.out('查不到记录的进程状态，它可能还在运行。没有动它，PID 文件保留，请稍后再试 clo stop。');
+    ctx.out(r.cause === 'cmdline_unreadable'
+      ? `记录的进程可能还在运行。没有动它，PID 文件保留。${CMDLINE_HINT}`
+      : '查不到记录的进程状态，它可能还在运行。没有动它，PID 文件保留，请稍后再试 clo stop。');
     return 1;
   }
   if (r.reason === 'pid_mismatch') {
