@@ -1,2 +1,5 @@
 # CLAUDE.md is hashed. A line-ending conversion would fail the integrity check.
 CLAUDE.md -text
+
+# Golden files are compared byte for byte.
+tests/fixtures/render/*.json -text
