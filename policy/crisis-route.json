@@ -1,0 +1,12 @@
+{
+  "version": "1",
+  "basis": "Routing only: a match adds one decision call during cooldown or quiet hours. It never blocks, leaves no per-member record, and is capped per group.",
+  "addedBy": "clo-build",
+  "addedAt": "2026-11-03",
+  "terms": [
+    "想死", "不想活", "活不下去", "自杀", "轻生", "自残", "割腕", "跳楼", "结束生命", "结束自己", "了结自己",
+    "吞药", "吃了很多药", "吃了一瓶药", "药物过量",
+    "家暴", "被打了", "虐待", "被性侵", "性侵", "强奸", "猥亵", "被跟踪",
+    "救命", "有危险", "要杀我"
+  ]
+}

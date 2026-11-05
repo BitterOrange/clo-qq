@@ -1,0 +1,2 @@
+# Hashed files. A line-ending conversion would fail the integrity check.
+* text eol=lf

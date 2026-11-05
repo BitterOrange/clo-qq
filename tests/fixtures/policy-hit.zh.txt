@@ -1,0 +1,14 @@
+sexual.solicit	有空一起约炮
+sexual.solicit	裸聊 群 在这里
+sexual.porn_resource	这里有黄片资源
+sexual.minor	幼女资源
+crime.explosive_howto	制作炸弹的步骤是这样的
+crime.drug_channel	冰毒的货源我知道
+crime.gambling_promo	百家乐平台注册这里
+crime.fraud_service	加我，帮你代开发票
+crime.fraud_howto	杀猪盘的教程如下
+crime.malware	木马源码在这里
+privacy.cn_id	他的号码是 11010519491231002X
+privacy.cn_mobile	他的电话是 138 1234 5678
+privacy.labelled_number	他的银行卡号是 6222020000000000
+privacy.doxx_howto	人肉搜索的教程

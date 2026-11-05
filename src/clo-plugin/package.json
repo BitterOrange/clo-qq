@@ -1,0 +1,19 @@
+{
+  "name": "@clo/clo-plugin",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Clo QQ channel for OpenClaw.",
+  "dependencies": {
+    "@tencent-connect/qqbot-nodejs": "1.0.5"
+  },
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "compat": { "pluginApi": ">=2026.10.9" },
+    "channel": {
+      "id": "clo-qq",
+      "label": "Clo QQ",
+      "blurb": "Clo QQ channel."
+    }
+  }
+}

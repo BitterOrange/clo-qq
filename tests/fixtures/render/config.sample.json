@@ -1,0 +1,27 @@
+{
+  "mode": "dry-run",
+  "gatewayPort": 18790,
+  "budget": { "dailyUsd": 2.5, "interjectUsd": 0.75, "searchUsd": 2.10, "namedUsd": 2.25, "addressedUsd": 2.5, "keyDailyLimitUsd": 3.25 },
+  "claudeModel": { "id": "opus-latest", "effort": "low", "maxTokens": 3000, "cacheRetention": "short", "contextTokens": 24000 },
+  "decisionModel": { "id": "anthropic/claude-haiku-5.5", "effort": "none", "maxTokens": 200 },
+  "searchProvider": "none",
+  "timeouts": { "decisionMs": 8000, "turnSeconds": 90 },
+  "names": ["可洛", "可洛小姐", "Clo"],
+  "interject": { "cooldownMinutes": 8, "perHour": 6, "perDay": 8, "windowMs": 4000 },
+  "quietHours": { "start": "23:00", "end": "08:00", "timezone": "Asia/Shanghai" },
+  "retention": { "eventDays": 14, "sendDays": 14, "reservationDays": 90, "contextMaxItems": 40, "contextMaxAgeHours": 24, "contextMaxTokens": 3000 },
+  "qq": {
+    "enabled": true, "appId": "FAKE-APP-ID", "apiBaseUrl": "", "tokenBaseUrl": "",
+    "owner": { "dm": [], "groupMember": { "FAKE_GROUP_A": ["FAKE_OWNER_A"] } },
+    "allowedDmUserIds": [], "allowedGroupIds": ["FAKE_GROUP_A"],
+    "groups": { "FAKE_GROUP_A": { "label": "测试群", "interject": false, "nameMention": false, "noticeGiven": false } },
+    "urlMode": "names", "maxPartChars": 1500
+  },
+  "contentPolicy": {
+    "enabled": true, "version": "1", "file": "persona/CONTENT-POLICY.md", "sha256": "",
+    "outputFilter": { "rulesFile": "policy/rules.json", "categories": ["sexual", "crime", "privacy"] },
+    "crisis": { "routeTermsFile": "policy/crisis-route.json", "localNumbers": "", "numbersVerifiedOn": "" }
+  },
+  "privacy": { "replaceSystemPrompt": true },
+  "acks": { "q0Recorded": false, "d3": "", "identityConfirmedAppId": "" }
+}

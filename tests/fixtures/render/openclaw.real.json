@@ -1,0 +1,190 @@
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback",
+    "port": 18790,
+    "auth": {
+      "mode": "token"
+    },
+    "controlUi": {
+      "enabled": false
+    },
+    "reload": {
+      "mode": "hybrid"
+    }
+  },
+  "logging": {
+    "level": "silent",
+    "consoleLevel": "silent"
+  },
+  "update": {
+    "checkOnStart": false,
+    "auto": {
+      "enabled": false
+    }
+  },
+  "discovery": {
+    "mdns": {
+      "mode": "off"
+    }
+  },
+  "cron": {
+    "enabled": false
+  },
+  "plugins": {
+    "allow": [
+      "clo",
+      "openrouter"
+    ],
+    "load": {
+      "paths": [
+        "C:\\fake repo\\src\\clo-plugin"
+      ]
+    },
+    "slots": {
+      "memory": "none"
+    },
+    "entries": {
+      "clo": {
+        "enabled": true,
+        "config": {
+          "effectivePath": "C:\\fake repo\\.runtime\\clo\\effective.json"
+        },
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      },
+      "openrouter": {
+        "enabled": true
+      }
+    }
+  },
+  "channels": {
+    "clo-qq": {
+      "enabled": true,
+      "appId": "FAKE-APP-ID"
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "catalogRefresh": {
+      "enabled": false
+    },
+    "providers": {
+      "openrouter": {
+        "models": [
+          {
+            "id": "anthropic/claude-opus-5.5",
+            "name": "anthropic/claude-opus-5.5",
+            "reasoning": true,
+            "input": [
+              "text"
+            ],
+            "contextWindow": 200000,
+            "contextTokens": 24000,
+            "maxTokens": 3000,
+            "cost": {
+              "input": 5,
+              "output": 20,
+              "cacheRead": 0.5,
+              "cacheWrite": 6.25
+            }
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/anthropic/claude-opus-5.5",
+        "fallbacks": []
+      },
+      "models": {
+        "openrouter/anthropic/claude-opus-5.5": {
+          "params": {
+            "thinking": "low",
+            "maxTokens": 3000,
+            "cacheRetention": "short"
+          }
+        }
+      },
+      "workspace": "C:\\fake repo\\.runtime\\workspace",
+      "userTimezone": "Asia/Shanghai",
+      "skipBootstrap": true,
+      "contextInjection": "always",
+      "bootstrapMaxChars": 20000,
+      "bootstrapTotalMaxChars": 60000,
+      "heartbeat": {
+        "every": "0m"
+      },
+      "silentReply": {
+        "group": "allow"
+      },
+      "timeoutSeconds": 90,
+      "blockStreamingDefault": "off",
+      "compaction": {
+        "memoryFlush": {
+          "enabled": false
+        }
+      }
+    }
+  },
+  "messages": {
+    "visibleReplies": "automatic"
+  },
+  "session": {
+    "dmScope": "per-channel-peer",
+    "resetByType": {
+      "group": {
+        "mode": "idle",
+        "idleMinutes": 120
+      }
+    }
+  },
+  "tools": {
+    "allow": [
+      "clo_feature_status"
+    ],
+    "toolSearch": false,
+    "deny": [
+      "message",
+      "web_search",
+      "web_fetch",
+      "x_search",
+      "memory_*",
+      "exec",
+      "process",
+      "read",
+      "write",
+      "edit",
+      "apply_patch",
+      "ls",
+      "sessions_*",
+      "subagents",
+      "secrets",
+      "tts",
+      "cron",
+      "gateway",
+      "openclaw",
+      "session_status",
+      "tool_call",
+      "tool_describe",
+      "tool_search"
+    ],
+    "media": {
+      "image": {
+        "enabled": false
+      },
+      "audio": {
+        "enabled": false
+      },
+      "video": {
+        "enabled": false
+      }
+    },
+    "elevated": {
+      "enabled": false
+    }
+  }
+}

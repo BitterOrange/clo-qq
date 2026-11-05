@@ -1,0 +1,9 @@
+{
+  "name": "clo-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "openclaw": "2026.10.9",
+    "@openclaw/perplexity-plugin": "2026.10.9"
+  }
+}

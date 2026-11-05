@@ -1,0 +1,18 @@
+{
+  "version": "1",
+  "rules": [
+    { "id": "sexual.solicit", "category": "sexual", "pattern": "(约炮|裸聊|援交)(群|软件|平台|服务|加我|私聊我|联系我)|(加我|来|一起)(约炮|裸聊)", "basis": "policy item 3: soliciting sexual contact in the bot's own reply", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "sexual.porn_resource", "category": "sexual", "pattern": "(黄片|成人视频|色情视频|色情网站|小黄书)(资源|下载|地址|网址|分享|合集)", "basis": "policy item 3: pointing to pornography", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "sexual.minor", "category": "sexual", "pattern": "(幼女|幼童|萝莉)(资源|裸照|色情|性交)", "basis": "policy item 3: sexualizing minors", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "crime.explosive_howto", "category": "crime", "pattern": "(炸弹|炸药|雷管)(的)?(制作|配方|做法|制造)(步骤|教程|方法|如下)|(制作|自制|制造)(炸弹|炸药|雷管)(的)?(步骤|教程|方法|配方)", "basis": "policy item 2: operational crime method", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "crime.drug_channel", "category": "crime", "pattern": "(冰毒|海洛因|大麻|k粉|摇头丸)(的)?(货源|购买渠道|购买方式|哪里买|代购)|(合成|提炼|制作)(冰毒|海洛因|k粉)(的)?(步骤|教程|方法|配方)", "basis": "policy item 4: drug channels", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "crime.gambling_promo", "category": "crime", "pattern": "(赌场|博彩|百家乐|时时彩)(平台|网站)?(注册|充值|入口|网址|链接|推荐|返水|代理)", "basis": "policy item 4: gambling promotion", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "crime.fraud_service", "category": "crime", "pattern": "(代开发票|办假证|刷单兼职|跑分平台|洗钱通道)(加|联系|私聊|微信|vx|qq)|(加我|联系我|私聊我|私信我).{0,12}(代开发票|办假证|刷单|跑分|洗钱)", "basis": "policy item 4: promoting fraud services", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "crime.fraud_howto", "category": "crime", "pattern": "(诈骗|杀猪盘|电信诈骗)(的)?(教程|实操步骤|入门方法)", "basis": "policy item 4: fraud method", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "crime.malware", "category": "crime", "pattern": "(木马|勒索软件|远控)(源码|免杀|生成器)|免杀教程", "basis": "policy item 4: malware", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "privacy.cn_id", "category": "privacy", "pattern": "(?<!\\d)[1-9]\\d{5}(19|20)\\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])\\d{3}[\\dx](?!\\d)", "basis": "policy item 5: resident ID number in the bot's own reply", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "privacy.cn_mobile", "category": "privacy", "pattern": "(?<!\\d)1[3-9]\\d{9}(?!\\d)", "basis": "policy item 5: mobile number in the bot's own reply", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "privacy.labelled_number", "category": "privacy", "pattern": "(身份证号|银行卡号|卡号|护照号)(码)?(是|为|:)\\d{6,}", "basis": "policy item 5: labelled personal number", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" },
+    { "id": "privacy.doxx_howto", "category": "privacy", "pattern": "(开盒|人肉搜索)(他|她|某人|别人)?(的)?(教程|步骤|方法如下)", "basis": "policy item 5: doxxing method", "addedBy": "clo-build", "addedAt": "2026-11-03", "status": "active" }
+  ]
+}

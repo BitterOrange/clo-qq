@@ -1,0 +1,33 @@
+{
+  "id": "clo",
+  "name": "Clo",
+  "description": "Clo QQ channel.",
+  "channels": ["clo-qq"],
+  "activation": { "onStartup": true },
+  "contracts": { "tools": ["clo_feature_status"] },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "effectivePath": { "type": "string" },
+      "generationTag": { "type": "string" }
+    }
+  },
+  "channelConfigs": {
+    "clo-qq": {
+      "label": "Clo QQ",
+      "description": "Clo QQ channel.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "appId": { "type": "string" },
+          "apiBaseUrl": { "type": "string" },
+          "tokenBaseUrl": { "type": "string" },
+          "reloadTag": { "type": "string" }
+        }
+      }
+    }
+  }
+}

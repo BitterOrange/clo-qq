@@ -1,0 +1,18 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+config.json
+
+# Runtime state: private Node, packages, gateway state, logs, PIDs
+.runtime/
+node_modules/
+
+# Evidence that may contain IDs or message content
+captures/
+*.log
+*.qr.png
+
+# Local notes and leftover temp files
+.private/
+*.tmp

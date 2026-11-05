@@ -1,0 +1,11 @@
+{
+  "name": "clo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Clo: local QQ chat companion and group bot. Runs with the private Node in .runtime/node.",
+  "engines": { "node": ">=24.22.1 <25" },
+  "dependencies": {
+    "@tencent-connect/qqbot-nodejs": "1.0.5"
+  }
+}
