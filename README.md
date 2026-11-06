@@ -12,6 +12,8 @@
 
 阶段编号、哪些在真实环境验证过、哪些只在模拟环境验证过，见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
+**分支：** 这里是 `master`，跑的是 OpenClaw 路线，上面的真实记录都来自它。不依赖 OpenClaw 的原生运行时在 [`native-runtime`](https://github.com/BitterOrange/clo-qq/tree/native-runtime) 分支上开发，只有离线测试，真实 QQ 验收还没做，通过之后才合并回来。
+
 ## 你需要准备什么
 
 - **Windows x64 和 PowerShell 7。** `setup.ps1` 用到了 Windows PowerShell 5.1 没有的参数。项目自带私有 Node，不用系统 Node，也不改 PATH。
