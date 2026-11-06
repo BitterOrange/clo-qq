@@ -14,7 +14,7 @@
 
 **分支：** 这里是 `native-runtime`，原生运行时在真实 QQ 验收通过、合并之前只在这个分支上。没有原生运行时、只走 OpenClaw 路线的版本在 [`master`](https://github.com/BitterOrange/clo-qq/tree/master)。
 
-**过渡期：两套运行时。** 用户已决定去掉 OpenClaw。项目自己的运行时已经写好，放在配置项 `runtime: "own"` 后面，**默认仍是 `openclaw`，现在跑的也是它，上面这些真实记录都是在 OpenClaw 上得到的**。新运行时在真实 QQ 上的验收一项都没有做，只有离线测试（mock QQ、mock 模型）。这份 README 写的都是 openclaw 路线，另有说明的除外。怎么切换、怎么回退、改了什么，见 [docs/own-runtime.md](docs/own-runtime.md)。
+**过渡期：两套运行时。** 用户已决定去掉 OpenClaw。项目自己的运行时已经写好，放在配置项 `runtime: "own"` 后面，**默认仍是 `openclaw`，现在跑的也是它，上面这些真实记录都是在 OpenClaw 上得到的**。新运行时在真实 QQ 上的验收一项都没有做，只有离线测试（mock QQ、mock 模型）和一次不接 QQ 的付费探测（Q5，真实 OpenRouter，两个回合）。这份 README 写的都是 openclaw 路线，另有说明的除外。怎么切换、怎么回退、改了什么，见 [docs/own-runtime.md](docs/own-runtime.md)。
 
 ## 你需要准备什么
 
@@ -241,7 +241,7 @@ Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度�
 - 本地数字是估算，真实费用以 OpenRouter 账单为准。对账差额过大或读不到 Key 时，付费自动暂停。
 - 实际花费的小样本：测试群 18 次 @ 回复共 $0.2382，平均 $0.0132。没命中缓存的约 $0.03–$0.04，命中的约 $0.005–$0.012。改人设后下一条总是没命中缓存。会话越长越贵，每个会话最多只测到 8 轮，也没有遇到压缩。插话冷却 8 分钟比缓存的 5 分钟长，所以插话通常没有缓存，一次约 $0.04。这些样本很少，不能当预算依据。
 
-另有一个可选的付费探测工具，用来量真实的 token、费用和对账延迟：最坏 $1.5484，最多 9 次模型调用。新运行时的版本（`-Runtime own`）按 2026-11-06 的新计划最坏 $0.0941，最多 2 次模型调用，读专用的 `CLO_TEST_API_KEY`，还没有在真实 OpenRouter 上跑过。用法和约束见 [DEPLOYMENT.md](DEPLOYMENT.md) 的“付费探测工具”。
+另有一个可选的付费探测工具，用来量真实的 token、费用和对账延迟：最坏 $1.5484，最多 9 次模型调用。新运行时的版本（`-Runtime own`）按 2026-11-06 的新计划最坏 $0.094144，最多 2 次模型调用，读专用的 `CLO_TEST_API_KEY`。它在真实 OpenRouter 上跑过一次（2026-11-07，不接 QQ），两个回合合计 $0.0338，只是一次样本。用法和约束见 [DEPLOYMENT.md](DEPLOYMENT.md) 的“付费探测工具”。
 
 以后可能用的省钱办法记在 [docs/cost-options.md](docs/cost-options.md)，都没有实现。
 
@@ -329,6 +329,8 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 .\.runtime\node\node.exe --test --test-concurrency=1 tests/e2e/*.test.mjs   # 真实 Gateway，一个文件一个文件跑
 .\.runtime\node\node.exe --test --test-concurrency=1 tests/e2e-own/<文件>.test.mjs   # 自己的运行时，一个文件一个文件跑
 ```
+
+真实 Gateway 的测试要一个文件一个文件跑。4 个文件并发时，插件换代从单独跑的约 11 秒变成约 87 秒，超过测试的等待时间。
 
 `tests/e2e-own/` 启动真实的 `src/bot/main.mjs`，QQ 和模型同样是 mock。它和 `tests/e2e/` 怎么一一对应，见 [docs/own-runtime.md](docs/own-runtime.md) 的“测试对照”。
 

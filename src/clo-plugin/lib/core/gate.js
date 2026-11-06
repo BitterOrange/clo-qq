@@ -143,6 +143,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
   let queues = null;
   let context = null;
   let sweepTimer = null;
+  let ownSweepTimer = null;
   let invalidStreak = 0;
   let arrivals = 0;
   const flights = new Map();
@@ -214,6 +215,29 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       if (context.sweep(now()) > 0) armSweep();
     }, HOUR);
     sweepTimer?.unref?.();
+  }
+
+  // Own runtime: her own lines leave the moment a group has been idle for OWN_IDLE_MS, not at the next hourly sweep.
+  // One timer, set for the earliest such deadline. A turn that moved a deadline later finds it early, and it sets
+  // itself again.
+  function armOwnSweep() {
+    if (stopped) return;
+    if (ownSweepTimer) clearTimer(ownSweepTimer);
+    ownSweepTimer = null;
+    const due = context?.ownDeadline() ?? null;
+    if (due === null) return;
+    ownSweepTimer = setTimer(() => {
+      ownSweepTimer = null;
+      if (stopped) return;
+      tryQuietly(() => {
+        const held = context.ownHeld();
+        context.sweep(now());
+        const gone = held - context.ownHeld();
+        if (gone > 0) log('own_lines_expired', { count: gone });
+      });
+      armOwnSweep();
+    }, Math.max(due - now(), 1));
+    ownSweepTimer?.unref?.();
   }
 
   function end(rec, from, state, reason, extra = {}) {
@@ -533,6 +557,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     if (posted.length > 0) {
       context.pushOwn(rec.groupKey, { text: posted.join('\n'), ts: now() });
       armSweep();
+      armOwnSweep();
     }
   }
 
@@ -552,6 +577,11 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       return false;
     }
     const why = ownerAborted ? 'owner_stop' : 'aborted';
+    // With the own runtime gate.stop() aborts the run itself, so an abort that was not a /stop may be the shutdown.
+    if (!ownerAborted && runtime === 'own') {
+      alertMissed(rec, why);
+      return false;
+    }
     if (!ownerAborted || !turn.required || wentOut(rec.eventKey)) {
       alertRefused(rec, why);
       return false;
@@ -1254,6 +1284,8 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       for (const flight of running) flight.controller.abort(abortReason('shutdown'));
       if (sweepTimer) clearTimer(sweepTimer);
       sweepTimer = null;
+      if (ownSweepTimer) clearTimer(ownSweepTimer);
+      ownSweepTimer = null;
       const done = (async () => {
         if (queues) await queues.stop();
         await Promise.allSettled([...adhoc]);

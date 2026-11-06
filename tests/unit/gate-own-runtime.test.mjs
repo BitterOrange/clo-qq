@@ -690,3 +690,105 @@ test('a runtime other than openclaw or own is refused when the gate or exit is b
   assert.throws(() => createGate({ store: null, ledger: null, policy: null, getEffective: () => null, decide: null, dispatchTurn: null, runtime: 'wechat' }), /runtime must be/);
   assert.throws(() => createExit({ bot: null, store: null, policy: null, getEffective: () => null, runtime: 'wechat' }), /runtime must be/);
 });
+
+// ---- a turn for a person in danger cut off by a shutdown ----
+
+const crisisAlerts = (h) => h.store.listAlerts().filter((a) => a.kind.startsWith('crisis_'));
+
+test('own: a shutdown that cuts off a turn for a person in danger raises the shutdown alert, not crisis_refused', async () => {
+  const h = stack();
+  h.run = waitsForAbort(h);
+  h.later();
+  const a = await h.send(h.at({ text: CRISIS, senderId: MEMBER }));
+  await until(() => h.waiting === 1);
+  await h.gate.stop();
+  await until(() => h.state(a) !== 'dispatching');
+  assert.equal(h.runs[0].signal.reason.message, 'shutdown');
+  assert.equal(h.state(a), 'failed:aborted');
+  assert.deepEqual(crisisAlerts(h).map((x) => x.kind), ['crisis_dropped_on_stop']);
+  assert.deepEqual(h.postedTo(a), [], 'nothing is said at a shutdown');
+  assert.deepEqual(h.reservations(a).map((r) => r.status), ['unsettled']);
+  assert.equal(h.pausedBy(), null);
+});
+
+test('own: /stop and the deadline keep their path for a person in danger (controls for the shutdown case)', async () => {
+  // /stop: the failure line once, and crisis_refused saying so.
+  const s = stack();
+  s.run = waitsForAbort(s);
+  s.later();
+  const a = await s.send(s.at({ text: CRISIS, senderId: MEMBER }));
+  await until(() => s.waiting === 1);
+  s.later();
+  await s.send(s.at({ text: '/stop', senderId: OWNER }));
+  await s.gate.idle();
+  assert.deepEqual(s.postedTo(a), [LINES.modelFailed]);
+  const stopAlerts = crisisAlerts(s);
+  assert.deepEqual(stopAlerts.map((x) => x.kind), ['crisis_refused']);
+  assert.match(JSON.stringify(stopAlerts[0]), /owner_stop/);
+  assert.match(JSON.stringify(stopAlerts[0]), /line_sent/);
+
+  // The deadline, with the gate running: crisis_refused for the abort, and no line.
+  const d = stack();
+  d.run = waitsForAbort(d);
+  d.later();
+  const b = await d.send(d.at({ text: CRISIS, senderId: MEMBER }));
+  await until(() => d.waiting === 1);
+  d.advance(d.runs[0].turn.deadlineAt - d.now());
+  await d.gate.idle();
+  assert.equal(d.runs[0].signal.reason.message, 'deadline');
+  assert.equal(d.state(b), 'failed:aborted');
+  const deadlineAlerts = crisisAlerts(d);
+  assert.deepEqual(deadlineAlerts.map((x) => x.kind), ['crisis_refused']);
+  assert.match(JSON.stringify(deadlineAlerts[0]), /"aborted"/);
+  assert.deepEqual(d.postedTo(b), []);
+});
+
+test('openclaw: a shutdown during a turn for a person in danger that the host reports aborted still raises crisis_refused, as before', async () => {
+  const h = stack({ runtime: null });
+  h.run = waitsForAbort(h);
+  h.later();
+  const a = await h.send(h.at({ text: CRISIS, senderId: MEMBER }));
+  await until(() => h.waiting === 1);
+  await h.gate.stop();
+  await until(() => h.state(a) !== 'dispatching');
+  const alerts = crisisAlerts(h);
+  assert.deepEqual(alerts.map((x) => x.kind), ['crisis_refused']);
+  assert.match(JSON.stringify(alerts[0]), /"aborted"/);
+});
+
+// ---- her lines leave on time ----
+
+const expired = (h) => h.logs.filter((l) => l.event === 'own_lines_expired');
+
+test('own: her lines leave memory at exactly 120 idle minutes with no read; openclaw holds none to drop', async () => {
+  const h = stack();
+  await h.ask({ text: '第一个问题' });
+  h.advance(OWN_IDLE_MS - 1);
+  assert.deepEqual(expired(h), [], 'positive control: still held a moment before');
+  h.advance(1);
+  assert.deepEqual(expired(h).map((l) => l.count), [1], 'gone at the deadline, before any turn reads the ring');
+  await h.ask({ text: '之后的问题' });
+  assert.deepEqual(h.ownLines(1), []);
+  assert.deepEqual(h.historyOf(1).map((l) => l.sender), ['U1'], 'members\' lines stay');
+
+  const o = stack({ runtime: null });
+  await o.ask({ text: '第一个问题' });
+  o.advance(2 * OWN_IDLE_MS);
+  assert.deepEqual(expired(o), []);
+});
+
+test('own: a turn in between moves the deadline; the early timer sets itself again', async () => {
+  const h = stack();
+  await h.ask({ text: '第一个问题' });
+  const first = h.now();
+  h.later(100 * 60000);
+  h.replyText = null;
+  await h.ask({ text: '没有回复的问题' });
+  const touched = h.now();
+  h.advance(first + OWN_IDLE_MS - h.now());
+  assert.deepEqual(expired(h), [], 'the turn at 100 minutes kept her line');
+  h.advance(touched + OWN_IDLE_MS - h.now() - 1);
+  assert.deepEqual(expired(h), []);
+  h.advance(1);
+  assert.deepEqual(expired(h).map((l) => l.count), [1]);
+});

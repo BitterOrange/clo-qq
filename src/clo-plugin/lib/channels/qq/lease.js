@@ -44,3 +44,18 @@ export function liveBotLease({ store, now = Date.now, isAlive = pidAlive }) {
     return { pid: null };
   }
 }
+
+/**
+ * Drops the lease if the process named in it is the one given: for clo stop, once it has seen that process gone. A
+ * hard stop gives the bot no chance to drop it itself, and a lease left behind would block the next start for a while
+ * if Windows hands the PID to another process. A lease naming any other PID is left alone. Returns whether it went.
+ */
+export function releaseLeaseOfPid({ store, pid }) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  return store.tx(() => {
+    const held = store.getControl(CONSUMER_LEASE_KEY);
+    if (held === null || leasePid(held) !== pid) return false;
+    store.delControl(CONSUMER_LEASE_KEY);
+    return true;
+  });
+}

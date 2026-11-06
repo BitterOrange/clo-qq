@@ -65,7 +65,7 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
   }
 
   const prune = (g, at) => {
-    const idle = g.activeAt !== null && at - g.activeAt > OWN_IDLE_MS;
+    const idle = g.activeAt !== null && at - g.activeAt >= OWN_IDLE_MS;
     g.items = g.items.filter((i) => at - i.ts <= maxAgeMs && !(idle && i.own));
     if (idle) g.activeAt = null;
   };
@@ -168,6 +168,24 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
 
     lines(groupKey, excludeEventKey, count, chars, at) {
       return live(groupKey, excludeEventKey, at).filter((i) => !i.own).slice(-count).map((i) => ({ sender: i.sender, text: clamp(i.text, chars) }));
+    },
+
+    // When her own lines are next due to leave: the earliest idle deadline of a group that holds any, or null.
+    ownDeadline() {
+      let due = null;
+      for (const g of groups.values()) {
+        if (g.activeAt === null || !g.items.some((i) => i.own)) continue;
+        const at = g.activeAt + OWN_IDLE_MS;
+        if (due === null || at < due) due = at;
+      }
+      return due;
+    },
+
+    // How many of her own lines are held, in all groups.
+    ownHeld() {
+      let n = 0;
+      for (const g of groups.values()) n += g.items.filter((i) => i.own).length;
+      return n;
     },
 
     // Drops expired text even when a group has gone quiet. Returns the count of items still held.

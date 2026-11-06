@@ -358,3 +358,37 @@ test('one consumer: an untracked bot (fresh lease, live PID, no record) blocks a
   assert.equal(plain.code, 0, plain.err);
   assert.match(plain.out, /已停止 Gateway/);
 });
+
+test('clo stop drops the consumer lease of the bot it stopped, and leaves a lease naming another live process alone (control)', { timeout: 120000 }, async () => {
+  const s = await stack('lease-release');
+  const other = bystander();
+  await until(() => alive(other.pid), 'bystander');
+
+  // Control first: the lease names a different live process, so this stop must not touch it.
+  assert.equal((await s.run(['start'])).code, 0);
+  const first = await fakeBot(s.root);
+  withDb(s.root, (store) => {
+    store.setControl(CONSUMER_LEASE_KEY, `${other.pid}:other-run`, 'bot');
+    store.setControl('heartbeat_at', String(Date.now()), 'heartbeat');
+  });
+  const one = await s.run(['stop']);
+  assert.equal(one.code, 0, one.err);
+  await until(() => !alive(first.pid), 'the first bot to go', 10000);
+  withDb(s.root, (store) => {
+    assert.equal(store.getControl('heartbeat_at'), null, 'the stop did note the bot down');
+    assert.equal(store.getControl(CONSUMER_LEASE_KEY), `${other.pid}:other-run`, 'another process\'s lease is left alone');
+    store.delControl(CONSUMER_LEASE_KEY);
+  });
+  assert.equal(alive(other.pid), true, 'the other process is untouched');
+
+  // The bot it stops is killed hard and cannot drop its own lease: clo stop does.
+  rmSync(join(s.root, 'fake-bot.json'), { force: true });
+  assert.equal((await s.run(['start'])).code, 0);
+  const second = await fakeBot(s.root);
+  withDb(s.root, (store) => store.setControl(CONSUMER_LEASE_KEY, `${second.pid}:gen-1`, 'bot'));
+  const two = await s.run(['stop']);
+  assert.equal(two.code, 0, two.err);
+  assert.equal(alive(second.pid), false);
+  withDb(s.root, (store) => assert.equal(store.getControl(CONSUMER_LEASE_KEY), null, 'the stopped bot\'s lease is gone'));
+  assert.equal(alive(other.pid), true);
+});

@@ -117,7 +117,7 @@ OpenClaw Gateway（项目 PID 管理，环境按白名单构造，只绑 loopbac
 | `CLO_QQ_APP_ID`、`CLO_QQ_APP_SECRET` | QQ 机器人凭据 |
 | `CLO_CHAT_API_KEY` | 对话 Key，给这个项目单独建一个，并设每日限额。启动时映射成宿主要的 `OPENROUTER_API_KEY`。dry-run 不需要 |
 | `CLO_SEARCH_API_KEY` | 搜索 Key，启用搜索时才要。单独一个 Key，否则搜索费用无法核算 |
-| `CLO_TEST_API_KEY` | 探测 Key，只给付费探测用。单独建一个，每日限额不高于这次探测的上限。机器人不用它，`clo start` 也不把它交给 Gateway 或机器人进程 |
+| `CLO_TEST_API_KEY` | 探测 Key，只给 own 运行时的付费探测用（`q5-probe.ps1 -Runtime own`），openclaw 模式仍读 `CLO_CHAT_API_KEY`。单独建一个，每日限额不高于这次探测的上限。机器人不用它，`clo start` 也不把它交给 Gateway 或机器人进程 |
 
 **目前只适用于 OpenRouter。** 其他 OpenAI 兼容接口未来可能加，现在不能用，文档也不要写成能用。它们没有账户侧限额，也没有 Key 读数可以对账，只剩本地估算管钱，所以这算一项独立功能。
 

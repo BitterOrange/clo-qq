@@ -187,8 +187,29 @@ test('her own lines go after the idle time with no turn; a touch restarts it; me
   // The sweep applies it too, so a quiet group does not keep her text in memory.
   const d = buffer({ maxAgeMs: 24 * 3600000 });
   d.pushOwn('g', { text: '回复', ts: T0 });
-  assert.equal(d.sweep(T0 + OWN_IDLE_MS), 1);
-  assert.equal(d.sweep(T0 + OWN_IDLE_MS + 1), 0);
+  assert.equal(d.sweep(T0 + OWN_IDLE_MS - 1), 1, 'positive control: held until the idle time is up');
+  assert.equal(d.sweep(T0 + OWN_IDLE_MS), 0, 'gone at exactly the idle time');
+});
+
+test('ownDeadline: the earliest idle deadline of a group holding her lines, moved by a touch; none once they are gone', () => {
+  const c = buffer({ maxAgeMs: 24 * 3600000 });
+  assert.equal(c.ownDeadline(), null);
+  say(c, 'q1', '问题');
+  c.touch('g', T0);
+  assert.equal(c.ownDeadline(), null, "members' lines alone set no deadline");
+  c.pushOwn('g', { text: '回复', ts: T0 });
+  c.pushOwn('h', { text: '另一个群的回复', ts: T0 + 5000 });
+  assert.equal(c.ownDeadline(), T0 + OWN_IDLE_MS);
+  assert.equal(c.ownHeld(), 2);
+  c.touch('g', T0 + 10000);
+  assert.equal(c.ownDeadline(), T0 + 5000 + OWN_IDLE_MS, 'the touch moved g past h');
+  c.sweep(T0 + 5000 + OWN_IDLE_MS);
+  assert.equal(c.ownHeld(), 1, 'h went at its deadline, g stays');
+  assert.equal(c.ownDeadline(), T0 + 10000 + OWN_IDLE_MS);
+  c.sweep(T0 + 10000 + OWN_IDLE_MS);
+  assert.equal(c.ownHeld(), 0);
+  assert.equal(c.ownDeadline(), null);
+  assert.equal(c.history('g', 'x', T0 + 10000 + OWN_IDLE_MS).length, 1, "the member's line stays");
 });
 
 test('her own lines share the item cap, and clear() takes them with the rest', () => {

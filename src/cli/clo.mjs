@@ -11,7 +11,7 @@ import { apply as applyRender, assertApplicable as checkApplicable, assertValid,
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, runDoctor } from './doctor.mjs';
 import { assertRuntimeSwitchAllowed, assertTestModeWired, inspectGateway, inspectStartLock, parseEnvFile, recordRuntime, renamedEnvNames, renamedKeyHint, requireSecrets, RUNTIME_LABEL, startLockFile, startRuntime, stopGateway, withStartLock } from './lifecycle.mjs';
 import { collectStatus, formatStatus, RESIDUAL_EXIT, residualBehind } from './status.mjs';
-import { liveBotLease, STOP_REQUEST_KEY } from '../clo-plugin/lib/channels/qq/lease.js';
+import { liveBotLease, releaseLeaseOfPid, STOP_REQUEST_KEY } from '../clo-plugin/lib/channels/qq/lease.js';
 
 const USAGE = `用法：clo <命令>
   apply                              按 config.json 重新生成运行配置
@@ -801,16 +801,19 @@ function cmdStop(ctx) {
     ctx.out('没有 PID 文件，但 clo.db 里的连接租约读不出来，可能有可洛进程还连着这个 AppID。没有动任何进程，请稍后再试 clo stop。');
     return 1;
   }
-  const noteDown = () => {
+  // stoppedPid: a process this stop has just seen gone. A bot killed hard leaves its consumer lease behind, and a lease
+  // naming that PID goes with it. A lease naming any other process is left alone.
+  const noteDown = (stoppedPid = null) => {
     if (!existsSync(ctx.paths.db)) return;
     withStore(ctx, (store) => {
       store.setControl('connected', 'false', 'cli');
       // A heartbeat only says something while the Gateway runs. A leftover one would read as fresh for a while.
       store.delControl('heartbeat_at');
+      if (stoppedPid !== null) releaseLeaseOfPid({ store, pid: stoppedPid });
     });
   };
   if (r.stopped) {
-    noteDown();
+    noteDown(r.pid);
     ctx.out(`已停止 ${RUNTIME_LABEL[r.runtime]}（进程 ${r.pid}）。`);
     return 0;
   }

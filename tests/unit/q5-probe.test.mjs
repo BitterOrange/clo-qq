@@ -871,7 +871,9 @@ test('the CLI keeps the key out of stdout, stderr and results, and takes only th
   assert.equal(src.match(/parseEnvFile\(/g).length, 1, 'one read of .env');
   assert.ok(src.includes('parseEnvFile(paths.envFile, [keyName])'), 'one name, picked by runtime');
   assert.equal(PROBE_KEY_NAME.openclaw, 'CLO_CHAT_API_KEY');
-  assert.ok(!/process\.env\.(OPENROUTER_API_KEY|CLO_CHAT_API_KEY)\s*=/.test(src), 'never put into its own environment');
+  const ownEnvWrite = /process\.env\.(OPENROUTER_API_KEY|CLO_CHAT_API_KEY|CLO_TEST_API_KEY)\s*=/;
+  assert.ok(ownEnvWrite.test('process.env.CLO_TEST_API_KEY = key'), 'positive control: the pattern sees a write of the probe Key');
+  assert.ok(!ownEnvWrite.test(src), 'never put into its own environment');
 });
 
 test('an empty key is refused with no request', async () => {
@@ -1548,11 +1550,14 @@ test('own plan without --approve: the bounds, the gate and the guarantees are pr
   assert.ok(!r.stdout.includes(HOST_ADDED.runtimeContextPrefix), 'nothing the host would add');
   assert.ok(r.stdout.includes('Planned calls: 0 direct, then 2 turns'));
   assert.ok(r.stdout.includes('At most 2 model calls'));
-  assert.ok(r.stdout.includes(`own_turn_1: own turn runner, bound $0.0941 = (${ownPlan.turns[0].messageBytes} bytes of messages + 500) x $5.5/M + 1200 x $22/M`));
+  assert.ok(r.stdout.includes(`own_turn_1: own turn runner, bound $0.0942 (94144 micro-USD, rounded up) = (${ownPlan.turns[0].messageBytes} bytes of messages + 500) x $5.5/M + 1200 x $22/M`));
+  // The printed bound is rounded up, so passing it back as --max-usd is enough; the exact threshold is printed too.
+  assert.ok(r.stdout.includes('Worst case before the run: $0.0942 (94144 micro-USD, rounded up), turn 1 only. A --max-usd below 94144 micro-USD is refused.'));
+  assert.ok(!r.stdout.includes('$0.0941'), 'no figure rounded down below the bound');
   assert.ok(r.stdout.includes('recorded as skipped_cap and nothing is sent'));
   assert.ok(r.stdout.includes(`its user message is ${ownPlan.turn2BaseUserBytes} bytes plus the answer's bytes`), 'the threshold moves with the answer');
   // Turn 1's bound is conditional: it rests on three things only checked after turn 1 is charged.
-  assert.ok(r.stdout.includes('turn 1 stays within $0.0941 provided its completion tokens are at most max_tokens (1200), its prompt tokens are at most the message bytes plus 500, and the price charged is at or below the ceiling above'));
+  assert.ok(r.stdout.includes('turn 1 stays within $0.0942 provided its completion tokens are at most max_tokens (1200), its prompt tokens are at most the message bytes plus 500, and the price charged is at or below the ceiling above'));
   assert.ok(r.stdout.includes('each is checked after turn 1, so a breach stops the run only after turn 1 was charged'));
   assert.doesNotMatch(r.stdout, /provably|strictly/, 'no unconditional claim for turn 1');
   assert.ok(r.stdout.includes('provided the usage OpenRouter reports is accurate'));
@@ -1562,6 +1567,7 @@ test('own plan without --approve: the bounds, the gate and the guarantees are pr
   assert.ok(r.stdout.includes('Turn 2 is sent only if its bound B2 fits in what is left under --max-usd.'));
   assert.doesNotMatch(r.stdout, /Turn 2 can use at most what is left/, 'no claim that turn 2 is capped by what is left');
   assert.ok(r.stdout.includes('unconditional backstop'));
+  assert.ok(r.stdout.includes('It can only refuse a request that has not started'), 'the backstop says what it cannot stop');
   assert.ok(r.stdout.includes('No max_price is sent'));
   assert.ok(r.stdout.includes("an inference from OpenRouter's routing docs"));
   assert.ok(r.stdout.includes('No data in this mode: content_policy_block, decision_prompt and the ledger.decisionHoldInputTokens suggestion'));
@@ -1575,6 +1581,7 @@ test('own plan without --approve: the bounds, the gate and the guarantees are pr
   assert.ok(gw.stdout.includes(HOST_ADDED.runtimeContextPrefix));
   assert.ok(gw.stdout.includes(FIXED.baselineSystem));
   assert.doesNotMatch(gw.stdout, /runtime own/);
+  assert.ok(gw.stdout.includes('Worst case: $1.5484, at price ceilings'), 'the Gateway figure prints as before');
 });
 
 test('own run: both turns go through the runner, one request each, with the probe max_tokens, the cache marker and no ID', async () => {
@@ -1645,6 +1652,11 @@ test('the turn 2 gate: a cheap short turn 1 lets it through; a dear or a long-an
   assert.equal(measure.state, 'skipped_cap');
   assert.equal(measure.tokens, null);
   assert.equal(d.totals.totalMicros, (100 * 4 + 4400 * 5 + 1200 * 20));
+  // The summary says what the skip left unmeasured, though the run completed.
+  const dSummary = d.lines.find((x) => x.kind === 'summary');
+  assert.equal(dSummary.completed, true);
+  assert.deepEqual(dSummary.skipped, ['own_turn_2']);
+  assert.match(d.said, /Run finished\.\nNot measured in this run: own_turn_2 was skipped \(skipped_cap\), so the warm turn and its cache read did not happen\./);
 
   // The same cheap turn 1 with a long answer: turn 2's user message carries it, so its bound grows past the room left.
   const LONG = '春'.repeat(2000);
@@ -1664,6 +1676,8 @@ test('the turn 2 gate: a cheap short turn 1 lets it through; a dear or a long-an
   assert.equal(ownRequests(short).length, 2);
   assert.equal(ownLines(s)[1].state, 'completed');
   assert.ok(ownLines(s)[1].worstUsd < l2.worstUsd, 'the bound moved with the answer length');
+  assert.deepEqual(s.lines.find((x) => x.kind === 'summary').skipped, [], 'positive control: nothing skipped, nothing listed');
+  assert.doesNotMatch(s.said, /Not measured in this run/);
 });
 
 test('a turn with no usage counts at its own bound, not a production worst, and stops the run with no cap flag', async () => {
@@ -1883,6 +1897,51 @@ test('the test Key: its daily limit must not be above --max-usd either', async (
   const ok = await ownMock();
   ok.setKey({ limit: 0.1, limit_remaining: 0.1 });
   assert.equal((await ownRun(ok)).stopReason, null, 'positive control: a limit at the cap runs');
+});
+
+test('a Key with less left than --max-usd is noted on the own runtime, though turn 1 alone fits', async () => {
+  const low = await ownMock();
+  // Above turn 1's bound, below the cap the two turns may use.
+  low.setKey({ limit: 0.1, limit_remaining: 0.095 });
+  const r = await ownRun(low);
+  assert.match(r.said, /Note: the key has \$0\.095 left today, below --max-usd, which the two turns together may spend\./);
+  assert.doesNotMatch(r.said, /below the worst case/);
+  // Positive control: a Key with the whole cap left draws no note.
+  const full = await ownMock();
+  full.setKey({ limit: 0.1, limit_remaining: 0.1 });
+  assert.doesNotMatch((await ownRun(full)).said, /Note: the key has/);
+});
+
+test('a run-time turn-1 bound above the printed one sends nothing and stops with bound_above_plan', async () => {
+  const [t1, t2] = ownPlan.turns;
+  const tight = { ...ownPlan, turns: [{ ...t1, boundMicros: t1.boundMicros - 1 }, t2] };
+  const m = await ownMock();
+  const r = await ownRun(m, { plan: tight });
+  assert.equal(r.stopReason, 'bound_above_plan');
+  assert.equal(paid(m), 0, 'nothing was sent');
+  assert.match(r.said, new RegExp(`own_turn_1: its bound ${t1.boundMicros} micro-USD is above the planned ${t1.boundMicros - 1} micro-USD, so nothing was sent\.`));
+  assert.equal(r.totals.totalMicros, 0);
+  // Positive control: the plan as built, whose bound equals the run-time one, sends both turns.
+  const ok = await ownMock();
+  const fine = await ownRun(ok, { plan: { ...ownPlan, turns: [{ ...t1 }, t2] } });
+  assert.equal(fine.stopReason, null, fine.said);
+  assert.equal(ownRequests(ok).length, 2);
+});
+
+test('the CLI refusal is consistent with the printed own worst case: the printed figure is enough, one below it is not', async () => {
+  const m = await mock();
+  const root = cliRoot('ownedge');
+  const fsLog = join(root, 'fs.log');
+  const below = await cli(['--runtime', 'own', '--approve', '--max-usd', '0.0941'], { root, base: m.base, imports: [tracker(root)], extra: { CLO_FS_LOG: fsLog } });
+  assert.equal(below.status, 2);
+  assert.match(below.stderr, /Refused: the worst case \$0\.0942 is above --max-usd \$0\.0941\. Nothing was sent\./);
+  assert.equal(existsSync(fsLog), false, '.env not read');
+  // Positive control: the printed figure passes the cap check; with no CLO_TEST_API_KEY in this .env it then stops there.
+  const at = await cli(['--runtime', 'own', '--approve', '--max-usd', '0.0942'], { root, base: m.base });
+  assert.equal(at.status, 2);
+  assert.doesNotMatch(at.stderr, /above --max-usd/);
+  assert.match(at.stderr, /CLO_TEST_API_KEY is empty in \.env/);
+  assert.equal(paid(m) + m.other.length, 0);
 });
 
 test('the CLI: --runtime own reads CLO_TEST_API_KEY and nothing else, and refuses without it; openclaw still reads CLO_CHAT_API_KEY', async () => {

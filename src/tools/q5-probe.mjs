@@ -68,8 +68,9 @@ export const OWN_FIELD_PRICE_BOUND = Object.freeze({ inputPerM: 4.4, outputPerM:
 // OpenRouter documents the reasoning budget at effort low as max(min(max_tokens x 0.2, 128000), 1024) tokens, and
 // max_tokens must be strictly above that budget. So this is the lowest max_tokens a request with reasoning can carry.
 export const OPENROUTER_REASONING_FLOOR_TOKENS = 1024;
-// The own probe's max_tokens. Probe only: production keeps claudeModel.maxTokens. Higher than about 1300 does not fit
-// a $0.10 cap at the ceilings above.
+// The own probe's max_tokens. Probe only: production keeps claudeModel.maxTokens. At the ceilings above, the turn-1
+// bound alone passes a $0.10 cap above (100000 - (message bytes + overhead) x 5.5) / 22 tokens:
+// about 1466 with the current persona, and less if it grows.
 export const PROBE_MAX_TOKENS = 1200;
 if (!(PROBE_MAX_TOKENS > OPENROUTER_REASONING_FLOOR_TOKENS)) throw new Error('q5: the probe max_tokens must be above the reasoning floor');
 // Turn 2 of --runtime own is bounded from turn 1's reported prompt, since the system text is byte for byte the same:
@@ -143,6 +144,8 @@ function toolDefinition() {
 
 const utf8Bytes = (text) => Buffer.byteLength(text, 'utf8');
 const usdText = (micros) => `$${(micros / 1e6).toFixed(4)}`;
+// A bound the user may pass back as --max-usd: rounded up, so the printed figure is always enough for the run to start.
+const usdUpText = (micros) => `$${(Math.ceil(micros / 100) / 1e4).toFixed(4)}`;
 const round6 = (micros) => Number((micros / 1e6).toFixed(6));
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
@@ -279,7 +282,7 @@ export function printPlan(plan, say) {
   say(`Models: primary ${plan.primaryId} (selector opus-latest; if the catalog resolves it to anything else the run refuses), decision ${plan.decisionId}.`);
   say(`Planned calls: ${plan.calls.length} direct, then ${plan.turns.length} Gateway turns against mock QQ, each limited to ${plan.turnCallLimit} model requests. At most ${plan.maxModelCalls} model calls. No retries by this tool.`);
   say('The host retries failed calls and can compact by itself, up to 10 requests in one turn on mocks. So the guard counts each request as it is created, and the next one over the limit ends the Gateway before it leaves, which stops the run.');
-  say(`Worst case: ${usdText(plan.totalWorstMicros)}, at price ceilings of $${PRICE_CEILING.primary.inputPerM}/$${PRICE_CEILING.primary.outputPerM} per million (primary) and $${PRICE_CEILING.decision.inputPerM}/$${PRICE_CEILING.decision.outputPerM} (decision). Real prices come from the catalog and are expected to be lower. A turn's token sizes are assumed to stay within the context and output limits above.`);
+  say(`Worst case: ${usdUpText(plan.totalWorstMicros)}, at price ceilings of $${PRICE_CEILING.primary.inputPerM}/$${PRICE_CEILING.primary.outputPerM} per million (primary) and $${PRICE_CEILING.decision.inputPerM}/$${PRICE_CEILING.decision.outputPerM} (decision). Real prices come from the catalog and are expected to be lower. A turn's token sizes are assumed to stay within the context and output limits above.`);
   say("The hard ceiling is the Key's daily limit on OpenRouter, because only OpenRouter can refuse a request. It must not be above --max-usd, or the run refuses to start. It covers the whole UTC day, including other use of the Key.");
   for (const c of plan.calls) say(`  ${c.id}: ${c.role}, max_tokens ${c.body.max_tokens}, worst ${usdText(c.worstMicros)}. Sends: ${c.sends}.`);
   for (const t of plan.turns) say(`  ${t.id}: real Gateway, worst ${usdText(t.worstMicros)}. Sends: full system prompt, the turn text, and what the host adds (below).`);
@@ -347,11 +350,11 @@ function printOwnPlan(plan, say) {
   say(`Planned calls: ${plan.calls.length} direct, then ${plan.turns.length} turns through the project's own turn runner, each limited to ${plan.turnCallLimit} model request. At most ${plan.maxModelCalls} model calls. No retries: the runner's one connect retry is refused here.`);
   say('There is no Gateway, no QQ and no mock QQ in this mode. The runner and its OpenRouter client run in this process, with a fetch that reaches the model host only and refuses a second request in a turn before it leaves.');
   say(`Probe bounds, apart from production: max_tokens ${plan.probeMaxTokens} (claudeModel.maxTokens stays ${plan.primaryMaxTokens} in production; OpenRouter documents a reasoning budget of at least ${OPENROUTER_REASONING_FLOOR_TOKENS} tokens, and max_tokens must be above it), and price ceilings of $${ceil.inputPerM}/$${ceil.outputPerM} per million, the locked price plus 10%. A catalog price above them refuses the run.`);
-  say(`  ${t1.id}: own turn runner, bound ${usdText(t1.boundMicros)} = (${t1.messageBytes} bytes of messages + ${PROMPT_OVERHEAD_TOKENS}) x $${ceil.inputPerM}/M + ${plan.probeMaxTokens} x $${ceil.outputPerM}/M. Sends: full system prompt with one cache marker at its end, and the user message below. No tools.`);
+  say(`  ${t1.id}: own turn runner, bound ${usdUpText(t1.boundMicros)} (${t1.boundMicros} micro-USD, rounded up) = (${t1.messageBytes} bytes of messages + ${PROMPT_OVERHEAD_TOKENS}) x $${ceil.inputPerM}/M + ${plan.probeMaxTokens} x $${ceil.outputPerM}/M. Sends: full system prompt with one cache marker at its end, and the user message below. No tools.`);
   say(`  ${t2.id}: sent only if it fits. Right before it would be sent, its bound B2 is computed from its exact body: the smaller of its byte bound and (ceil(${TURN2_PROMPT_MARGIN} x P1) + the bytes of its user message + ${TURN2_SLACK_TOKENS}) x $${ceil.inputPerM}/M + ${plan.probeMaxTokens} x $${ceil.outputPerM}/M, where P1 is turn 1's reported prompt tokens, or its cached plus cache-write tokens if more. If the spend counted so far plus B2 would pass --max-usd, it is recorded as skipped_cap and nothing is sent.`);
   say(`Turn 2's threshold depends on how long turn 1's answer is: its user message is ${plan.turn2BaseUserBytes} bytes plus the answer's bytes after JSON escaping (about 3 per Chinese character), and each byte adds ${perByte} to B2. A long answer can make turn 2 skip.`);
-  say(`Worst case before the run: ${usdText(plan.totalWorstMicros)}, turn 1 only. Turn 2 is sent only if its bound B2 fits in what is left under --max-usd.`);
-  say(`What is guaranteed, and what it rests on: turn 1 stays within ${usdText(t1.boundMicros)} provided its completion tokens are at most max_tokens (${plan.probeMaxTokens}), its prompt tokens are at most the message bytes plus ${PROMPT_OVERHEAD_TOKENS}, and the price charged is at or below the ceiling above. None of these can be checked before the request leaves: each is checked after turn 1, so a breach stops the run only after turn 1 was charged. The total stays within --max-usd provided the usage OpenRouter reports is accurate, because B2 and the counted spend rest on it, and provided turn 2 costs no more than B2: its price charged at or below the ceiling above, its completion tokens at most max_tokens, and its prompt tokens within the estimate B2 used (the margin ${TURN2_PROMPT_MARGIN} and the slack ${TURN2_SLACK_TOKENS} are allowances, not derived from data). Turn 2 is the last turn, so the checks after it only report a breach; they prevent nothing. The Key's daily limit, which must not be above --max-usd, is the unconditional backstop.`);
+  say(`Worst case before the run: ${usdUpText(plan.totalWorstMicros)} (${plan.totalWorstMicros} micro-USD, rounded up), turn 1 only. A --max-usd below ${plan.totalWorstMicros} micro-USD is refused. Turn 2 is sent only if its bound B2 fits in what is left under --max-usd.`);
+  say(`What is guaranteed, and what it rests on: turn 1 stays within ${usdUpText(t1.boundMicros)} provided its completion tokens are at most max_tokens (${plan.probeMaxTokens}), its prompt tokens are at most the message bytes plus ${PROMPT_OVERHEAD_TOKENS}, and the price charged is at or below the ceiling above. None of these can be checked before the request leaves: each is checked after turn 1, so a breach stops the run only after turn 1 was charged. The total stays within --max-usd provided the usage OpenRouter reports is accurate, because B2 and the counted spend rest on it, and provided turn 2 costs no more than B2: its price charged at or below the ceiling above, its completion tokens at most max_tokens, and its prompt tokens within the estimate B2 used (the margin ${TURN2_PROMPT_MARGIN} and the slack ${TURN2_SLACK_TOKENS} are allowances, not derived from data). Turn 2 is the last turn, so the checks after it only report a breach; they prevent nothing. The Key's daily limit, which must not be above --max-usd, is the unconditional backstop. It can only refuse a request that has not started: whether OpenRouter cuts off one already running when the limit is reached is not known, so that last request may finish past it.`);
   say("No max_price is sent. That the base model ID is not routed to the fast endpoint is an inference from OpenRouter's routing docs, not something this tool can check. After turn 1 the run stops if the reported cost is above its tokens at the locked price plus 10% (price_above_bound), if completion tokens are above max_tokens, or if prompt tokens are above the message bytes plus the overhead.");
   say(`Each request is checked before it leaves, and refused if any of this differs: exactly the fields ${OWN_BODY_KEYS.join(', ')}; model ${plan.primaryId}; max_tokens ${plan.probeMaxTokens}; stream false; reasoning {effort:'low'}; usage {include:true}; provider {require_parameters:true} only; no tools; two messages; one cache_control in the whole body, {type:'ephemeral'} with no ttl, on the system part; the same system text in both turns; no more bytes than the bound was computed from.`);
   say('No data in this mode: content_policy_block, decision_prompt and the ledger.decisionHoldInputTokens suggestion. No direct or decision call is made, so those lines print no data. They are not measurements.');
@@ -410,7 +413,7 @@ const RESULT_KEYS = new Set([
   'qqRouteAttempt', 'firstDeltaMs', 'matchedMs', 'timedOut', 'polls', 'keyDeltaUsd', 'reportedUsd', 'countedAtWorstUsd', 'missingCount', 'totalUsd', 'capUsd',
   'name', 'current', 'suggested', 'basis', 'observed', 'tokens', 'catalogInputPerM', 'catalogOutputPerM', 'completed', 'testMode',
   'guardRequests', 'refusedRequests', 'hiddenCalls', 'turnCallLimit', 'tokenCostUsd', 'flags', 'unusedPriceFields',
-  'runtime', 'cacheMarker', 'sameSystem', 'collects', 'cacheHit', 'started',
+  'runtime', 'cacheMarker', 'sameSystem', 'collects', 'cacheHit', 'started', 'skipped',
 ]);
 const SAFE_STRING = /^[A-Za-z0-9_.:/~+-]{1,64}$/;
 const KEY_SHAPED = /^sk-|sk-or-/i;
@@ -1121,7 +1124,7 @@ export async function runOwnStage({ plan, catalog, baseUrl, key, tracker, record
       const bound = ownTurnBound(expected, prev?.usage ?? null);
       if (planned.boundMicros !== null && !(bound <= planned.boundMicros)) {
         stopReason = 'bound_above_plan';
-        say(`${planned.id}: its bound ${usdText(bound)} is above the planned ${usdText(planned.boundMicros)}, so nothing was sent.`);
+        say(`${planned.id}: its bound ${bound} micro-USD is above the planned ${planned.boundMicros} micro-USD, so nothing was sent.`);
         break;
       }
       if (!tracker.canAfford(bound)) {
@@ -1489,7 +1492,7 @@ export function checkCatalog(plan, catalog, cfg) {
 
 export async function runProbe({ plan, baseUrl, key, maxUsd, resultPath, say, fetchImpl = globalThis.fetch, gatewayStage = runGatewayStage, ownStage = runOwnStage, testMode = false, parentEnv = {}, tempParent = null, repoRoot, lagMs = DEFAULT_LAG_MINUTES * 60000, pollMs = POLL_MS, signal, keepRunRoot = false }) {
   const capMicros = Math.floor(maxUsd * 1e6);
-  if (plan.totalWorstMicros > capMicros) throw new Error(`refused: worst case ${usdText(plan.totalWorstMicros)} is above --max-usd`);
+  if (plan.totalWorstMicros > capMicros) throw new Error(`refused: worst case ${usdUpText(plan.totalWorstMicros)} is above --max-usd`);
   const http = restrictedFetch(baseUrl, fetchImpl);
   const tracker = createSpendTracker(capMicros);
   const record = resultWriter(resultPath, [key]);
@@ -1526,7 +1529,10 @@ export async function runProbe({ plan, baseUrl, key, maxUsd, resultPath, say, fe
       // This limit is the one thing that can stop the host mid-turn, so it has to be the ceiling the user agreed to.
       stopWith('key_limit_above_cap');
       say(`Refused: this key's daily limit $${key0.limit} is above --max-usd $${maxUsd}. Lower the limit on OpenRouter, or raise --max-usd to it. No paid call was made.`);
-    } else if (key0.remaining !== null && key0.remaining * 1e6 < plan.totalWorstMicros) {
+    } else if (own && key0.remaining !== null && key0.remaining * 1e6 < capMicros) {
+      // The own plan's worst case is turn 1 alone, but the two turns together may spend up to the cap.
+      say(`Note: the key has $${key0.remaining} left today, below --max-usd, which the two turns together may spend. If it runs out the provider refuses and the run stops.`);
+    } else if (!own && key0.remaining !== null && key0.remaining * 1e6 < plan.totalWorstMicros) {
       say(`Note: the key has $${key0.remaining} left today, below the worst case. If it runs out the provider refuses and the run stops.`);
     }
   }
@@ -1611,10 +1617,13 @@ export async function runProbe({ plan, baseUrl, key, maxUsd, resultPath, say, fe
   const totals = tracker.totals();
   const suggestions = suggestConfig({ plan, calls, turns, lag, prices });
   for (const s of suggestions) record({ kind: 'suggestion', ...s });
-  record({ kind: 'summary', completed: stopReason === null, stopReason, flags: keyCheck?.flags ?? [], reportedUsd: round6(totals.reportedMicros), countedAtWorstUsd: round6(totals.countedAtWorstMicros), missingCount: totals.missingCount, totalUsd: round6(totals.totalMicros), capUsd: round6(capMicros) });
+  // A planned skip is not a failure, but what it left unmeasured has to be in the summary too.
+  const skipped = own ? turns.filter((t) => t.state === 'skipped_cap').map((t) => t.id) : null;
+  record({ kind: 'summary', completed: stopReason === null, stopReason, flags: keyCheck?.flags ?? [], reportedUsd: round6(totals.reportedMicros), countedAtWorstUsd: round6(totals.countedAtWorstMicros), missingCount: totals.missingCount, totalUsd: round6(totals.totalMicros), capUsd: round6(capMicros), ...(skipped ? { skipped } : {}) });
 
   say('');
   say(stopReason ? `Run stopped: ${stopReason}.` : 'Run finished.');
+  if (skipped?.length) say(`Not measured in this run: ${skipped.join(', ')} was skipped (skipped_cap), so the warm turn and its cache read did not happen.`);
   say(`Total reported spend: ${usdText(totals.reportedMicros)}.`);
   say(`Counted at worst case because usage was missing: ${usdText(totals.countedAtWorstMicros)} (${totals.missingCount} calls or turns). Running total ${usdText(totals.totalMicros)}, cap ${usdText(capMicros)}.`);
   say('Suggested values. These are suggestions only: nothing was changed, and config.json was not read or written.');
@@ -1705,7 +1714,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
     return 2;
   }
   if (plan.totalWorstMicros > Math.floor(cli.maxUsd * 1e6)) {
-    fail(`Refused: the worst case ${usdText(plan.totalWorstMicros)} is above --max-usd $${cli.maxUsd}. Nothing was sent.`);
+    fail(`Refused: the worst case ${usdUpText(plan.totalWorstMicros)} is above --max-usd $${cli.maxUsd}. Nothing was sent.`);
     return 2;
   }
   const proxies = Object.keys(env).filter((k) => /proxy/i.test(k));
