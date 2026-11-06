@@ -1,7 +1,8 @@
 // Shared console helpers: context, config and lock files, and `apply`.
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { buildEffective, ConfigError, createEffectiveReader, liveConfigProblems, loadBusinessConfig, resolvePaths, validateBusinessConfig } from '../clo-plugin/lib/core/config.js';
+import { buildEffective, ConfigError, createEffectiveReader, liveConfigProblems, loadBusinessConfig, resolvePaths, runtimeOf, validateBusinessConfig } from '../clo-plugin/lib/core/config.js';
+import { createLedger } from '../clo-plugin/lib/core/ledger.js';
 import { createLog } from '../clo-plugin/lib/core/log.js';
 import { renderOpenclaw, renderWorkspace, writeAtomic } from '../clo-plugin/lib/core/render.js';
 import { openStore } from '../clo-plugin/lib/core/store.js';
@@ -96,11 +97,23 @@ export function usableLock(cfg, lock) {
   return lockMatches(cfg, lock) ? lock : null;
 }
 
+// Under the own runtime there is no host config: openclaw is null, and of the workspace only the system prompt is used.
 function renderWith(ctx, cfg, lock, env) {
   const effective = buildEffective(cfg, { paths: ctx.paths, modelsLock: lock, env, now: ctx.now });
-  const openclaw = renderOpenclaw(cfg, effective, ctx.paths, { testMode: isTestMode(env) });
+  const openclaw = runtimeOf(effective) === 'openclaw' ? renderOpenclaw(cfg, effective, ctx.paths, { testMode: isTestMode(env) }) : null;
   const workspace = renderWorkspace(ctx.paths.repoRoot, effective);
   return { effective, openclaw, workspace };
+}
+
+// The hold of one required reply, in micros, exactly as the ledger of the runtime this effective config names computes
+// it. Null when it cannot be priced yet. holdMicros reads only the effective config, so no database is opened for it.
+export function requiredHoldMicros(effective) {
+  try {
+    const ledger = createLedger({ store: { q: null }, getEffective: () => effective, fetch: null, getKey: () => null, setTimer: () => null, clearTimer: () => {}, runtime: runtimeOf(effective) });
+    return ledger.holdMicros('reply_required');
+  } catch {
+    return null;
+  }
 }
 
 // The whole output of a render, with nothing written.
@@ -172,12 +185,16 @@ export function apply(ctx, cfg, { allowLive = false } = {}) {
   for (const d of [paths.stateDir, paths.home, paths.workspace, paths.cloDir, paths.logsDir, paths.gatewayCwd, dirname(paths.pidFile), join(paths.runtime, 'temp')]) {
     mkdirSync(d, { recursive: true });
   }
-  for (const [name, text] of Object.entries(workspace.files)) writeIfChanged(join(paths.workspace, name), text);
+  // The own runtime reads only the system prompt and effective.json. The host's workspace files and openclaw.json are
+  // left as they are: a switch back to openclaw renders them again, and nothing that runs reads them meanwhile.
+  if (openclaw) {
+    for (const [name, text] of Object.entries(workspace.files)) writeIfChanged(join(paths.workspace, name), text);
+  }
   writeIfChanged(paths.systemPromptFile, workspace.systemPrompt);
   writeAtomic(paths.effectiveJson, `${JSON.stringify(effective, null, 2)}\n`);
   // Last, and only on a real change: the Gateway watches this file and reloads on a write.
-  const changed = writeIfChanged(paths.openclawJson, `${JSON.stringify(openclaw, null, 2)}\n`);
-  ctx.log('cli_apply', { state: effective.mode, count: changed ? 1 : 0 });
+  const changed = openclaw ? writeIfChanged(paths.openclawJson, `${JSON.stringify(openclaw, null, 2)}\n`) : false;
+  ctx.log('cli_apply', { state: effective.mode, count: changed ? 1 : 0, kind: runtimeOf(effective) });
   return { effective, openclaw, workspace, openclawChanged: changed };
 }
 

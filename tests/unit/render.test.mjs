@@ -148,3 +148,12 @@ test('writeAtomic replaces the file whole, makes directories, leaves no temp fil
   assert.deepEqual(readdirSync(dirname(file)), ['c.json']);
   assert.ok(existsSync(file));
 });
+
+test('the host render ignores the runtime field: an explicit openclaw gives the golden bytes, and nothing of it leaks in', () => {
+  const cfg = sample();
+  assert.equal(cfg.runtime, undefined, 'positive control: the golden comes from a config written before the switch');
+  assert.equal(pretty(render({ ...cfg, runtime: 'openclaw' })), golden('openclaw.real.json'));
+  const effective = buildEffective({ ...cfg, runtime: 'own' }, { paths: PATHS, modelsLock: LOCK, env: {}, now: () => 0 });
+  assert.equal(effective.runtime, 'own');
+  assert.equal(pretty(renderOpenclaw(cfg, effective, PATHS)), golden('openclaw.real.json'), 'the field does not reach the host config');
+});

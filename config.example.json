@@ -1,5 +1,6 @@
 {
   "mode": "dry-run",
+  "runtime": "openclaw",
   "gatewayPort": 18790,
   "budget": { "dailyUsd": 2.5, "interjectUsd": 0.75, "searchUsd": 2.10, "namedUsd": 2.25, "addressedUsd": 2.5, "keyDailyLimitUsd": 1.6 },
   "claudeModel": { "id": "opus-latest", "effort": "low", "maxTokens": 3000, "cacheRetention": "short", "contextTokens": 24000 },

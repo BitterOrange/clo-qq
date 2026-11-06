@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { estimateTokens } from '../../src/clo-plugin/lib/core/context.js';
 import { buildRequest } from '../../src/clo-plugin/lib/core/decision.js';
-import { createLedger, usdToMicros } from '../../src/clo-plugin/lib/core/ledger.js';
+import { createLedger, replyHoldMicros, usdToMicros } from '../../src/clo-plugin/lib/core/ledger.js';
 import { openStore } from '../../src/clo-plugin/lib/core/store.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'clo-ledger-'));
@@ -17,11 +17,11 @@ const PRIMARY = { id: 'anthropic/claude-opus-5.5', effort: 'low', maxTokens: 300
 const DECISION = { id: 'anthropic/claude-haiku-5.5', effort: 'none', maxTokens: 200, price: { inputPerM: 1, outputPerM: 5, cacheReadPerM: 0.1, cacheWritePerM: 1.25 } };
 const budget = (over = {}) => ({ dailyUsd: 2.5, interjectUsd: 0.75, searchUsd: 2.1, namedUsd: 2.25, addressedUsd: 2.5, residualMinUsd: 0.25, residualPct: 0.15, providerFailStreakPause: 3, ...over });
 
-function setup(over = {}) {
+function setup(over = {}, { runtime } = {}) {
   const clock = { t: T0 };
   const store = openStore(join(dir, `l${++n}.db`), { runGen: 'g', now: () => clock.t });
   const eff = { mode: 'live', budget: budget(over), models: { primary: PRIMARY, decision: DECISION }, openrouter: { baseUrl: 'http://mock' } };
-  const ledger = createLedger({ store, getEffective: () => eff, fetch: async () => { throw new Error('no network in this test'); }, getKey: () => 'FAKE', now: () => clock.t });
+  const ledger = createLedger({ store, getEffective: () => eff, fetch: async () => { throw new Error('no network in this test'); }, getKey: () => 'FAKE', now: () => clock.t, ...(runtime ? { runtime } : {}) });
   return { store, ledger, clock, eff };
 }
 const row = (store, id) => store.q('SELECT * FROM reservations WHERE id=?').get(id);
@@ -251,4 +251,29 @@ test('a 402 with no recognised limit source is a credits pause, not a step in th
   assert.equal(store.getControl('paid_paused'), null, 'a 403 still needs a recognised source');
   assert.equal(store.peekCounter('provider_fail_streak'), 1);
   store.close();
+});
+
+test('own runtime: a required turn holds one worst call, its input at the cache-write rate', () => {
+  const { ledger, store, eff } = setup({}, { runtime: 'own' });
+  eff.runtime = 'own';
+  // 24000 tokens in at max(5, 6.25) per million, 3000 out at 20.
+  assert.equal(ledger.holdMicros('reply_required'), 210000);
+  assert.equal(ledger.holdMicros('reply_optional'), 210000);
+  assert.equal(ledger.holdMicros('decision'), 10500 + 1000, 'decisions are unchanged');
+  eff.models = { ...eff.models, primary: { ...PRIMARY, price: { ...PRIMARY.price, cacheWritePerM: 4 } } };
+  assert.equal(ledger.holdMicros('reply_required'), 180000, 'a cache write cheaper than input is priced at input');
+  eff.runtime = 'openclaw';
+  assert.equal(ledger.holdMicros('reply_required'), 180000, 'the bot process keeps its own hold whatever the file says');
+  store.close();
+  const host = setup();
+  assert.equal(host.ledger.holdMicros('reply_required'), 360000, 'positive control: the host path still holds two');
+  host.eff.runtime = 'own';
+  assert.equal(host.ledger.holdMicros('reply_required'), 360000, 'a file saying own does not shrink the hold of the host process');
+  delete host.eff.runtime;
+  assert.equal(host.ledger.holdMicros('reply_required'), 360000, 'no runtime means openclaw');
+  assert.throws(() => createLedger({ store: host.store, getEffective: () => host.eff, getKey: () => null, runtime: 'other' }), /runtime must be/);
+  host.store.close();
+  assert.equal(replyHoldMicros('reply_required', PRIMARY, 'own'), 210000);
+  assert.throws(() => replyHoldMicros('reply_required', { ...PRIMARY, price: null }, 'own'), /not locked/);
+  assert.throws(() => replyHoldMicros('other', PRIMARY, 'own'), /unknown kind/);
 });

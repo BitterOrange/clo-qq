@@ -16,6 +16,12 @@ const DEFAULT_MAX_PART_CHARS = 1500;
 // Optional. Left out, the ledger's own defaults apply.
 const BUDGET_WAITS = ['decisionRetryMs', 'creditsRetryMs', 'unsettledClearMs', 'unsettledClearReads'];
 
+// Which process answers QQ: the OpenClaw Gateway, or the project's own runtime (src/bot/main.mjs).
+export const RUNTIMES = Object.freeze(['openclaw', 'own']);
+export const DEFAULT_RUNTIME = 'openclaw';
+// Every reader goes through this, so a config or effective file written before the switch means openclaw.
+export const runtimeOf = (cfgOrEffective) => cfgOrEffective?.runtime ?? DEFAULT_RUNTIME;
+
 const samePath = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 
 function realOrSelf(p) {
@@ -136,6 +142,7 @@ export function validateBusinessConfig(cfg, { env = process.env } = {}) {
   for (const p of secretKeys) err(p, 'secrets belong in .env, not in config');
 
   if (cfg.mode !== 'dry-run' && cfg.mode !== 'live') err('mode', 'must be dry-run or live');
+  if (cfg.runtime !== undefined && !RUNTIMES.includes(cfg.runtime)) err('runtime', 'must be openclaw or own');
   if (cfg.gatewayPort !== undefined && !(Number.isInteger(cfg.gatewayPort) && cfg.gatewayPort > 0 && cfg.gatewayPort < 65536)) err('gatewayPort', 'must be a port number');
 
   if (!tiersValid(cfg.budget)) err('budget', 'needs interjectUsd <= searchUsd <= namedUsd <= addressedUsd = dailyUsd, all non-negative');
@@ -289,6 +296,7 @@ export function buildEffective(cfg, { paths, modelsLock = null, env = process.en
     version: 1,
     generatedAt: new Date(now()).toISOString(),
     mode: cfg.mode,
+    runtime: runtimeOf(cfg),
     qq: {
       enabled: cfg.qq.enabled,
       appId: cfg.qq.appId ?? '',
@@ -387,7 +395,8 @@ export function buildEffective(cfg, { paths, modelsLock = null, env = process.en
 }
 
 function isEffectiveShape(e) {
-  return isObj(e) && e.version === 1 && (e.mode === 'dry-run' || e.mode === 'live')
+  // A runtime this build does not know reads as no config at all, so nothing runs on a guess.
+  return isObj(e) && e.version === 1 && (e.mode === 'dry-run' || e.mode === 'live') && (e.runtime === undefined || RUNTIMES.includes(e.runtime))
     && isObj(e.qq) && isObj(e.qq.groups) && isObj(e.budget) && isObj(e.limits) && isObj(e.window) && isObj(e.paths);
 }
 

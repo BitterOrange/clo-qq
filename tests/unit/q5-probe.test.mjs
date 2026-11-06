@@ -10,12 +10,12 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import {
-  assertIsolated, assertNoQqRoute, buildPlan, classifyError, createSpendTracker, extraPriceFields, FAKE_APP_ID, FAKE_QQ_SECRET, FIXED, HOST_ADDED, parseCli, priceAboveCeiling, PRICE_CEILING, PRIMARY_ID,
+  assertIsolated, assertNoQqRoute, assertOwnNoQqRoute, buildPlan, OWN_TURN_CALL_LIMIT, ownEffective, runOwnStage, classifyError, createSpendTracker, extraPriceFields, FAKE_APP_ID, FAKE_QQ_SECRET, FIXED, HOST_ADDED, parseCli, priceAboveCeiling, PRICE_CEILING, PRIMARY_ID,
   probeConfig, q5GatewayEnv, renderForProbe, reportedCostMicros, resolveEndpoint, restrictedFetch, runGatewayStage, runProbe, sanitizeResult, suggestConfig, sweepOldRunRoots, tokenCostMicros, TURN_CALL_LIMIT, watchStopSignals,
 } from '../../src/tools/q5-probe.mjs';
 import { GATEWAY_NODE_FLAGS, gatewayArgs } from '../../src/cli/lifecycle.mjs';
 import { resolvePaths } from '../../src/clo-plugin/lib/core/config.js';
-import { DECISION_INPUT_TOKENS } from '../../src/clo-plugin/lib/core/ledger.js';
+import { DECISION_INPUT_TOKENS, replyHoldMicros } from '../../src/clo-plugin/lib/core/ledger.js';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { decisionText, defaultCatalog, startMockOpenRouter } from '../harness/mock-openrouter.mjs';
 import { NODE, ROOT } from './_cli-helper.mjs';
@@ -182,7 +182,9 @@ test('no free text: an unknown argument stops it, and only fixed texts and perso
   for (const args of [['--text', '你好'], ['你好'], ['--max-usd', 'lots'], ['--lag-minutes', '99'], ['--approve', '--prompt', 'x']]) {
     assert.ok(parseCli(args).error, args.join(' '));
   }
-  assert.deepEqual(parseCli(['--approve', '--max-usd', '2.5', '--lag-minutes', '5']), { approve: true, maxUsd: 2.5, lagMinutes: 5 });
+  assert.deepEqual(parseCli(['--approve', '--max-usd', '2.5', '--lag-minutes', '5']), { approve: true, maxUsd: 2.5, lagMinutes: 5, runtime: 'openclaw' });
+  assert.equal(parseCli(['--runtime', 'own']).runtime, 'own');
+  for (const args of [['--runtime'], ['--runtime', 'OWN'], ['--runtime', 'gateway']]) assert.ok(parseCli(args).error, args.join(' '));
   const m = await mock();
   await run(m);
   const allowed = new Set([FIXED.baselineSystem, FIXED.question, JSON.stringify(FIXED.decisionInput), plan.texts.policy, plan.texts.decisionPrompt, plan.texts.systemPrompt]);
@@ -1431,4 +1433,307 @@ test('the wrapper is ASCII, uses the private Node, and carries output and exit c
   assert.match(`${noCap.stdout}${noCap.stderr}`, /--max-usd/);
   const low = ps(['-Approve', '-MaxUsd', '0.01'], root);
   assert.equal(low.status, 2);
+});
+
+// --- the own runtime: the project's turn runner in this process, against the mock OpenRouter ---
+
+const ownPlan = buildPlan(ROOT, { runtime: 'own' });
+const isOwnTurn = (rec) => Array.isArray(rec.body?.messages?.[0]?.content);
+const ownRequests = (m) => m.requests.filter(isOwnTurn);
+const FAKE_IDS = ['Q5FAKEGROUP', 'Q5FAKEOWNER', 'Q5FAKEMEMBER', 'Q5FAKEBOT', FAKE_APP_ID, '127.0.0.1'];
+// The own turns answer this unless a test says otherwise. The direct primary calls keep the mock's default.
+const ANSWER = '四个：春夏秋冬。';
+
+async function ownMock(turnStep) {
+  const m = await mock();
+  m.setScript((rec, n) => (isOwnTurn(rec)
+    ? (turnStep?.(rec, ownRequests(m).length) ?? { text: ANSWER, usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0.002 } })
+    : { text: '四个。', usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0.001 } }));
+  return m;
+}
+
+const ownRun = (m, over = {}) => run(m, { plan: ownPlan, gatewayStage: async () => { throw new Error('the Gateway stage must not run'); }, ...over });
+
+test('own plan: one request per turn at one worst-case call, no tool, and a user message with no ID in it', () => {
+  assert.equal(ownPlan.runtime, 'own');
+  assert.equal(OWN_TURN_CALL_LIMIT, 1);
+  assert.equal(ownPlan.turnCallLimit, 1);
+  assert.deepEqual(ownPlan.turns.map((t) => t.id), ['own_turn_1', 'own_turn_2']);
+  assert.equal(ownPlan.turns[0].worstMicros, ownPlan.turnCallWorstMicros);
+  assert.equal(ownPlan.maxModelCalls, ownPlan.calls.length + ownPlan.turns.length);
+  assert.equal(ownPlan.totalWorstMicros, ownPlan.calls.reduce((a, c) => a + c.worstMicros, 0) + ownPlan.turns.length * ownPlan.turnCallWorstMicros);
+  assert.equal(ownPlan.tool, undefined, 'the own runner sends no tools');
+  // Positive control: the Gateway plan holds two calls a turn and carries the tool schema.
+  assert.equal(plan.turns[0].worstMicros, 2 * ownPlan.turnCallWorstMicros);
+  assert.ok(plan.tool);
+  assert.equal(ownPlan.userPreview.length, 2);
+  const [first, second] = ownPlan.userPreview.map((u) => u.split('\n'));
+  assert.match(first[0], /^\[clo-turn class=at time=\S+ \S+ Asia\/Shanghai\]$/);
+  assert.equal(JSON.parse(first[1]).text, FIXED.turns[0]);
+  assert.deepEqual(JSON.parse(second[1]).recent.map((r) => r.who), ['U1', '可洛']);
+  for (const id of FAKE_IDS) assert.ok(!ownPlan.userPreview.join('\n').includes(id), id);
+  assert.throws(() => buildPlan(ROOT, { runtime: 'gateway' }), /unknown runtime/);
+});
+
+test('own plan without --approve: the runner layout is printed, with no request and no .env read', async () => {
+  const m = await mock();
+  const root = cliRoot('ownplan');
+  const fsLog = join(root, 'fs.log');
+  const r = await cli(['--runtime', 'own'], { root, base: m.base, imports: [tracker(root)], extra: { CLO_FS_LOG: fsLog } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /plan \(runtime own\)/);
+  assert.match(r.stdout, /no Gateway, no QQ and no mock QQ/);
+  for (const u of ownPlan.userPreview) assert.ok(r.stdout.includes(u), 'the exact user message');
+  assert.ok(!r.stdout.includes(HOST_ADDED.runtimeContextPrefix), 'nothing the host would add');
+  assert.ok(r.stdout.includes(`At most ${ownPlan.maxModelCalls} model calls`));
+  assert.equal(paid(m) + m.other.length, 0);
+  assert.equal(existsSync(fsLog), false);
+  // Positive control: the default is still the Gateway plan.
+  const gw = await cli([], { root });
+  assert.ok(gw.stdout.includes(HOST_ADDED.runtimeContextPrefix));
+  assert.doesNotMatch(gw.stdout, /runtime own/);
+});
+
+test('own run: both turns go through the runner, one request each, with the locked model, the cache marker and no ID', async () => {
+  const m = await ownMock();
+  const parent = tempDir('ownparent');
+  const r = await ownRun(m, { tempParent: parent });
+  assert.equal(r.stopReason, null, r.said);
+  assert.equal(m.requests.length, ownPlan.calls.length + 2, 'positive control: the direct calls ran too');
+  const reqs = ownRequests(m);
+  assert.equal(reqs.length, 2, 'exactly one request per turn');
+  for (const rec of reqs) {
+    const b = rec.body;
+    assert.equal(b.model, PRIMARY_ID);
+    assert.equal(b.stream, false);
+    assert.equal(b.max_tokens, ownPlan.primaryMaxTokens);
+    assert.deepEqual(b.reasoning, { effort: ownPlan.primaryEffort });
+    assert.deepEqual(b.provider, { require_parameters: true });
+    assert.deepEqual(b.usage, { include: true });
+    for (const k of ['tools', 'tool_choice', 'models', 'route', 'user', 'fallbacks']) assert.equal(b[k], undefined, k);
+    assert.equal(b.messages.length, 2);
+    assert.deepEqual(b.messages[0].content, [{ type: 'text', text: ownPlan.texts.systemPrompt, cache_control: { type: 'ephemeral' } }]);
+    assert.equal(typeof b.messages[1].content, 'string');
+    assert.equal(rec.headers['http-referer'], undefined, 'no attribution header');
+    assert.equal(rec.headers['x-title'], undefined);
+    assert.equal(rec.headers.authorization, `Bearer ${FAKE_KEY}`);
+    for (const id of FAKE_IDS) assert.ok(!b.messages[1].content.includes(id), id);
+  }
+  const [u1, u2] = reqs.map((rec) => JSON.parse(rec.body.messages[1].content.split('\n')[1]));
+  assert.equal(u1.text, FIXED.turns[0]);
+  assert.deepEqual(u1.recent, []);
+  assert.equal(u2.text, FIXED.turns[1]);
+  assert.deepEqual(u2.recent, [{ who: 'U1', text: FIXED.turns[0] }, { who: '可洛', text: ANSWER }], 'her answer to turn 1 is in turn 2 as her own line');
+  const lines = r.lines.filter((l) => l.kind === 'own_turn');
+  assert.deepEqual(lines.map((l) => [l.state, l.guardRequests, l.collects, l.cacheMarker, l.sameSystem]), [['completed', 1, 1, true, true], ['completed', 1, 1, true, true]]);
+  assert.deepEqual(lines.map((l) => l.countedUsd), [0.002, 0.002]);
+  assert.equal(r.totals.countedAtWorstMicros, 0);
+  assert.equal(r.lines.find((l) => l.kind === 'own_stage').state, 'finished');
+  assert.equal(r.lines.find((l) => l.kind === 'run_start').runtime, 'own');
+  assert.ok(!r.raw.includes(ANSWER), 'the answer is not in the results');
+  assert.ok(!r.raw.includes(FAKE_KEY));
+  assert.deepEqual(readdirSync(parent), [], 'no temp root: nothing on disk in this mode');
+  assert.equal(existsSync(join(tmpdir(), 'clo-q5-own-unused')), false);
+});
+
+test('a warm turn reads the cache marker: the cache read is recorded, and its absence is said', async () => {
+  const warm = await ownMock((rec, n) => ({
+    text: ANSWER,
+    usage: { prompt_tokens: 4400, completion_tokens: 20, cost: n === 1 ? 0.025 : 0.007, prompt_tokens_details: n === 1 ? { cache_write_tokens: 4350 } : { cached_tokens: 4350, cache_write_tokens: 0 } },
+  }));
+  const r = await ownRun(warm);
+  assert.equal(r.stopReason, null, r.said);
+  const [t1, t2] = r.lines.filter((l) => l.kind === 'own_turn');
+  assert.equal(t1.cacheWriteTokens, 4350);
+  assert.equal(t1.cacheHit, null, 'the first turn is cold by definition');
+  assert.equal(t2.cachedTokens, 4350);
+  assert.equal(t2.cacheReadTokens, 4350, 'the runner read it from the same response');
+  assert.equal(t2.cacheHit, true);
+  const measure = r.lines.find((l) => l.name === 'warm_cache_read');
+  assert.equal(measure.tokens, 4350);
+  assert.equal(measure.cacheHit, true);
+  assert.match(r.said, /Warm turn read 4350 tokens from the cache/);
+  // The marker was on both requests, so a miss is the route's doing, not ours.
+  const [b1, b2] = ownRequests(warm).map((q) => q.body.messages[0].content);
+  assert.deepEqual(b1, b2, 'the cached prefix is byte for byte the same');
+
+  const cold = await ownMock();
+  const c = await ownRun(cold);
+  assert.equal(c.stopReason, null);
+  assert.equal(c.lines.find((l) => l.name === 'warm_cache_read').cacheHit, false);
+  assert.match(c.said, /warm turn read nothing from the cache/);
+  assert.doesNotMatch(c.said, /Warm turn read \d+/);
+});
+
+test('a turn with no usage counts at its worst and stops the run; a zero cost is not free either', async () => {
+  for (const usage of [null, { prompt_tokens: 4000, completion_tokens: 20, cost: 0 }]) {
+    const m = await ownMock(() => ({ text: ANSWER, usage }));
+    const r = await ownRun(m);
+    assert.equal(r.stopReason, 'usage_missing', JSON.stringify(usage));
+    assert.equal(ownRequests(m).length, 1, 'the second turn did not run');
+    const line = r.lines.find((l) => l.kind === 'own_turn');
+    assert.equal(line.usageMissing, true);
+    assert.equal(line.countedUsd, ownPlan.turnCallWorstMicros / 1e6);
+    assert.equal(r.totals.countedAtWorstMicros, ownPlan.turnCallWorstMicros);
+    assert.equal(r.totals.missingCount, 1);
+  }
+});
+
+test('the cap is checked before each turn: a first turn that overspent leaves no room for the second', async () => {
+  // Turn 1 reports everything the plan left for it and the turn after, and a little more.
+  const over = (ownPlan.totalWorstMicros - ownPlan.turnCallWorstMicros) / 1e6 + 0.01;
+  const m = await ownMock(() => ({ text: ANSWER, usage: { prompt_tokens: 100, completion_tokens: 20, cost: over } }));
+  const r = await ownRun(m);
+  assert.equal(r.stopReason, 'cap');
+  assert.equal(ownRequests(m).length, 1);
+  assert.equal(r.lines.find((l) => l.kind === 'own_stage').state, 'cap');
+  // Positive control: a first turn that stays within its worst leaves room, and the second turn runs.
+  const fine = await ownMock(() => ({ text: ANSWER, usage: { prompt_tokens: 100, completion_tokens: 20, cost: ownPlan.turnCallWorstMicros / 1e6 } }));
+  const ok = await ownRun(fine);
+  assert.equal(ok.stopReason, null);
+  assert.equal(ownRequests(fine).length, 2);
+});
+
+test('no retry on the own runtime: a 500, a 429 or a refused connection is one request, counted at worst', async () => {
+  for (const [status, stop] of [[500, 'own_turn_failed'], [429, 'rate_limit']]) {
+    const m = await ownMock(() => ({ error: { status, body: { error: { code: status, message: `no ${CANARY}` } } } }));
+    const r = await ownRun(m);
+    assert.equal(r.stopReason, stop, String(status));
+    assert.equal(ownRequests(m).length, 1, `${status}: one request, no retry`);
+    const line = r.lines.find((l) => l.kind === 'own_turn');
+    assert.equal(line.httpStatus, status);
+    assert.equal(line.state, 'failed');
+    assert.equal(line.collects, 0, 'nothing reached the exit');
+    assert.equal(line.usageMissing, true);
+    assert.ok(!r.raw.includes(CANARY));
+  }
+  // A connection refused before anything left is the one case the runner would retry. The probe refuses even that.
+  const m = await ownMock();
+  let attempts = 0;
+  const fetchImpl = (url, init) => {
+    if (url.endsWith('/chat/completions') && Array.isArray(JSON.parse(init.body).messages[0].content)) {
+      attempts += 1;
+      const err = new TypeError('fetch failed');
+      err.cause = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED', syscall: 'connect' });
+      return Promise.reject(err);
+    }
+    return fetch(url, init);
+  };
+  const r = await ownRun(m, { fetchImpl });
+  assert.equal(attempts, 1, 'the connect retry was refused');
+  assert.equal(r.stopReason, 'own_turn_not_started');
+  assert.equal(r.lines.find((l) => l.kind === 'own_turn').countedUsd, ownPlan.turnCallWorstMicros / 1e6, 'an attempt is counted at worst all the same');
+});
+
+test('a second request in one turn is refused before it leaves, and stops the run', async () => {
+  const twice = (n) => (args) => runOwnStage({
+    ...args,
+    factories: {
+      createTurnRunner: ({ client, getEffective }) => async (turn, { signal } = {}) => {
+        let r;
+        for (let i = 0; i < n; i += 1) {
+          r = await client.post({ model: getEffective().models.primary.id, messages: [{ role: 'system', content: [{ type: 'text', text: ownPlan.texts.systemPrompt, cache_control: { type: 'ephemeral' } }] }, { role: 'user', content: 'x' }] }, { signal });
+        }
+        return { started: true, hostError: r.kind !== 'ok', aborted: false, usage: r.usage };
+      },
+    },
+  });
+  const m = await ownMock();
+  const r = await ownRun(m, { ownStage: twice(2) });
+  assert.equal(r.stopReason, 'turn_call_limit');
+  assert.equal(ownRequests(m).length, 1, 'the second request never arrived');
+  const line = r.lines.find((l) => l.kind === 'own_turn');
+  assert.equal(line.guardRequests, 1);
+  assert.equal(line.refusedRequests, 1);
+  // Positive control: the same stand-in runner with one request passes the limit.
+  const ok = await ownMock();
+  const single = await ownRun(ok, { ownStage: twice(1) });
+  assert.equal(single.lines.find((l) => l.kind === 'own_turn').refusedRequests, 0);
+  assert.equal(ownRequests(ok).length, 1);
+  assert.notEqual(single.stopReason, 'turn_call_limit');
+});
+
+test('no QQ route on the own runtime: a QQ address is refused before it leaves, and the config is fake and loopback', async () => {
+  const seen = [];
+  const fetchImpl = (url, init) => {
+    seen.push(url);
+    return fetch(url, init);
+  };
+  const qqClient = (args) => runOwnStage({
+    ...args,
+    factories: {
+      createOpenRouterClient: ({ fetch: f }) => ({
+        post: async () => {
+          await f('https://api.sgroup.qq.com/v2/groups/x/messages', { method: 'POST', body: '{}' }).catch(() => {});
+          return { kind: 'not_sent', reason: 'connect', status: null, message: null, finishReason: null, usage: null, info: null };
+        },
+      }),
+    },
+  });
+  const m = await ownMock();
+  const r = await ownRun(m, { fetchImpl, ownStage: qqClient });
+  assert.equal(r.stopReason, 'qq_route_attempt');
+  const stage = r.lines.find((l) => l.kind === 'own_stage');
+  assert.equal(stage.qqRouteAttempt, true);
+  assert.deepEqual(stage.refusedHosts, ['api.sgroup.qq.com']);
+  assert.ok(seen.length > 0, 'positive control: the probe did fetch');
+  assert.ok(!seen.some((u) => u.includes('qq.com')), 'nothing went to QQ');
+
+  const eff = ownEffective({ repoRoot: ROOT, catalog: defaultCatalog(), baseUrl: 'https://openrouter.ai/api/v1', testMode: false });
+  assert.equal(eff.runtime, 'own');
+  assert.equal(eff.openrouter.baseUrl, 'https://openrouter.ai/api/v1');
+  assert.equal(eff.models.primary.id, PRIMARY_ID);
+  assertOwnNoQqRoute(eff);
+  for (const edit of [(e) => { e.qq.apiBaseUrl = 'https://api.sgroup.qq.com'; }, (e) => { e.qq.tokenBaseUrl = ''; }, (e) => { e.qq.appId = 'REALAPPID'; }, (e) => { e.runtime = 'openclaw'; }]) {
+    const e = structuredClone(eff);
+    edit(e);
+    assert.throws(() => assertOwnNoQqRoute(e), /loopback|identity|own runtime/);
+  }
+  assert.throws(() => ownEffective({ repoRoot: ROOT, catalog: defaultCatalog(), baseUrl: 'http://127.0.0.1:6/api/v1', testMode: false }), /another model host/, 'outside test mode only the real host');
+  assert.doesNotMatch(readFileSync(PROBE, 'utf8').split('// --- the own runtime stage')[1].split('// --- Key lag ---')[0], /mock-qq|qqbot|@tencent-connect|connectAccount|runConnection/, 'the own stage has no QQ client of any kind');
+});
+
+test('an interrupt during an own turn aborts the request: nothing reaches the exit, it counts at worst, and no turn follows', async () => {
+  const ac = new AbortController();
+  const m = await ownMock(() => {
+    setTimeout(() => ac.abort(), 20);
+    return { text: ANSWER, delayMs: 2000, usage: { cost: 0.002 } };
+  });
+  const started = Date.now();
+  const r = await ownRun(m, { signal: ac.signal });
+  assert.ok(Date.now() - started < 1900, 'the runner gave up at the abort, not at the answer');
+  assert.equal(r.stopReason, 'interrupted');
+  assert.equal(ownRequests(m).length, 1);
+  const line = r.lines.find((l) => l.kind === 'own_turn');
+  assert.equal(line.state, 'aborted');
+  assert.equal(line.collects, 0);
+  assert.equal(line.contentChars, 0);
+  assert.equal(line.countedUsd, ownPlan.turnCallWorstMicros / 1e6, 'an aborted request may still be billed');
+  assert.equal(r.lag, null);
+});
+
+test('a system prompt without the policy markers sends nothing on the own runtime', async () => {
+  const broken = { ...ownPlan, texts: { ...ownPlan.texts, systemPrompt: ownPlan.texts.systemPrompt.replace(/<!-- clo-policy:1 -->/g, '') } };
+  assert.notEqual(broken.texts.systemPrompt, ownPlan.texts.systemPrompt, 'the marker was there to remove');
+  const m = await ownMock();
+  const r = await ownRun(m, { plan: broken, maxUsd: roomy(ownPlan) });
+  assert.equal(r.stopReason, 'own_turn_not_started');
+  assert.equal(ownRequests(m).length, 0);
+  const line = r.lines.find((l) => l.kind === 'own_turn');
+  assert.equal(line.reason, 'policy_sentinel');
+  assert.equal(line.countedUsd, 0, 'nothing left, so nothing is counted');
+});
+
+test('own suggestions: the required hold is the own ledger figure, and a cut-off own turn asks for more tokens', () => {
+  const prices = { inputPerM: 5, outputPerM: 20, cacheReadPerM: 0.5, cacheWritePerM: 6.25 };
+  const pick = (list, name) => list.find((s) => s.name === name);
+  const own = pick(suggestConfig({ plan: ownPlan, calls: [], turns: [], lag: null, prices }), 'ledger.replyRequiredHoldUsd').suggested;
+  const expected = replyHoldMicros('reply_required', { price: prices, contextTokens: ownPlan.contextTokens, maxTokens: ownPlan.primaryMaxTokens }, 'own');
+  assert.equal(own, expected / 1e6);
+  assert.equal(own, (24000 * 6.25 + 3000 * 20) / 1e6);
+  assert.equal(pick(suggestConfig({ plan, calls: [], turns: [], lag: null, prices }), 'ledger.replyRequiredHoldUsd').suggested, 2 * own, 'positive control: the Gateway hold is twice that');
+  const cut = suggestConfig({ plan: ownPlan, calls: [], turns: [{ outputTokens: 2990, finishReason: 'length', hostNotices: 0 }], lag: null, prices: null });
+  assert.equal(pick(cut, 'claudeModel.maxTokens').basis, 'truncated_in_probe');
+  const whole = suggestConfig({ plan: ownPlan, calls: [], turns: [{ outputTokens: 100, finishReason: 'stop', hostNotices: 0 }], lag: null, prices: null });
+  assert.equal(pick(whole, 'claudeModel.maxTokens').basis, 'keep_small_sample');
 });

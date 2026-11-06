@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buildEffective, ConfigError, createEffectiveReader, liveConfigProblems, livePreconditions, loadBusinessConfig, OPENROUTER_BASE_URL, resolvePaths, validateBusinessConfig } from '../../src/clo-plugin/lib/core/config.js';
+import { buildEffective, ConfigError, createEffectiveReader, liveConfigProblems, livePreconditions, loadBusinessConfig, OPENROUTER_BASE_URL, resolvePaths, runtimeOf, validateBusinessConfig } from '../../src/clo-plugin/lib/core/config.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
@@ -381,4 +381,43 @@ test('nothing passes on empty facts, and the shipped defaults are not ready for 
   for (const code of ['d3', 'q0', 'identity', 'key_readable', 'reconciled', 'heartbeat', 'policy', 'doctor']) {
     assert.ok(r.failed.includes(code), code);
   }
+});
+
+test('runtime: openclaw or own, and left out it means openclaw', () => {
+  for (const bad of ['gateway', 'OWN', '', 1, null, true]) {
+    const c = sample();
+    c.runtime = bad;
+    assert.ok(errorsOf(c).includes('runtime'), String(bad));
+  }
+  for (const good of ['openclaw', 'own', undefined]) {
+    const c = sample();
+    if (good === undefined) delete c.runtime;
+    else c.runtime = good;
+    assert.deepEqual(errorsOf(c), [], String(good));
+  }
+  const plain = sample();
+  delete plain.runtime;
+  assert.equal(buildEffective(plain, { paths, env: {} }).runtime, 'openclaw');
+  assert.equal(buildEffective({ ...sample(), runtime: 'own' }, { paths, env: {} }).runtime, 'own');
+  assert.equal(buildEffective({ ...sample(), runtime: 'openclaw' }, { paths, env: {} }).runtime, 'openclaw');
+  assert.equal(runtimeOf(null), 'openclaw');
+  assert.equal(runtimeOf({}), 'openclaw');
+  assert.equal(runtimeOf({ runtime: 'own' }), 'own');
+});
+
+test('the effective reader refuses a runtime it does not know, and keeps a file written before the switch', () => {
+  const sub = join(dir, 'eff-runtime');
+  mkdirSync(sub, { recursive: true });
+  const file = join(sub, 'effective.json');
+  const read = createEffectiveReader(file);
+  const eff = buildEffective({ ...sample(), runtime: 'own' }, { paths, env: {} });
+  writeFileSync(file, JSON.stringify(eff));
+  assert.equal(read().runtime, 'own', 'positive control');
+  const { runtime: _r, ...before } = eff;
+  writeFileSync(file, JSON.stringify(before));
+  utimesSync(file, new Date(), new Date(Date.now() + 5000));
+  assert.equal(runtimeOf(read()), 'openclaw', 'an older file still reads, as openclaw');
+  writeFileSync(file, JSON.stringify({ ...eff, runtime: 'something-else' }));
+  utimesSync(file, new Date(), new Date(Date.now() + 10000));
+  assert.equal(read(), null, 'an unknown runtime is no config');
 });

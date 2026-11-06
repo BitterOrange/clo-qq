@@ -18,7 +18,8 @@ const SEND_SURFACE = new Set(['api', 'apiClient', 'messageApi', 'mediaApi', 'chu
 const OWN_SEND_NAMES = new Set(['sendFixed', 'sendDays']);
 const NET_MODULES = new Set(['ws', 'undici', 'node:http', 'node:https', 'node:net', 'node:tls', 'http', 'https', 'net', 'tls']);
 // models.js only takes an injected fetch for the console's catalog read. The Gateway never calls it.
-const FETCH_FILES = new Set(['decision.js', 'ledger.js', 'models.js']);
+// openrouterChat.js is the one OpenRouter client; decision.js and turn.js reach the model through it.
+const FETCH_FILES = new Set(['decision.js', 'ledger.js', 'models.js', 'openrouterChat.js']);
 const BOT_ALLOWED_IN_EXIT = new Set(['api', 'appId']);
 const EXIT_API_ALLOWED = new Set(['post', 'get']);
 

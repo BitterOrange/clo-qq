@@ -1,6 +1,6 @@
 // Modes, live preconditions, pause, status, targets, budget, policy. In-process, temp root, fake provider.
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { processInfo } from '../../src/cli/lifecycle.mjs';
@@ -802,4 +802,93 @@ test('ack terminal also clears a close that only reached the file', async () => 
   assert.match(res.out, /4915/);
   assert.equal(existsSync(file), false);
   assert.match((await clo(r, ['ack', 'terminal'])).out, /没有锁存/);
+});
+
+// --- The own runtime ---
+
+test('config.example.json names the runtime, and it is the host until the switch', () => {
+  assert.equal(JSON.parse(readFileSync(join(ROOT, 'config.example.json'), 'utf8')).runtime, 'openclaw');
+});
+
+// A stand-in for src/bot/main.mjs, which doctor needs to see under own.
+function ownEntryEnv(r) {
+  const entry = join(r, 'bot', 'main.mjs');
+  mkdirSync(dirname(entry), { recursive: true });
+  writeFileSync(entry, '// stand-in entry\n');
+  return { CLO_TEST_BOT_ENTRY: entry };
+}
+
+// The reply_required hold the ledger of that runtime computes from this site's effective config, in dollars.
+const holdOf = (r, provider, runtime) => withDb(r, (store) => createLedger({ store, getEffective: () => effectiveOf(r), fetch: provider.fetch, getKey: () => null, log: () => {}, now: Date.now, runtime }).holdMicros('reply_required')) / 1e6;
+const setBudget = (r, x) => editConfig(r, (c) => { Object.assign(c.budget, { dailyUsd: x, addressedUsd: x, namedUsd: x, searchUsd: x, interjectUsd: x }); });
+
+test('mode live works under own with no host config at all, and refuses when its doctor checks fail', async () => {
+  const r = root('ownlive');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  editConfig(r, (c) => { c.runtime = 'own'; });
+  const openclawJson = join(r, '.runtime', 'state', 'openclaw.json');
+  rmSync(openclawJson, { force: true });
+  const env = ownEntryEnv(r);
+
+  const noEntry = await clo(r, ['mode', 'live'], { fetch: provider.fetch, env: { CLO_TEST_BOT_ENTRY: join(r, 'nowhere.mjs') } });
+  assert.equal(noEntry.code, 1, 'positive control: the own doctor checks are part of the gate');
+  assert.deepEqual(failedCodes(noEntry.out), ['doctor']);
+  assert.equal(effectiveOf(r).mode, 'dry-run');
+
+  const res = await clo(r, ['mode', 'live'], { fetch: provider.fetch, env });
+  assert.equal(res.code, 0, `${res.out}${res.err}`);
+  assert.equal(effectiveOf(r).mode, 'live');
+  assert.equal(effectiveOf(r).runtime, 'own');
+  assert.equal(existsSync(openclawJson), false, 'no host config was needed or written');
+  const status = await clo(r, ['status', '--json']);
+  assert.equal(JSON.parse(status.out).runtime, 'own');
+  assert.match((await clo(r, ['status'])).out, /可洛进程：没有 PID 文件/);
+});
+
+test('under own the daily budget is checked against the hold the ledger computes for that runtime', async () => {
+  const r = root('owndailyhold');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  editConfig(r, (c) => { c.runtime = 'own'; });
+  const env = ownEntryEnv(r);
+  assert.equal((await clo(r, ['apply'], { env })).code, 0);
+  assert.equal(effectiveOf(r).runtime, 'own', 'positive control: the hold below is the own one');
+  const holdUsd = holdOf(r, provider, 'own');
+  assert.ok(holdUsd < holdOf(r, provider, 'openclaw'), 'positive control: the own hold is the smaller one, so the exact pass below tells them apart');
+  const setDaily = (x) => setBudget(r, x);
+
+  setDaily(holdUsd - 0.000001);
+  const low = await clo(r, ['mode', 'live'], { fetch: provider.fetch, env });
+  assert.equal(low.code, 1);
+  assert.deepEqual(failedCodes(low.out), ['daily_hold']);
+  assert.match(low.out, /永远得不到额度/, 'positive control for the text checked below');
+  // At the own hold, which is below the host one: the bot reserves only this much, so clo mode live lets it through.
+  setDaily(holdUsd);
+  const exact = await clo(r, ['mode', 'live'], { fetch: provider.fetch, env });
+  assert.equal(exact.code, 0, `${exact.out}${exact.err}`);
+  assert.doesNotMatch(exact.out, /永远得不到额度/, 'no budget warning at the own hold');
+});
+
+test('a daily budget between the own and the host hold is refused under openclaw and passes under own (control)', async () => {
+  const r = root('betweenholds');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  assert.equal(effectiveOf(r).runtime ?? 'openclaw', 'openclaw');
+  const own = holdOf(r, provider, 'own');
+  const host = holdOf(r, provider, 'openclaw');
+  const between = Math.round(((own + host) / 2) * 1e6) / 1e6;
+  assert.ok(between > own && between < host);
+  setBudget(r, between);
+  const hostRun = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(hostRun.code, 1);
+  assert.deepEqual(failedCodes(hostRun.out), ['daily_hold']);
+  assert.equal(effectiveOf(r).mode, 'dry-run');
+
+  editConfig(r, (c) => { c.runtime = 'own'; });
+  const env = ownEntryEnv(r);
+  assert.equal((await clo(r, ['apply'], { env })).code, 0);
+  const ownRun = await clo(r, ['mode', 'live'], { fetch: provider.fetch, env });
+  assert.equal(ownRun.code, 0, `${ownRun.out}${ownRun.err}`);
+  assert.equal(effectiveOf(r).mode, 'live');
 });

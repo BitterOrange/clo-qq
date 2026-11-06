@@ -1,7 +1,7 @@
 // The context buffer's caps: a very long line must not empty a turn's history, and caps can change while it runs.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createContextBuffer, estimateTokens } from '../../src/clo-plugin/lib/core/context.js';
+import { createContextBuffer, estimateTokens, OWN_IDLE_MS, OWN_LABEL } from '../../src/clo-plugin/lib/core/context.js';
 import { atEvent, decisionOf, inbound, makeHarness, MEMBER, MEMBER2, T0 } from '../fixtures/inbound.mjs';
 
 const buffer = (over = {}) => createContextBuffer({ maxItems: 40, maxAgeMs: 3600000, maxTokens: 3000, ...over });
@@ -156,4 +156,47 @@ test('configure: a missing cap stays as it is, and pseudonyms and names survive'
   say(c, 'e3', '消息3');
   assert.equal(c.history('g', null, T0).length, 2, 'the item cap was not touched');
   assert.equal(c.pseudonym('g', 's1'), 'U1');
+});
+
+// ---- her own lines (own runtime) ----
+
+test('her own line reads as hers in history, never in the decision lines, and never takes a member label', () => {
+  const c = buffer();
+  say(c, 'q1', '第一个问题', { displayName: '小明', arrival: 1 });
+  c.pushOwn('g', { text: '她的回复', ts: T0 });
+  const plain = c.history('g', 'current', T0);
+  assert.deepEqual(plain, [
+    { sender: 'U1', body: '第一个问题', timestamp: T0 },
+    { sender: OWN_LABEL, body: '她的回复', timestamp: T0, own: true },
+  ]);
+  const named = c.history('g', 'current', T0, { showNames: true });
+  assert.equal(named[1].sender, OWN_LABEL, 'no display-name suffix on her line');
+  assert.match(named[0].sender, /小明/, 'positive control: the member keeps theirs');
+  assert.deepEqual(c.lines('g', 'current', 15, 200, T0).map((l) => l.sender), ['U1']);
+  assert.deepEqual(c.ownEarlier('g', 's1', 99), ['q1']);
+});
+
+test('her own lines go after the idle time with no turn; a touch restarts it; members stay', () => {
+  const c = buffer({ maxAgeMs: 24 * 3600000 });
+  say(c, 'q1', '问题');
+  c.pushOwn('g', { text: '回复', ts: T0 });
+  c.touch('g', T0 + OWN_IDLE_MS);
+  assert.equal(c.history('g', 'x', T0 + OWN_IDLE_MS + 1000).length, 2, 'the touch kept her line');
+  assert.equal(c.history('g', 'x', T0 + 2 * OWN_IDLE_MS + 1000).length, 1);
+  assert.equal(c.history('g', 'x', T0 + 2 * OWN_IDLE_MS + 1000)[0].sender, 'U1');
+  // The sweep applies it too, so a quiet group does not keep her text in memory.
+  const d = buffer({ maxAgeMs: 24 * 3600000 });
+  d.pushOwn('g', { text: '回复', ts: T0 });
+  assert.equal(d.sweep(T0 + OWN_IDLE_MS), 1);
+  assert.equal(d.sweep(T0 + OWN_IDLE_MS + 1), 0);
+});
+
+test('her own lines share the item cap, and clear() takes them with the rest', () => {
+  const c = buffer({ maxItems: 2 });
+  say(c, 'q1', '问题一');
+  c.pushOwn('g', { text: '回复一', ts: T0 });
+  say(c, 'q2', '问题二');
+  assert.deepEqual(c.history('g', 'x', T0).map((l) => l.body), ['回复一', '问题二']);
+  c.clear('g');
+  assert.deepEqual(c.history('g', 'x', T0), []);
 });

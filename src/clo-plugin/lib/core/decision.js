@@ -2,6 +2,7 @@
 // Provider text is never returned or logged, only the whitelisted status fields.
 import { readFileSync } from 'node:fs';
 import { mappedCopy, normalizeCopy } from './contentPolicy.js';
+import { createOpenRouterClient } from './openrouterChat.js';
 
 const SKIP_CLASSES = ['political', 'violence_crime', 'sexual', 'harm_person', 'none'];
 const FIELDS = ['action', 'crisis', 'need_search', 'skip_class'];
@@ -26,7 +27,6 @@ const RESPONSE_FORMAT = {
 };
 
 const clamp = (text, chars) => [...String(text ?? '')].slice(0, chars).join('');
-const scalar = (v) => (typeof v === 'string' || typeof v === 'number' ? v : undefined);
 
 export function parseAnswer(content) {
   let v;
@@ -143,7 +143,7 @@ export function buildRequest(eff, prompt, { trigger, lines, current }) {
 }
 
 const costMicros = (usage) => {
-  const cost = usage?.cost;
+  const cost = usage?.costUsd;
   return typeof cost === 'number' && Number.isFinite(cost) && cost > 0 ? Math.ceil(cost * 1e6) : null;
 };
 
@@ -152,7 +152,10 @@ const skip = (invalid, over = {}) => ({
   actualMicros: null, model: null, httpStatus: null, limitSource: null, ...over,
 });
 
-export function createDecider({ fetch = globalThis.fetch, getKey, getEffective, promptFile, log = () => {}, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
+// client: the shared OpenRouter client. Without one, a client of its own is made over fetch.
+export function createDecider({ client = null, fetch = globalThis.fetch, getKey, getEffective, promptFile, log = () => {}, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
+  // No deadline is passed to it, so it never retries: a decision is cheap to skip.
+  const chat = client ?? createOpenRouterClient({ fetch, getKey, getBaseUrl: () => getEffective()?.openrouter?.baseUrl, log, now });
   let prompt = null;
   const loadPrompt = (eff) => {
     prompt ??= readFileSync(promptFile ?? eff.paths.decisionPromptFile, 'utf8');
@@ -188,44 +191,29 @@ export function createDecider({ fetch = globalThis.fetch, getKey, getEffective, 
       return out;
     };
 
-    let res;
-    let raw;
+    let r;
     try {
-      res = await fetch(`${eff.openrouter.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildRequest(eff, text, { trigger, lines, current })),
-        signal: ctl.signal,
-      });
-      raw = await res.text();
-    } catch {
-      return finish(skip(ctl.signal.aborted ? 'timeout' : 'http', { model, httpStatus: res?.status ?? null }));
+      r = await chat.post(buildRequest(eff, text, { trigger, lines, current }), { signal: ctl.signal });
     } finally {
       clearTimer(timer);
       signal?.removeEventListener('abort', onOuterAbort);
     }
 
-    let body = null;
-    try {
-      body = JSON.parse(raw);
-    } catch {
-      body = null;
-    }
-    const base = { model, actualMicros: costMicros(body?.usage), httpStatus: res.status };
-    const error = body?.error;
-    if (!res.ok || error) {
-      const meta = error?.metadata;
+    if (r.kind === 'aborted') return finish(skip('timeout', { model, httpStatus: r.status }));
+    if (r.kind === 'not_sent' || r.reason === 'network') return finish(skip('http', { model, httpStatus: r.status }));
+    const base = { model, actualMicros: costMicros(r.usage), httpStatus: r.status };
+    if (r.reason === 'http' || r.reason === 'moderation' || r.reason === 'provider_error') {
       return finish(skip('http', {
         ...base,
-        limitSource: typeof meta?.limit_source === 'string' ? meta.limit_source : null,
-        providerInfo: { status: res.status, error_type: scalar(error?.type), provider_name: scalar(meta?.provider_name), provider_code: scalar(error?.code) },
+        limitSource: r.info.limitSource,
+        providerInfo: { status: r.info.status, error_type: r.info.error_type, provider_name: r.info.provider_name, provider_code: r.info.provider_code },
       }));
     }
-    if (body === null) return finish(skip('json', base));
-    const choice = body.choices?.[0];
-    if (choice?.finish_reason === 'length') return finish(skip('length', base));
-    const content = choice?.message?.content;
-    if (typeof content !== 'string' || !content.trim() || choice?.message?.refusal) return finish(skip('empty', base));
+    if (r.reason === 'bad_body') return finish(skip('json', base));
+    // Read from the message itself, as before the shared client: a decision has its own rules for what is usable.
+    if (r.finishReason === 'length') return finish(skip('length', base));
+    const content = r.message?.content;
+    if (typeof content !== 'string' || !content.trim() || r.message?.refusal) return finish(skip('empty', base));
     const answer = parseAnswer(content.trim());
     if (!answer) return finish(skip('json', base));
     return finish({ ...answer, invalid: null, paid: true, limitSource: null, ...base });

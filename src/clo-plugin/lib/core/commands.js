@@ -41,6 +41,13 @@ export function commandRoute(cmd) {
   return 'unknown';
 }
 
+// The own runtime's rule: only a listed owner command is a command. Any other slash text is ordinary text, so a
+// member's words that happen to start with a slash go through the normal triggers.
+export function listedCommand(text) {
+  const cmd = parseCommand(text);
+  return cmd && commandRoute(cmd) !== 'unknown' ? cmd : null;
+}
+
 export function runLocalCommand(cmd, { store, groupKey, effective }) {
   const [verb, arg] = cmd.name === 'status' ? ['status'] : cmd.args.map((a) => a.toLowerCase());
   if (verb === 'status') {

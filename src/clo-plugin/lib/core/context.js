@@ -1,7 +1,13 @@
 // Recent messages for one process, in memory only. Bounded by item count, age and an estimated token
 // cap. A restart loses it. Senders leave this module as pseudonyms. A sanitized display name rests on the line it came
 // with, so it expires and clears with that line, and leaves only through history() when the caller asks for names.
+// With the own runtime her sent replies share the ring, as own lines under her name. They carry no member key or event
+// key, never reach the decision lines, and leave after OWN_IDLE_MS with no turn in the group.
 import { speakerLabel } from './displayName.js';
+
+export const OWN_LABEL = '可洛';
+// The host reset an idle group session after this long. Her own lines follow the same rule.
+export const OWN_IDLE_MS = 120 * 60000;
 
 // Not a tokenizer: a deliberately high guess of 2 tokens per non-ASCII character, 1 per 3 ASCII.
 export function estimateTokens(text) {
@@ -42,7 +48,7 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
   function groupOf(key) {
     let g = groups.get(key);
     if (!g) {
-      g = { items: [], names: new Map() };
+      g = { items: [], names: new Map(), activeAt: null };
       groups.set(key, g);
     }
     return g;
@@ -59,7 +65,9 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
   }
 
   const prune = (g, at) => {
-    g.items = g.items.filter((i) => at - i.ts <= maxAgeMs);
+    const idle = g.activeAt !== null && at - g.activeAt > OWN_IDLE_MS;
+    g.items = g.items.filter((i) => at - i.ts <= maxAgeMs && !(idle && i.own));
+    if (idle) g.activeAt = null;
   };
 
   const live = (groupKey, excludeEventKey, at) => {
@@ -75,7 +83,7 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
     const g = groups.get(groupKey);
     if (g) {
       prune(g, at);
-      for (const i of g.items) names.set(i.sender, i.displayName ?? null);
+      for (const i of g.items) if (!i.own) names.set(i.sender, i.displayName ?? null);
     }
     if (current) names.set(current.sender, current.displayName ?? null);
     return names;
@@ -103,6 +111,19 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
       return sender;
     },
 
+    // Her own reply as it was posted. Only the gate calls this, and only for text the exit reports as out.
+    pushOwn(groupKey, { text, ts }) {
+      const g = groupOf(groupKey);
+      g.items.push({ sender: OWN_LABEL, text, ts, eventKey: null, displayName: null, arrival: null, own: true });
+      g.activeAt = ts;
+      if (g.items.length > maxItems) g.items.splice(0, g.items.length - maxItems);
+    },
+
+    // A turn ran in this group: the idle clock for her own lines starts again.
+    touch(groupKey, at) {
+      groupOf(groupKey).activeAt = at;
+    },
+
     // Newest entries that fit the token cap, oldest first, in the host's HistoryEntry shape.
     // Labels count toward the cap only when they are sent, so without names this is what it always was.
     // A line over the per-line cap is shortened here and only here, so one long message cannot empty the history. The
@@ -115,11 +136,11 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
       const out = [];
       let tokens = 0;
       for (const i of live(groupKey, excludeEventKey, at).filter((l) => !hide?.has(l.eventKey)).reverse()) {
-        const sender = names ? speakerLabel(i.sender, names.get(i.sender)) : i.sender;
+        const sender = names && !i.own ? speakerLabel(i.sender, names.get(i.sender)) : i.sender;
         const body = fitTokens(i.text, lineCap);
         tokens += estimateTokens(body) + (names ? estimateTokens(sender) : 0);
         if (tokens > maxTokens) break;
-        out.push({ sender, body, timestamp: i.ts });
+        out.push(i.own ? { sender, body, timestamp: i.ts, own: true } : { sender, body, timestamp: i.ts });
       }
       return out.reverse();
     },
@@ -129,7 +150,7 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
       const g = groups.get(groupKey);
       const sender = g?.names.get(senderKey);
       if (!sender) return [];
-      return g.items.filter((i) => i.sender === sender && i.arrival < arrival).map((i) => i.eventKey);
+      return g.items.filter((i) => !i.own && i.sender === sender && i.arrival < arrival).map((i) => i.eventKey);
     },
 
     forgetNames(groupKey) {
@@ -146,7 +167,7 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
     },
 
     lines(groupKey, excludeEventKey, count, chars, at) {
-      return live(groupKey, excludeEventKey, at).slice(-count).map((i) => ({ sender: i.sender, text: clamp(i.text, chars) }));
+      return live(groupKey, excludeEventKey, at).filter((i) => !i.own).slice(-count).map((i) => ({ sender: i.sender, text: clamp(i.text, chars) }));
     },
 
     // Drops expired text even when a group has gone quiet. Returns the count of items still held.
@@ -161,7 +182,9 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
 
     clear(groupKey) {
       const g = groups.get(groupKey);
-      if (g) g.items = [];
+      if (!g) return;
+      g.items = [];
+      g.activeAt = null;
     },
   };
 }

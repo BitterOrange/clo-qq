@@ -10,6 +10,9 @@
 // - No paid call is retried by this tool. The host retries and compacts by itself, so a Gateway turn has a live limit
 //   of TURN_CALL_LIMIT requests: the guard ends the Gateway when the next one is created, before it leaves.
 // - The Gateway gets a temp root, a fake QQ identity and a loopback mock QQ. A preloaded guard refuses other hosts.
+// - With --runtime own there is no Gateway and no QQ at all: the project's own turn runner and OpenRouter client run in
+//   this process, with a fetch that reaches the model host only, one request per turn, and no retry. The reply goes to
+//   an exit stand-in that only keeps it in memory, for the second turn's recent lines.
 // - The key is read at run time, and goes only to fetch headers and the Gateway's environment.
 // - Results hold numbers and classifications only. The temp root holds the host's session store, with the prompts and
 //   the model's answers, until it is removed at the end, or by the next start after a hard kill.
@@ -17,7 +20,7 @@
 //
 // Run through scripts\q5-probe.ps1, which uses the private Node.
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -32,9 +35,11 @@ import { POLICY_V1_SHA256 } from '../clo-plugin/lib/core/contentPolicy.js';
 import { estimateTokens } from '../clo-plugin/lib/core/context.js';
 import { buildRequest as buildDecisionRequest } from '../clo-plugin/lib/core/decision.js';
 import { hmacKey } from '../clo-plugin/lib/core/ids.js';
-import { DECISION_INPUT_TOKENS } from '../clo-plugin/lib/core/ledger.js';
+import { DECISION_INPUT_TOKENS, replyHoldMicros } from '../clo-plugin/lib/core/ledger.js';
 import { fetchCatalog, lockFromCatalog, priceFor, resolveSelector, validateModels } from '../clo-plugin/lib/core/models.js';
+import { createOpenRouterClient } from '../clo-plugin/lib/core/openrouterChat.js';
 import { renderOpenclaw, renderWorkspace, writeAtomic } from '../clo-plugin/lib/core/render.js';
+import { createTurnRunner, OWN_LABEL, renderUserMessage } from '../clo-plugin/lib/core/turn.js';
 
 const SELF = fileURLToPath(import.meta.url);
 const GUARD = fileURLToPath(new URL('./q5-net-guard.mjs', import.meta.url));
@@ -52,6 +57,15 @@ export const PRICE_CEILING = Object.freeze({
 const PROMPT_OVERHEAD_TOKENS = 500;
 // Requests one Gateway turn may make. The host made up to 10 on mocks when calls failed, so this is enforced, not assumed.
 export const TURN_CALL_LIMIT = 2;
+// The own runner makes one request per turn. Its one connect retry is refused here, so one is the limit.
+export const OWN_TURN_CALL_LIMIT = 1;
+export const RUNTIMES = Object.freeze(['openclaw', 'own']);
+// The same passive window the gate gives a turn.
+const OWN_PASSIVE_WINDOW_MS = 285000;
+// A stand-in label, as the gate would give one. No ID reaches the model.
+const OWN_MEMBER_LABEL = 'U1';
+// A fixed moment, so the printed preview of the user message is exact apart from its time field.
+const PREVIEW_AT = Date.UTC(2026, 0, 1, 4, 0);
 // The Key can round. A difference this small is not a finding.
 const KEY_TOLERANCE_MICROS = 1000;
 // A hard kill leaves a temp root behind. With no recorded process, this old means no run is still starting in it.
@@ -143,7 +157,8 @@ function worstCall(body, ceiling) {
   return Math.ceil(tokens * ceiling.inputPerM + body.max_tokens * ceiling.outputPerM);
 }
 
-export function buildPlan(repoRoot) {
+export function buildPlan(repoRoot, { runtime = 'openclaw' } = {}) {
+  if (!RUNTIMES.includes(runtime)) throw new Error('q5: unknown runtime');
   const example = JSON.parse(readFileSync(join(repoRoot, 'config.example.json'), 'utf8').replace(/^\uFEFF/, ''));
   if (example.claudeModel.id !== 'opus-latest') throw new Error('config.example.json no longer selects opus-latest');
   if (example.decisionModel.id !== DECISION_ID) throw new Error('config.example.json names another decision model');
@@ -155,6 +170,7 @@ export function buildPlan(repoRoot) {
   // Same assembly the Gateway uses, including the policy hash and sentinel checks.
   const { systemPrompt } = renderWorkspace(repoRoot, { contentPolicy: { policyFile: join(repoRoot, 'persona', 'CONTENT-POLICY.md'), sha256: POLICY_V1_SHA256, version: example.contentPolicy.version } });
   const plan = {
+    runtime,
     primaryId: PRIMARY_ID,
     decisionId: DECISION_ID,
     primaryEffort: example.claudeModel.effort,
@@ -173,17 +189,24 @@ export function buildPlan(repoRoot) {
     { id: 'primary_full_prompt', role: 'primary', body: primaryBody(systemPrompt, plan), sends: 'full system prompt (policy, AGENTS, SOUL, IDENTITY) + question' },
   ];
   plan.calls = direct.map((c) => ({ ...c, worstMicros: worstCall(c.body, PRICE_CEILING[c.role]) }));
-  // The guard enforces the limit, so this figure is a bound and not a guess at what the host will do.
-  plan.turnCallLimit = TURN_CALL_LIMIT;
+  // The guard (Gateway) or the stage's own fetch (own) enforces the limit, so this figure is a bound and not a guess.
+  // The input ceiling is at least every input-side catalog rate, the cache write included (priceAboveCeiling).
+  const own = runtime === 'own';
+  plan.turnCallLimit = own ? OWN_TURN_CALL_LIMIT : TURN_CALL_LIMIT;
   plan.turnCallWorstMicros = Math.ceil(plan.contextTokens * PRICE_CEILING.primary.inputPerM + plan.primaryMaxTokens * PRICE_CEILING.primary.outputPerM);
-  plan.turns = FIXED.turns.map((text, i) => ({ id: `gateway_turn_${i + 1}`, text, worstMicros: TURN_CALL_LIMIT * plan.turnCallWorstMicros }));
+  plan.turns = FIXED.turns.map((text, i) => ({ id: `${own ? 'own' : 'gateway'}_turn_${i + 1}`, text, worstMicros: plan.turnCallLimit * plan.turnCallWorstMicros }));
   plan.totalWorstMicros = plan.calls.reduce((a, c) => a + c.worstMicros, 0) + plan.turns.reduce((a, t) => a + t.worstMicros, 0);
-  plan.maxModelCalls = plan.calls.length + plan.turns.length * TURN_CALL_LIMIT;
-  plan.tool = toolDefinition();
+  plan.maxModelCalls = plan.calls.length + plan.turns.length * plan.turnCallLimit;
+  if (own) plan.userPreview = ownUserPreview();
+  else plan.tool = toolDefinition();
   return plan;
 }
 
 export function printPlan(plan, say) {
+  if (plan.runtime === 'own') {
+    printOwnPlan(plan, say);
+    return;
+  }
   say('Q5 paid probe: plan');
   say(`Models: primary ${plan.primaryId} (selector opus-latest; if the catalog resolves it to anything else the run refuses), decision ${plan.decisionId}.`);
   say(`Planned calls: ${plan.calls.length} direct, then ${plan.turns.length} Gateway turns against mock QQ, each limited to ${plan.turnCallLimit} model requests. At most ${plan.maxModelCalls} model calls. No retries by this tool.`);
@@ -205,6 +228,69 @@ export function printPlan(plan, say) {
   say("  turn 2 also resends turn 1's question and the model's answer to it.");
   say(`  the tool schema: ${JSON.stringify(plan.tool)}`);
   say(`  only if the host compacts: its English prompt beginning "${HOST_ADDED.compactionPrefix}", with the earlier turns. Not expected at these sizes, and it would use up the turn's limit.`);
+  say('');
+  say('Exact persona files sent:');
+  for (const f of plan.files) {
+    say(`--- persona/${f.name} (${f.bytes} bytes, sha256 ${f.sha256}) ---`);
+    say(f.text.trimEnd());
+  }
+  say('--- end of files ---');
+}
+
+// The own runner's user message for each planned turn. The second one carries the first turn and her answer to it as
+// recent lines; the answer is not known before the run, so the printed preview has a placeholder for it.
+const ANSWER_PLACEHOLDER = "<the model's answer to turn 1>";
+
+export function ownTurn(text, { at, history = [], i = 0 }) {
+  return {
+    turnId: randomUUID(),
+    eventKey: `q5_own_turn_${i + 1}`,
+    groupKey: 'q5',
+    cls: 'at',
+    tier: 'addressed',
+    required: true,
+    senderLabel: OWN_MEMBER_LABEL,
+    speakerLabel: null,
+    text,
+    history,
+    receivedAt: at,
+    msgTs: at,
+    deadlineAt: at + OWN_PASSIVE_WINDOW_MS,
+  };
+}
+
+export const ownHistory = (prevText, prevAt, answer) => [
+  { sender: OWN_MEMBER_LABEL, body: prevText, timestamp: prevAt },
+  { sender: OWN_LABEL, body: answer, timestamp: prevAt, own: true },
+];
+
+function ownUserPreview() {
+  return FIXED.turns.map((text, i) => renderUserMessage(ownTurn(text, {
+    at: PREVIEW_AT, i, history: i === 0 ? [] : ownHistory(FIXED.turns[i - 1], PREVIEW_AT, ANSWER_PLACEHOLDER),
+  })));
+}
+
+function printOwnPlan(plan, say) {
+  say('Q5 paid probe: plan (runtime own)');
+  say(`Models: primary ${plan.primaryId} (selector opus-latest; if the catalog resolves it to anything else the run refuses), decision ${plan.decisionId}.`);
+  say(`Planned calls: ${plan.calls.length} direct, then ${plan.turns.length} turns through the project's own turn runner, each limited to ${plan.turnCallLimit} model request. At most ${plan.maxModelCalls} model calls. No retries: the runner's one connect retry is refused here.`);
+  say('There is no Gateway, no QQ and no mock QQ in this mode. The runner and its OpenRouter client run in this process, with a fetch that reaches the model host only and refuses a second request in a turn before it leaves.');
+  say(`Worst case: ${usdText(plan.totalWorstMicros)}, at price ceilings of $${PRICE_CEILING.primary.inputPerM}/$${PRICE_CEILING.primary.outputPerM} per million (primary) and $${PRICE_CEILING.decision.inputPerM}/$${PRICE_CEILING.decision.outputPerM} (decision). Real prices come from the catalog and are expected to be lower. The runner refuses an input above the context limit before sending it.`);
+  say("The hard ceiling is the Key's daily limit on OpenRouter, because only OpenRouter can refuse a request. It must not be above --max-usd, or the run refuses to start. It covers the whole UTC day, including other use of the Key.");
+  for (const c of plan.calls) say(`  ${c.id}: ${c.role}, max_tokens ${c.body.max_tokens}, worst ${usdText(c.worstMicros)}. Sends: ${c.sends}.`);
+  for (const t of plan.turns) say(`  ${t.id}: own turn runner, worst ${usdText(t.worstMicros)}. Sends: full system prompt with one cache marker at its end, and the user message below. No tools.`);
+  say('The second turn comes right after the first, so it should read the system prompt from the cache. The cache read is recorded.');
+  say('After the calls it reads the Key endpoint (no charge) until the spend shows up, to measure the reconciliation lag.');
+  say('');
+  say('Exact fixed texts:');
+  say(`  baseline system: ${FIXED.baselineSystem}`);
+  say(`  question: ${FIXED.question}`);
+  say(`  decision input: ${JSON.stringify(FIXED.decisionInput)}`);
+  FIXED.turns.forEach((t, i) => say(`  turn ${i + 1}: ${t}`));
+  say('');
+  say('The user message of each turn, as the runner builds it. Only the time differs in the run:');
+  plan.userPreview.forEach((u, i) => say(`  turn ${i + 1}:\n${u}`));
+  say(`  In turn 2, ${ANSWER_PLACEHOLDER} stands for the model's real answer to turn 1, which is kept in memory only.`);
   say('');
   say('Exact persona files sent:');
   for (const f of plan.files) {
@@ -250,6 +336,7 @@ const RESULT_KEYS = new Set([
   'qqRouteAttempt', 'firstDeltaMs', 'matchedMs', 'timedOut', 'polls', 'keyDeltaUsd', 'reportedUsd', 'countedAtWorstUsd', 'missingCount', 'totalUsd', 'capUsd',
   'name', 'current', 'suggested', 'basis', 'observed', 'tokens', 'catalogInputPerM', 'catalogOutputPerM', 'completed', 'testMode',
   'guardRequests', 'refusedRequests', 'hiddenCalls', 'turnCallLimit', 'tokenCostUsd', 'flags', 'unusedPriceFields',
+  'runtime', 'cacheMarker', 'sameSystem', 'collects', 'cacheHit', 'started',
 ]);
 const SAFE_STRING = /^[A-Za-z0-9_.:/~+-]{1,64}$/;
 const KEY_SHAPED = /^sk-|sk-or-/i;
@@ -810,6 +897,236 @@ export async function runGatewayStage({ plan, catalog, baseUrl, key, tracker, re
   }
 }
 
+// --- the own runtime stage: the project's turn runner, in this process, with no Gateway and no QQ ---
+
+const QQ_HOST = /(^|\.)(qq\.com|tencent\.com)$/i;
+
+// The own runtime renders no openclaw.json, so only the effective half of the QQ check applies.
+export function assertOwnNoQqRoute(effective) {
+  if (effective?.runtime !== 'own') throw new Error('q5: the effective config is not the own runtime');
+  for (const url of [effective?.qq?.apiBaseUrl, effective?.qq?.tokenBaseUrl]) {
+    if (!url || !isLoopback(url)) throw new Error('q5: the QQ endpoint is not loopback');
+  }
+  if (effective?.qq?.appId !== FAKE_APP_ID) throw new Error('q5: the QQ identity is not the fake one');
+}
+
+// What the runner reads. Nothing is written: there is no Gateway, no session store and no temp root in this mode.
+export function ownEffective({ repoRoot, catalog, baseUrl, testMode }) {
+  const cfg = probeConfig({ repoRoot, qqBase: 'http://127.0.0.1:9', port: 1, modelBase: testMode ? baseUrl : null });
+  cfg.runtime = 'own';
+  // Paths are only named, never created. buildEffective needs them for the policy files, which come from the project.
+  const paths = resolvePaths({ CLO_TEST_ROOT: join(tmpdir(), 'clo-q5-own-unused') });
+  const effective = buildEffective(cfg, { paths, modelsLock: lockFromCatalog(cfg, catalog), env: { CLO_TEST_ROOT: paths.root } });
+  assertOwnNoQqRoute(effective);
+  if (effective.openrouter.baseUrl !== baseUrl) throw new Error('q5: the runner would use another model host');
+  return effective;
+}
+
+const isChatPost = (url, init) => String(init?.method ?? 'GET').toUpperCase() === 'POST' && /\/chat\/completions$/.test(url.pathname);
+
+// The turns go through the same runner and client the bot uses. The probe owns three things around them: a fetch that
+// reaches the model host only and lets one request leave per turn, an exit stand-in that only keeps the text in memory,
+// and the spend count, which reads usage from the same response the runner read. factories is for tests.
+export async function runOwnStage({ plan, catalog, baseUrl, key, tracker, record, say, testMode, repoRoot, signal, http, prices, now = Date.now, factories = {} }) {
+  const makeRunner = factories.createTurnRunner ?? createTurnRunner;
+  const makeClient = factories.createOpenRouterClient ?? createOpenRouterClient;
+  const refusedHosts = new Set();
+  const collected = [];
+  const events = [];
+  const lines = [];
+  let active = null;
+  let stopReason = null;
+  const finish = () => {
+    const hosts = [...refusedHosts];
+    const qqAttempt = hosts.some((h) => QQ_HOST.test(h));
+    if (qqAttempt) stopReason = 'qq_route_attempt';
+    record({ kind: 'own_stage', runtime: 'own', state: stopReason ?? 'finished', refusedHosts: hosts, qqRouteAttempt: qqAttempt });
+    return { stop: stopReason };
+  };
+  try {
+    const effective = ownEffective({ repoRoot, catalog, baseUrl, testMode });
+    const modelOrigin = new URL(baseUrl).origin;
+    // Every refusal happens before anything leaves. Out of a turn, nothing may leave at all.
+    const turnFetch = async (url, init) => {
+      let target;
+      try {
+        target = new URL(url);
+      } catch {
+        throw new Error('q5: an unreadable address was refused');
+      }
+      if (target.origin !== modelOrigin || QQ_HOST.test(target.hostname)) {
+        refusedHosts.add(target.hostname);
+        throw new Error('q5: a request outside the model host was refused');
+      }
+      if (!isChatPost(target, init)) throw new Error('q5: only model requests are allowed in a turn');
+      const slot = active;
+      if (!slot || slot.requests >= plan.turnCallLimit) {
+        if (slot) slot.refused += 1;
+        throw new Error('q5: a request over the turn limit was refused before it left');
+      }
+      slot.requests += 1;
+      slot.bodies.push(parseJson(String(init?.body ?? '')));
+      const res = await http(url, init);
+      slot.status = res.status;
+      try {
+        slot.observed = parseJson(await res.clone().text());
+      } catch {
+        // Cut off. The runner sees the same thing, and the call counts at its worst below.
+      }
+      return res;
+    };
+    // Kept in memory for the next turn's recent lines, and dropped when the stage ends. It has nothing that can post.
+    const exitStandIn = Object.freeze({
+      collect(turnId, payload, info) {
+        collected.push({ turnId, text: typeof payload?.text === 'string' ? payload.text : '', kind: info?.kind ?? null });
+      },
+    });
+    const log = (event, data = {}) => events.push({ event, kind: data.kind ?? null, reason: data.reason ?? null });
+    const client = makeClient({ fetch: turnFetch, getKey: () => key, getBaseUrl: () => effective.openrouter.baseUrl, log, now });
+    const dispatchTurn = makeRunner({
+      client, getEffective: () => effective, readSystemPrompt: () => plan.texts.systemPrompt, getExit: () => exitStandIn, log, now,
+      // This tool retries no paid call, not even one that surely did not leave.
+      beforeRetry: () => false,
+    });
+    say('Own turn runner ready in this process. No Gateway and no QQ.');
+
+    let prev = null;
+    let firstSystem = null;
+    for (const [i, planned] of plan.turns.entries()) {
+      if (signal?.aborted) {
+        stopReason = 'interrupted';
+        break;
+      }
+      if (!tracker.canAfford(planned.worstMicros)) {
+        stopReason = 'cap';
+        break;
+      }
+      const at = now();
+      const turn = ownTurn(planned.text, { at, i, history: prev ? ownHistory(prev.text, prev.at, prev.answer) : [] });
+      const slot = { requests: 0, refused: 0, bodies: [], observed: null, status: null };
+      const seenEvents = events.length;
+      active = slot;
+      let result;
+      try {
+        result = await dispatchTurn(turn, { signal });
+      } catch {
+        // Whether a request left is not known, so it counts as having run.
+        result = { started: true, hostError: true, aborted: false, usage: null };
+      } finally {
+        active = null;
+      }
+      const mine = collected.filter((c) => c.turnId === turn.turnId);
+      const answer = mine.length === 1 && mine[0].kind === 'final' ? mine[0].text : null;
+      const system = slot.bodies[0]?.messages?.[0]?.content;
+      const block = Array.isArray(system) && system.length === 1 ? system[0] : null;
+      const cacheMarker = block?.cache_control?.type === 'ephemeral';
+      const systemText = typeof block?.text === 'string' ? block.text : null;
+      firstSystem ??= systemText;
+      const sameSystem = systemText !== null && systemText === firstSystem && systemText === plan.texts.systemPrompt;
+
+      // Spend comes from the response itself, as in a direct call. A request that left with no figure is never free.
+      const obs = slot.observed;
+      const usage = obs && typeof obs === 'object' ? obs.usage ?? null : null;
+      const sent = slot.requests;
+      const worst = Math.max(planned.worstMicros, sent * plan.turnCallWorstMicros);
+      const cost = reportedCostMicros(usage);
+      const byTokens = tokenCostMicros(usage, prices);
+      let counted = 0;
+      if (sent > 0 && cost === null) {
+        counted = worst;
+        tracker.addMissing(worst);
+      } else if (sent > 0) {
+        counted = Math.max(cost, byTokens ?? 0);
+        tracker.addReported(counted);
+      }
+      const status = slot.status;
+      const httpError = status !== null && (status < 200 || status >= 300 || Boolean(obs?.error));
+      const c = httpError ? classifyError(status, obs?.error ?? null) : null;
+      const choice = Array.isArray(obs?.choices) ? obs.choices[0] : null;
+      const turnModel = events.slice(seenEvents).find((e) => e.event === 'turn_model');
+      let state;
+      if (!result.started) state = 'not_started';
+      else if (result.aborted) state = 'aborted';
+      else if (result.hostError) state = 'failed';
+      else state = answer === null ? 'silent' : 'completed';
+      const cachedTokens = num(usage?.prompt_tokens_details?.cached_tokens);
+      const line = {
+        kind: 'own_turn',
+        id: planned.id,
+        runtime: 'own',
+        state,
+        started: result.started === true,
+        reason: result.started ? (turnModel?.reason ?? null) : (result.reason ?? null),
+        class: c?.class ?? turnModel?.kind ?? null,
+        httpStatus: status,
+        errorCode: c?.errorCode ?? null,
+        errorType: c?.errorType ?? null,
+        metadataKeys: c?.metadataKeys ?? [],
+        metadataTypes: c?.metadataTypes ?? [],
+        limitSource: c?.limitSource ?? null,
+        providerName: c?.providerName ?? providerSlug(obs?.provider),
+        finishReason: FINISH.has(choice?.finish_reason) ? choice.finish_reason : (choice?.finish_reason ? 'other' : null),
+        nativeFinish: NATIVE_FINISH.has(choice?.native_finish_reason) ? choice.native_finish_reason : (choice?.native_finish_reason ? 'other' : null),
+        promptTokens: num(usage?.prompt_tokens),
+        completionTokens: num(usage?.completion_tokens),
+        reasoningTokens: num(usage?.completion_tokens_details?.reasoning_tokens),
+        cachedTokens,
+        cacheWriteTokens: num(usage?.prompt_tokens_details?.cache_write_tokens),
+        inputTokens: num(result.usage?.input),
+        outputTokens: num(result.usage?.output),
+        cacheReadTokens: num(result.usage?.cacheRead),
+        cacheHit: i === 0 ? null : (cachedTokens ?? 0) > 0,
+        modelMatches: obs && typeof obs.model === 'string' ? obs.model === plan.primaryId : null,
+        contentChars: answer === null ? 0 : answer.length,
+        refusalPresent: Boolean(choice?.message?.refusal),
+        usageMissing: sent > 0 && cost === null,
+        costUsd: cost === null ? null : round6(cost),
+        tokenCostUsd: byTokens === null ? null : round6(byTokens),
+        actualUsd: sent > 0 && cost !== null ? round6(counted) : null,
+        countedUsd: round6(counted),
+        worstUsd: round6(planned.worstMicros),
+        durationMs: now() - at,
+        guardRequests: sent,
+        refusedRequests: slot.refused,
+        turnCallLimit: plan.turnCallLimit,
+        cacheMarker: sent > 0 ? cacheMarker : null,
+        sameSystem: sent > 0 ? sameSystem : null,
+        collects: mine.length,
+        modelCalls: sent,
+        modelCallErrors: result.hostError ? 1 : 0,
+        hostNotices: 0,
+      };
+      lines.push(line);
+      record(line);
+      say(`${planned.id}: state ${state}, ${sent} model request(s), counted ${usdText(counted)}${line.usageMissing ? ' (no usage, counted at worst case)' : ''}${i > 0 ? `, cache read ${cachedTokens ?? 0} tokens` : ''}.`);
+
+      if (signal?.aborted || result.aborted) stopReason = 'interrupted';
+      else if (slot.refused > 0) {
+        stopReason = 'turn_call_limit';
+        say(`The runner tried more than ${plan.turnCallLimit} model request in one turn. The extra one was refused before it left.`);
+      } else if (c?.stop) stopReason = c.class;
+      else if (sent > 0 && (!cacheMarker || !sameSystem)) stopReason = 'cache_marker_missing';
+      else if (!result.started) stopReason = 'own_turn_not_started';
+      else if (state !== 'completed' || mine.length !== 1) stopReason = 'own_turn_failed';
+      else if (line.usageMissing) stopReason = 'usage_missing';
+      if (stopReason) break;
+      prev = { text: planned.text, at, answer };
+    }
+    // The point of the second turn: the prefix written by the first should now be read from the cache.
+    const warm = lines[1];
+    if (warm && warm.guardRequests > 0) {
+      record({ kind: 'measure', name: 'warm_cache_read', tokens: warm.cachedTokens, cacheHit: warm.cacheHit });
+      say(warm.cacheHit
+        ? `Warm turn read ${warm.cachedTokens} tokens from the cache.`
+        : 'Note: the warm turn read nothing from the cache. Caching may not be working on this route; a cached turn would then cost several times more.');
+    }
+    return finish();
+  } finally {
+    active = null;
+    collected.length = 0;
+  }
+}
+
 // --- Key lag ---
 
 async function readKey({ http, baseUrl, key }) {
@@ -896,7 +1213,7 @@ export function suggestConfig({ plan, calls, turns, lag, prices }) {
   const add = (name, current, suggested, basis, observed = null) => out.push({ name, current, suggested, basis, observed });
 
   const primaryObserved = maxOf([...ok('primary').map((c) => c.completionTokens), ...turns.map((t) => t.outputTokens)]);
-  const primaryCut = ok('primary').some((c) => c.finishReason === 'length') || turns.some((t) => t.hostNotices > 0);
+  const primaryCut = ok('primary').some((c) => c.finishReason === 'length') || turns.some((t) => t.hostNotices > 0 || t.finishReason === 'length');
   if (primaryObserved === null) add('claudeModel.maxTokens', plan.primaryMaxTokens, plan.primaryMaxTokens, 'no_data');
   else if (primaryCut) add('claudeModel.maxTokens', plan.primaryMaxTokens, plan.primaryMaxTokens * 2, 'truncated_in_probe', primaryObserved);
   else if (primaryObserved * 2 > plan.primaryMaxTokens) add('claudeModel.maxTokens', plan.primaryMaxTokens, primaryObserved * 2, 'observed_above_half', primaryObserved);
@@ -916,7 +1233,10 @@ export function suggestConfig({ plan, calls, turns, lag, prices }) {
   else add('ledger.decisionHoldInputTokens', DECISION_INPUT_TOKENS, DECISION_INPUT_TOKENS, 'keep', decisionPrompt);
 
   if (prices) {
-    const hold = 2 * (plan.contextTokens * Math.max(prices.inputPerM, prices.cacheWritePerM ?? 0) + plan.primaryMaxTokens * prices.outputPerM);
+    // The own runtime holds one call, with the cacheable part at the cache-write rate, exactly as its ledger does.
+    const hold = plan.runtime === 'own'
+      ? replyHoldMicros('reply_required', { price: prices, contextTokens: plan.contextTokens, maxTokens: plan.primaryMaxTokens }, 'own')
+      : 2 * (plan.contextTokens * Math.max(prices.inputPerM, prices.cacheWritePerM ?? 0) + plan.primaryMaxTokens * prices.outputPerM);
     add('ledger.replyRequiredHoldUsd', null, round6(hold), 'catalog_price_times_cap', maxOf(turns.map((t) => t.actualUsd)));
   } else {
     add('ledger.replyRequiredHoldUsd', null, null, 'no_data');
@@ -999,7 +1319,7 @@ function checkCatalog(plan, catalog, cfg) {
   return { problems, prices, decisionPrices, unusedPriceFields: [...unused] };
 }
 
-export async function runProbe({ plan, baseUrl, key, maxUsd, resultPath, say, fetchImpl = globalThis.fetch, gatewayStage = runGatewayStage, testMode = false, parentEnv = {}, tempParent = null, repoRoot, lagMs = DEFAULT_LAG_MINUTES * 60000, pollMs = POLL_MS, signal, keepRunRoot = false }) {
+export async function runProbe({ plan, baseUrl, key, maxUsd, resultPath, say, fetchImpl = globalThis.fetch, gatewayStage = runGatewayStage, ownStage = runOwnStage, testMode = false, parentEnv = {}, tempParent = null, repoRoot, lagMs = DEFAULT_LAG_MINUTES * 60000, pollMs = POLL_MS, signal, keepRunRoot = false }) {
   const capMicros = Math.floor(maxUsd * 1e6);
   if (plan.totalWorstMicros > capMicros) throw new Error(`refused: worst case ${usdText(plan.totalWorstMicros)} is above --max-usd`);
   const http = restrictedFetch(baseUrl, fetchImpl);
@@ -1010,9 +1330,11 @@ export async function runProbe({ plan, baseUrl, key, maxUsd, resultPath, say, fe
   const trackedRecord = (line) => {
     record(line);
     if (line.kind === 'call') calls.push(line);
-    if (line.kind === 'gateway_turn') turns.push(line);
+    if (line.kind === 'gateway_turn' || line.kind === 'own_turn') turns.push(line);
   };
-  record({ kind: 'run_start', planCalls: plan.calls.length, planTurns: plan.turns.length, maxModelCalls: plan.maxModelCalls, worstUsd: round6(plan.totalWorstMicros), maxUsd, primaryModel: plan.primaryId, decisionModel: plan.decisionId, testMode });
+  const own = plan.runtime === 'own';
+  const stageName = own ? 'own runner stage' : 'Gateway stage';
+  record({ kind: 'run_start', runtime: own ? 'own' : 'openclaw', planCalls: plan.calls.length, planTurns: plan.turns.length, maxModelCalls: plan.maxModelCalls, worstUsd: round6(plan.totalWorstMicros), maxUsd, primaryModel: plan.primaryId, decisionModel: plan.decisionId, testMode });
 
   let stopReason = null;
   let lag = null;
@@ -1089,18 +1411,19 @@ export async function runProbe({ plan, baseUrl, key, maxUsd, resultPath, say, fe
     }
   }
 
-  // Before a Gateway costs a start-up, when the direct calls already used more than planned.
+  // Before the turns start, when the direct calls already used more than planned.
   if (!stopReason && plan.turns.length && !tracker.canAfford(plan.turns[0].worstMicros)) {
     stopWith('cap');
-    say('Stopped before the Gateway stage: a turn could pass the cap.');
+    say(`Stopped before the ${stageName}: a turn could pass the cap.`);
   }
 
   if (!stopReason) {
-    const staged = await gatewayStage({ plan, catalog, baseUrl, key, tracker, record: trackedRecord, say, testMode, parentEnv, tempParent, repoRoot, signal, keepRunRoot });
+    const stage = own ? ownStage : gatewayStage;
+    const staged = await stage({ plan, catalog, baseUrl, key, tracker, record: trackedRecord, say, testMode, parentEnv, tempParent, repoRoot, signal, keepRunRoot, http, prices });
     lastPaidAt = Date.now();
     if (staged?.stop) {
       stopWith(staged.stop);
-      say(`Stopped in the Gateway stage: ${staged.stop}.`);
+      say(`Stopped in the ${stageName}: ${staged.stop}.`);
     }
   }
 
@@ -1138,11 +1461,12 @@ export async function runProbe({ plan, baseUrl, key, maxUsd, resultPath, say, fe
 
 // --- command line ---
 
-const USAGE = `Usage: q5-probe [--approve --max-usd <dollars>] [--lag-minutes <1-30>]
-Without --approve it prints the plan and exits. No request is made and .env is not read.`;
+const USAGE = `Usage: q5-probe [--runtime openclaw|own] [--approve --max-usd <dollars>] [--lag-minutes <1-30>]
+Without --approve it prints the plan and exits. No request is made and .env is not read.
+--runtime own runs the turns through the project's own turn runner instead of a Gateway. The default is openclaw.`;
 
 export function parseCli(argv) {
-  const out = { approve: false, maxUsd: null, lagMinutes: DEFAULT_LAG_MINUTES };
+  const out = { approve: false, maxUsd: null, lagMinutes: DEFAULT_LAG_MINUTES, runtime: 'openclaw' };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--approve') {
@@ -1151,6 +1475,10 @@ export function parseCli(argv) {
       i += 1;
       if (!/^\d+(\.\d+)?$/.test(argv[i] ?? '') || Number(argv[i]) <= 0) return { error: '--max-usd needs a positive number of dollars.' };
       out.maxUsd = Number(argv[i]);
+    } else if (a === '--runtime') {
+      i += 1;
+      if (!RUNTIMES.includes(argv[i])) return { error: '--runtime must be openclaw or own.' };
+      out.runtime = argv[i];
     } else if (a === '--lag-minutes') {
       i += 1;
       if (!/^\d+$/.test(argv[i] ?? '') || Number(argv[i]) < 1 || Number(argv[i]) > 30) return { error: '--lag-minutes must be a whole number from 1 to 30.' };
@@ -1195,7 +1523,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
   }
   const paths = resolvePaths(env);
   if (!env.CLO_TEST_ROOT) sweepOldRunRoots(tmpdir(), { say });
-  const plan = buildPlan(paths.repoRoot);
+  const plan = buildPlan(paths.repoRoot, { runtime: cli.runtime });
   printPlan(plan, say);
   say('');
   if (!cli.approve) {

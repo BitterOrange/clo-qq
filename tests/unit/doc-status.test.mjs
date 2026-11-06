@@ -1,7 +1,7 @@
 // README and DEPLOYMENT are what the user reads before agreeing to anything, so their claims about status and spend
 // are checked here. These pin wording that was found false, and figures that come from the code.
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { DOWN_ALERT_AFTER_MS, PROBE_FAILS_TO_SUSPECT } from '../../src/clo-plugin/lib/channels/qq/connection.js';
@@ -138,7 +138,7 @@ test('the temp-root text says what happens when it cannot be deleted', () => {
 });
 
 // The repo is public. These hold what was decided for the public text.
-const PUBLIC_DOCS = ['README.md', 'DEPLOYMENT.md', 'DECISIONS.md', 'docs/group-chat-design.md', 'docs/q0a-guide.zh.md', 'docs/wiring-trial.md'];
+const PUBLIC_DOCS = ['README.md', 'DEPLOYMENT.md', 'DECISIONS.md', 'docs/group-chat-design.md', 'docs/q0a-guide.zh.md', 'docs/wiring-trial.md', 'docs/own-runtime.md'];
 
 test('public docs do not send a reader to files that are not in the repo, or name private things', () => {
   const documentation = /^(?:127\.0\.0\.1|0\.0\.0\.0|192\.0\.2\.\d+|198\.51\.100\.\d+|203\.0\.113\.\d+)$/;
@@ -385,6 +385,112 @@ test('fixed gaps have left the open lists, and what still awaits a decision stay
   for (const item of ['判定失败', '`crisis_route` 不管熔断', '`residual` 没有 owner 放行办法', '余额探测的 24 小时', '要不要插队', '预留和预算还没有按']) assert.ok(open.includes(item), item);
   assert.match(DEPLOYMENT, /\*\*事件日志不轮转：\*\*/);
   assert.match(DEPLOYMENT, /\*\*优雅停机：\*\* 没有/);
+});
+
+// The dual-runtime period: the own runtime exists, is not the default, and has no real acceptance. Until the cutover the
+// docs must say so, and must not close the privacy gaps that only a real run on it could close.
+const OWN_DOC = read('docs/own-runtime.md');
+const DESIGN_DOC = read('docs/group-chat-design.md');
+
+test('the own runtime is described as built, not the default, and not accepted on real QQ', () => {
+  assert.equal(JSON.parse(read('config.example.json')).runtime, 'openclaw', 'the template still names the default');
+  for (const [name, text] of [['README', README], ['DEPLOYMENT', DEPLOYMENT], ['own-runtime', OWN_DOC]]) {
+    assert.match(text, /runtime: "own"/, `${name} names the switch`);
+    assert.match(text, /默认仍是 `openclaw`|仍是 `openclaw`|默认值 `openclaw`/, `${name} says what the default is`);
+  }
+  assert.match(README, /现在跑的也是它，上面这些真实记录都是在 OpenClaw 上得到的/);
+  assert.match(README, /新运行时在真实 QQ 上的验收一项都没有做/);
+  assert.match(DEPLOYMENT, /\| 自己的运行时（own）上的 Q3 到 Q7 \| \*\*未做\*\*/);
+  assert.match(DEPLOYMENT, /\| 真实 QQ、真实模型、真实 OpenRouter \| \*\*都没有跑过\*\* \|/);
+  assert.match(OWN_DOC, /新运行时在真实 QQ 上的验收一项都没有做/);
+  assert.match(OWN_DOC, /现在真正在跑的仍是 OpenClaw 这条路/);
+  assert.match(DESIGN_DOC, /that is still the default \(`runtime: 'openclaw'`\) and what runs/);
+  assert.match(DESIGN_DOC, /no real QQ acceptance has been done on it/);
+  for (const [name, text] of [['README', README], ['DEPLOYMENT', DEPLOYMENT], ['own-runtime', OWN_DOC], ['design', DESIGN_DOC]]) {
+    assertGone(text, ['默认是 `own`', '已切换到 own', 'own 运行时已上线', 'own 已验收', 'default is `own`'], name);
+  }
+});
+
+test('the switch and the rollback are written out, with the steps the console needs', () => {
+  const sw = OWN_DOC.slice(OWN_DOC.indexOf('**切到 own：**'), OWN_DOC.indexOf('**回退到 openclaw：**'));
+  const back = OWN_DOC.slice(OWN_DOC.indexOf('**回退到 openclaw：**'), OWN_DOC.indexOf('几点要知道'));
+  assert.ok(sw.length > 0 && back.length > 0, 'positive control: both blocks were found');
+  for (const block of [sw, back]) {
+    const order = ['stop.ps1', 'clo.ps1 apply', 'doctor.ps1', 'start.ps1'].map((step) => block.indexOf(step));
+    assert.ok(order.every((i) => i >= 0), 'every step is there');
+    assert.deepEqual([...order].sort((a, b) => a - b), order, 'stop, then apply, then doctor, then start');
+  }
+  assert.match(sw, /"runtime": "own"/);
+  assert.match(back, /"runtime": "openclaw"/);
+  assert.match(OWN_DOC, /切到 own 不会删掉任何旧数据/);
+  // The refusal the text promises is the console's.
+  assert.match(read('src/cli/lifecycle.mjs'), /不能在它运行时把运行时换成/);
+});
+
+test('what the own runtime changes is stated with how far it was checked', () => {
+  assert.match(OWN_DOC, /请求里没有 `tools` 字段/);
+  assert.match(OWN_DOC, /只在内存上下文里，和群消息同一个有界环（40 条、24 小时、token 上限）/);
+  assert.match(OWN_DOC, /重启后丢失，`\/new`、`\/reset` 清空，这个群 120 分钟没有回合也清空/);
+  assert.equal(read('src/clo-plugin/lib/core/context.js').match(/OWN_IDLE_MS = (\d+) \* 60000/)[1], '120', 'the idle figure is the code\'s');
+  assert.match(OWN_DOC, /\*\*只在离线测试里量过\*\*：Windows，私有 Node，mock QQ，mock 模型/);
+  assert.match(DEPLOYMENT, /\*\*自己的运行时（own）：\*\* 同样的离线条件、一次样本/);
+  assert.match(OWN_DOC, /这些都只是离线结果，真实运行里还没有确认/);
+  assert.match(OWN_DOC, /没有一项在真实 QQ 或真实模型上看过/);
+});
+
+test('the clawhub.ai, session-store and deletion gaps stay open during the dual-runtime period', () => {
+  // Still stated for the path that runs.
+  assert.match(README, /Gateway 每次启动都会尝试连接 `clawhub\.ai`/);
+  assert.match(README, /这一版\*\*没有\*\*删除接口，`\/new` 也不会删除旧内容/);
+  assert.match(README, /\*\*没有实现按成员删除数据的功能/);
+  assert.match(README, /所以上面的会话库和 `clawhub\.ai` 两条照样成立，告知草稿也不改/);
+  assert.match(OWN_DOC, /所以 README 和告知草稿里的这几条缺口都\*\*没有关闭\*\*/);
+  assert.match(DEPLOYMENT, /\*\*缺口都没有关闭\*\*/);
+  const notice = read('persona/group-notice.zh.md');
+  assert.match(notice, /clawhub\.ai/, 'the notice draft still names it, until a real run shows otherwise');
+  for (const [name, text] of [['README', README], ['DEPLOYMENT', DEPLOYMENT], ['own-runtime', OWN_DOC]]) {
+    assertGone(text, ['不再访问 `clawhub.ai`（已确认）', '会话库的缺口已关闭', '已经可以按成员删除', '缺口已关闭'], name);
+  }
+});
+
+test('every host e2e file has a row in the mapping, and every own e2e file it names exists', () => {
+  const host = readdirSync(join(ROOT, 'tests', 'e2e')).filter((f) => f.endsWith('.test.mjs'));
+  const own = readdirSync(join(ROOT, 'tests', 'e2e-own')).filter((f) => f.endsWith('.test.mjs'));
+  assert.ok(host.length >= 20 && own.length >= 20, 'positive control: both suites were found');
+  const table = OWN_DOC.slice(OWN_DOC.indexOf('| `tests/e2e/` | `tests/e2e-own/` |'), OWN_DOC.indexOf('只在宿主上有意义'));
+  const rows = table.split('\n').filter((l) => /^\| (`[^`]+`|没有) \| (`[^`]+`|没有) \|/.test(l) && !l.startsWith('| `tests/')).map((l) => l.split('|').map((c) => c.trim().replace(/`/g, '')));
+  const left = rows.map((r) => r[1]).filter((c) => c !== '没有');
+  const right = rows.map((r) => r[2]).filter((c) => c !== '没有');
+  assert.deepEqual([...left].sort(), [...host].sort(), 'each host file once, and nothing else');
+  for (const f of right) assert.ok(own.includes(f), `the mapping names tests/e2e-own/${f}, which does not exist`);
+  assert.deepEqual([...right].sort(), [...own].sort(), 'every own file is in the mapping');
+  for (const r of rows) if (r[2] === '没有') assert.ok(r[3].length > 0, `${r[1]} says why it has no counterpart`);
+});
+
+test('the own probe figures are the ones its plan prints, and the gap to the agreed cap is stated', () => {
+  const ownPlan = buildPlan(ROOT, { runtime: 'own' });
+  const ownWorst = `$${(ownPlan.totalWorstMicros / 1e6).toFixed(4)}`;
+  assert.notEqual(ownWorst, worst, 'positive control: the two plans differ');
+  assert.ok(OWN_DOC.includes(`最坏 ${ownWorst}，最多 ${ownPlan.maxModelCalls} 次模型调用`), 'own-runtime.md has the own worst case');
+  assert.ok(OWN_DOC.includes(`openclaw 版本是 ${worst}、${plan.maxModelCalls} 次`));
+  assert.ok(DEPLOYMENT.includes(`最坏 ${ownWorst}`), 'DEPLOYMENT has it too');
+  if (ownPlan.totalWorstMicros > 100000) {
+    assert.match(OWN_DOC, /决定里写的 Q5 上限约 \$0\.10，比这个最坏数小/);
+    assert.match(DECISIONS_TEXT(), /Q5 付费探测上限约 \$0\.10/);
+  }
+  if (!/runtime/i.test(read('scripts/q5-probe.ps1'))) assert.match(OWN_DOC, /`scripts\\q5-probe\.ps1` 还没有传 `--runtime` 的参数/);
+});
+
+const DECISIONS_TEXT = () => read('DECISIONS.md');
+
+test('the design contract marks its host sections as openclaw only, and records the own deltas as offline', () => {
+  assert.match(DESIGN_DOC, /## 8\. Host wiring\n\nApplies to `runtime: 'openclaw'` only/);
+  const own = DESIGN_DOC.slice(DESIGN_DOC.indexOf('### From the own runtime'));
+  assert.ok(own.length > 100, 'positive control: the section exists');
+  assert.match(own, /^Offline only/m);
+  assert.match(own, /Nothing here has run on real QQ, with a real model or against real OpenRouter/);
+  assert.match(own, /no `tools` field/);
+  assert.match(own, /same second as `\/stop` is skipped/);
 });
 
 // These cross into files other copies own. They fail until the docs are merged with the code and templates they

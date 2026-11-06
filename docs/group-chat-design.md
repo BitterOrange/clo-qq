@@ -8,6 +8,8 @@ Precedence: `DECISIONS.md` and the review notes in `docs/wiring-trial.md` overri
 
 When this was written, nothing here had run on real QQ or real OpenRouter. `DEPLOYMENT.md` says what has run since. Offline tests prove wiring, not platform behaviour.
 
+**Two runtimes.** This contract was written for the OpenClaw Gateway, and that is still the default (`runtime: 'openclaw'`) and what runs. A second runtime, `runtime: 'own'` (`src/bot/main.mjs`, `core/turn.js`, `core/openrouterChat.js`), replaces the host with the project's own process; see `DECISIONS.md` (去掉 OpenClaw，改用自己的运行时) and [own-runtime.md](own-runtime.md). It has run offline only, with mock QQ and a mock model, and no real QQ acceptance has been done on it. Sections 7.4 and 8 and the host rows of section 10 apply to `openclaw` only. The own runtime's deltas are under "From the own runtime" at the end. This document is rewritten for one runtime at the cutover, not before.
+
 ## 0. Assumptions and open items
 
 | # | Assumption | Basis | If false |
@@ -887,6 +889,8 @@ The plugin config schema becomes `{ effectivePath, generationTag }` and the chan
 
 ## 8. Host wiring
 
+Applies to `runtime: 'openclaw'` only. The own runtime has no host: see "From the own runtime" below.
+
 ### 8.1 Identity and session
 
 `peer.id`, `conversation.id`, `routePeer`, `reply.to`, `originatingTo`, `nativeChannelId`, `from`, `sender.id`, `subject.stableId` all use `sessionPeerId(...)`, not raw IDs. The host never sees a raw openid. That fixes the observed lowercasing bleed (TQ15) and keeps openids out of the prompt. Exit and the gate alone keep raw IDs, from the Turn. Sender label in `HistoryEntry` is the `U1` pseudonym, or the `U1（显示名：小明）` label for a group with `displayNames` on, where `turn.speakerLabel` also goes to the host as a structured context entry. `sender.name` and the frame body stay on the code, because the host stores those with the turn.
@@ -963,6 +967,8 @@ trigger=crisis_route：只判断 crisis，其余一律 skip。
 - Heartbeat timer every 30 s writes `heartbeat_at`, stopped on abort.
 
 ## 10. Test map
+
+The files named here are the host suite (`tests/e2e/`). Each has a counterpart in `tests/e2e-own/` for the own runtime, or a stated reason why not; the mapping is in [own-runtime.md](own-runtime.md).
 
 Rules for every test file:
 - R1. Temp cwd, fake keys, loopback mocks, net-guard. Never read `.env`. Private Node only.
@@ -1229,3 +1235,18 @@ A provider_fail streak that reached the limit ends when the pause clears under a
 
 21. Observed: three unclean boots in five minutes make the host refuse channel auto-start (`channel autostart suppressed by crash-loop breaker`, documented in `docs/gateway/restart-recovery.md`). `clo stop` uses `taskkill /F`, which counts as unclean, so three stop-and-start cycles in five minutes leave the bot offline with a healthy process until the window drains or `openclaw gateway call channels.start`. In that safe mode, once, a message after a manual `channels.start` got zero model calls and the failure line. The cause was not diagnosed. `e2e/qq-crash-matrix` uses one stack per row to stay out of it.
 22. Observed: a 403 is classed by the host as `reason=auth`, and identical paragraphs in one reply are collapsed to one.
+
+### From the own runtime
+
+Offline only: unit tests with fakes, and the real bot process with mock QQ and a mock model. Nothing here has run on real QQ, with a real model or against real OpenRouter. Everything below applies only when `effective.runtime === 'own'`; with `'openclaw'` (the default) the sections above hold unchanged.
+
+1. **Config.** `runtime` is `'openclaw'` (default) or `'own'`, validated and carried into `effective.json`. A file without it reads as `'openclaw'`. Under `'own'`, `clo apply` writes only `effective.json` and `system-prompt.md`; no `openclaw.json`.
+2. **One consumer.** Both runtimes share the start lock and the PID record. `clo start` refuses one runtime while the other's recorded process is alive, and a console apply that would switch `runtime` under a running process of the other runtime is refused before `config.json` is written. The plugin refuses to connect when `effective.runtime` is `'own'`; the bot refuses unless it is `'own'`, `qq` is enabled, `CLO_QQ_APP_ID` equals `qq.appId` and a secret is set.
+3. **Process.** `clo start` spawns the private Node with the Gateway's node flags and env allowlist, minus `OPENCLAW_*` and the token, plus `CLO_EFFECTIVE_PATH`. The bot listens on no port. Host-independent startup (fatal-close latch, recovery, status controls, reconnect cap, stop order) is shared in `channels/qq/startup.js`.
+4. **Turn.** `core/turn.js` builds one non-streaming request with no `tools` field and one ephemeral cache marker at the end of the system block, checks the policy markers on the exact system string sent, and hands the exit one final text at most. `core/openrouterChat.js` is the one client for this and for the decision call; it retries once, only on a definitely-not-sent connect failure with room before the deadline. Provider text never reaches a log, an Error or the ledger. `provider.require_parameters:true`, no attribution headers, no `user` field.
+5. **Hold.** A required turn holds one worst-case call, with the whole input priced at the higher of the input and cache-write rates (`replyHoldMicros(kind, primary, 'own')`). An empty or `NO_REPLY` required answer gets one failure line and no second call.
+6. **Gate.** `createGate({ runtime: 'own' })`: `/new`, `/reset`, `/stop` are handled in the gate; only listed owner commands are commands, other slash text is ordinary text. Each running turn gets an AbortSignal; `/stop`, `gate.stop()` and the deadline abort it, except a crisis reply already handed over. A run ignoring the abort is dropped after 5 s, its hold stays unsettled, late text never reaches the exit. A message in the same second as `/stop` is skipped with no model call, no failure line and no hold, except one with danger words. The gate counts the main-model failure streak itself (pause after 3 in a row, immediate pause on 402); the runner and services do not count it.
+7. **Context.** Her replies that went out, or may have, join the group's ring under 可洛, sharing the 40-item, 24-hour and token caps; `/new` and `/reset` clear them; they drop after 120 minutes with no turn in the group (`OWN_IDLE_MS`). Memory only.
+8. **Exit and ledger.** `createExit({ runtime: 'own' })` skips the host-notice filter and reports posted text to the gate. `createLedger({ runtime: 'own' })` applies item 5.
+9. **Doctor.** Under `'own'` it checks the system prompt, the locked Node and SDK, the bot env, the entry and that nothing would listen, and needs no `openclaw.json`. The forbidden-plugin check runs under both.
+10. **Bot wiring and a second consumer.** `src/bot/main.mjs` builds the gate and exit, and `src/bot/services.mjs` the ledger, with `runtime: 'own'`, so items 5 to 8 apply in the bot process; `tests/unit/bot-main.test.mjs` checks this there. A bot that `clo` has no PID record for is still caught by its consumer lease (`channels/qq/lease.js`): while the lease is fresh and its PID alive, the plugin refuses to connect, `clo start` refuses either runtime and `clo stop` writes a stop request for that PID. The window between spawn and writing the PID record remains.

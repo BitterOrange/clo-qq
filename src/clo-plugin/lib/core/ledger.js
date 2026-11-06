@@ -43,13 +43,26 @@ export const DECISION_INPUT_TOKENS = 10500;
 
 export const usdToMicros = (usd) => Math.round(usd * 1e6);
 
+// One primary call at its worst. The own runtime marks the system block for caching, and which part of the input that
+// is goes unmeasured here, so all of it is priced at the dearer of the input and cache-write rates. It makes no hidden
+// second call, so a required turn holds one call. With the host a required turn holds two: it calls again on NO_REPLY.
+export function replyHoldMicros(kind, primary, runtime = 'openclaw') {
+  if (kind !== 'reply_required' && kind !== 'reply_optional' && kind !== 'tool_round') throw new TypeError(`ledger.holdMicros: unknown kind ${kind}`);
+  if (runtime !== 'own') return (kind === 'reply_required' ? 2 : 1) * callWorstMicros(primary.price, primary);
+  const { price } = primary;
+  if (!price) throw new Error('callWorstMicros: price is not locked');
+  const inputPerM = Math.max(price.inputPerM, price.cacheWritePerM ?? price.inputPerM);
+  return Math.ceil(primary.contextTokens * inputPerM + primary.maxTokens * price.outputPerM);
+}
+
 function microsOf(v) {
   if (v === null || v === undefined) return null;
   const n = Number(v);
   return Number.isFinite(n) ? usdToMicros(n) : null;
 }
 
-export function createLedger({ store, getEffective, fetch = globalThis.fetch, getKey, log = () => {}, now = Date.now, setTimer = setInterval, clearTimer = clearInterval }) {
+export function createLedger({ store, getEffective, fetch = globalThis.fetch, getKey, log = () => {}, now = Date.now, setTimer = setInterval, clearTimer = clearInterval, runtime = 'openclaw' }) {
+  if (runtime !== 'openclaw' && runtime !== 'own') throw new TypeError('createLedger: runtime must be openclaw or own');
   const { q } = store;
   let keyFailures = 0;
   let timer = null;
@@ -152,14 +165,13 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     const eff = getEffective();
     if (!eff) throw new Error('ledger: no effective config');
     const { primary, decision } = eff.models;
-    const callWorst = () => callWorstMicros(primary.price, primary);
     if (kind === 'decision') {
       if (!decision.price) throw new Error('ledger: decision price is not locked');
       return Math.ceil(DECISION_INPUT_TOKENS * decision.price.inputPerM + decision.maxTokens * decision.price.outputPerM);
     }
-    if (kind === 'reply_required') return 2 * callWorst();
-    if (kind === 'reply_optional' || kind === 'tool_round') return callWorst();
-    throw new TypeError(`ledger.holdMicros: unknown kind ${kind}`);
+    // The process's own runtime, fixed when it was built: the host process can still make its hidden second call
+    // whatever a later clo apply wrote to the file.
+    return replyHoldMicros(kind, primary, runtime);
   }
 
   const setSettled = (id, actualMicros, source, model) => q(`UPDATE reservations SET status='settled', actual_micros=?, source=?, model=COALESCE(?, model), settled_at=?

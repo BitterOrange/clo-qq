@@ -1,5 +1,4 @@
 // The clo-qq channel on @tencent-connect/qqbot-nodejs, for OpenClaw. Group chat only in this build.
-import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import {
   createChannelPluginBase,
   createChatChannelPlugin,
@@ -7,21 +6,15 @@ import {
 } from 'openclaw/plugin-sdk/channel-core';
 import { defineStableChannelIngressIdentity } from 'openclaw/plugin-sdk/channel-ingress-runtime';
 import { createGate } from './lib/core/gate.js';
-import { utcDay } from './lib/core/ids.js';
-import { createDownWatch, runConnection } from './lib/channels/qq/connection.js';
 import { createDispatcher } from './lib/channels/qq/dispatch.js';
 import { registerHooks } from './lib/channels/qq/hooks.js';
 import { attachUsage, getServices, liveSecrets, stopServices } from './lib/channels/qq/services.js';
+import { accountMismatch, beginRun, checkStartLatch, connectAccount, liveBotLease, runtimeOf, startControls, stopRun } from './lib/channels/qq/startup.js';
 import { registerTools } from './lib/channels/qq/tools.js';
 
 const CHANNEL_ID = 'clo-qq';
 const ACCOUNT_ID = 'default';
 const USER_AGENT = `clo-qq/1 (Node/${process.versions.node})`;
-const HEARTBEAT_MS = 30000;
-const JANITOR_MS = 3600000;
-const DOWN_CHECK_MS = 60000;
-// Well below the 1000 a day session_start_limit the plan records. The SDK's own reconnects also count.
-const LIVENESS_RESTARTS_PER_DAY = 100;
 
 const identity = defineStableChannelIngressIdentity({
   key: 'clo-peer',
@@ -66,40 +59,6 @@ const testOverride = () => (process.env.CLO_TEST_ROOT ? process.env.CLO_TEST_IGN
 function terminal(ctx, lastError) {
   // terminalDisconnect stops the host's auto-restart, which would otherwise retry an empty start.
   ctx.setStatus({ ...ctx.getStatus(), running: false, connected: false, terminalDisconnect: true, lastError });
-}
-
-// A fatal close must outlive a database that cannot be written, or the next start would reconnect to the
-// account the platform just closed. The file is written first and dropped once the store holds the code.
-// The last resort, for when the file cannot be written either, lasts as long as this module instance.
-let unsavedClose = null;
-const closeFilePath = (dbPath) => `${dbPath}.terminal_close`;
-
-function saveCloseFile(dbPath, code) {
-  try {
-    const path = closeFilePath(dbPath);
-    writeFileSync(`${path}.tmp`, String(code));
-    renameSync(`${path}.tmp`, path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Fails closed: a file that exists but cannot be read still counts as a latch.
-function readCloseFile(dbPath) {
-  try {
-    return readFileSync(closeFilePath(dbPath), 'utf8').trim() || 'unknown';
-  } catch (err) {
-    return err?.code === 'ENOENT' ? null : 'unknown';
-  }
-}
-
-function dropCloseFile(dbPath) {
-  try {
-    rmSync(closeFilePath(dbPath), { force: true });
-  } catch {
-    // The next start reads it as a latch, which is the safe direction.
-  }
 }
 
 /** Wraps dispatchTurn so the host's health policy sees a running turn as busy, not as a channel to restart. */
@@ -151,168 +110,79 @@ export async function startAccount(ctx) {
     terminal(ctx, 'channel runtime unavailable');
     return;
   }
-  const appEnv = process.env.CLO_QQ_APP_ID;
-  if (!isConfigured(account) || (appEnv && appEnv !== account.appId) || getEffective()?.qq?.appId !== account.appId) {
+  // One consumer per AppID: with the own runtime configured, the bot process is the one that connects.
+  if (runtimeOf(getEffective()) !== 'openclaw') {
+    log('start_refused', { reason: 'runtime' });
+    terminal(ctx, 'another runtime is configured');
+    return;
+  }
+  // A bot clo lost track of (no PID record) may still hold the account under the old runtime: it listens on no port,
+  // so only its lease shows it. Connecting beside it would make two consumers of one AppID.
+  if (liveBotLease({ store }) !== null) {
+    log('start_refused', { reason: 'running', kind: 'bot' });
+    terminal(ctx, 'another consumer holds the account');
+    return;
+  }
+  if (accountMismatch({ appId: account.appId, secret: account.clientSecret, envAppId: process.env.CLO_QQ_APP_ID, eff: getEffective() })) {
     log('start_refused', { reason: 'account' });
     store.addAlert('account_mismatch', {});
     terminal(ctx, 'account does not match configuration');
     return;
   }
   const dbPath = getEffective().paths.db;
-  const stored = store.getControl('terminal_close');
-  const filed = readCloseFile(dbPath);
-  const latched = stored ?? filed ?? unsavedClose;
-  if (filed !== null) {
-    try {
-      if (stored === null) {
-        store.setControl('terminal_close', filed, 'connection');
-        store.addAlert('terminal_close', { closeCode: Number(filed) });
-      }
-      dropCloseFile(dbPath);
-    } catch {
-      log('status_error', { reason: 'terminal_close' });
-    }
-  }
+  const latched = checkStartLatch({ store, dbPath, log });
   if (latched !== null) {
     log('start_refused', { reason: 'terminal', closeCode: Number(latched) });
     terminal(ctx, `gateway closed with code ${latched}`);
     return;
   }
 
-  // This process's environment is fixed now. Salted hash only: clo mode live compares it with .env.
-  store.setControl('gateway_key', process.env.OPENROUTER_API_KEY ? store.key(process.env.OPENROUTER_API_KEY) : 'none', 'start');
-  const recovered = store.recoverOnStart(started);
-  log('recovery', { count: recovered.crash_unknown + recovered.restart_dropped, reason: recovered.paid_paused ? 'crash_unsettled' : null });
-  store.janitor(started, getEffective().retention);
+  beginRun({ store, getEffective, log, started, key: process.env.OPENROUTER_API_KEY });
   const usage = await attachUsage(services);
 
   let exitRef = null;
   const dispatchTurn = trackRuns(createDispatcher({ rt, getCfg: () => ctx.cfg, account, getExit: () => exitRef, identity, usage, log }), ctx);
   const gate = createGate({ store, ledger, policy, getEffective, decide, dispatchTurn, log });
-
-  const downWatch = createDownWatch({ store, log });
-  let connectedNow = false;
+  const controls = startControls({ store, ledger, getEffective, log });
 
   // The host's view comes first: a locked database must not leave it believing an old state.
-  const onStatus = ({ connected, lastReadyAt, lastResumedAt, lastDisconnectCode, username }) => {
-    connectedNow = connected;
+  const onStatus = (state) => {
+    const { connected, lastReadyAt, lastResumedAt, lastDisconnectCode } = state;
     ctx.setStatus({
       ...ctx.getStatus(),
       connected,
       lastConnectedAt: lastResumedAt ?? lastReadyAt ?? undefined,
       lastDisconnect: lastDisconnectCode === null ? undefined : { at: Date.now(), status: lastDisconnectCode },
     });
-    try {
-      store.setControl('connected', connected ? 'true' : 'false', 'connection');
-      if (lastReadyAt) store.setControl('last_ready_at', lastReadyAt, 'connection');
-      if (username) store.setControl('ready_username', username, 'connection');
-    } catch {
-      log('status_error', { reason: 'connection' });
-    }
-    downWatch.check(connected);
+    controls.noteConnection(state);
   };
-
-  const beat = () => {
-    try {
-      store.setControl('heartbeat_at', Date.now(), 'heartbeat');
-    } catch {
-      log('heartbeat_error', {});
-    }
-  };
-  downWatch.begin(store.getControl('heartbeat_at'));
-  beat();
-  downWatch.check(false);
-  const heartbeat = setInterval(beat, HEARTBEAT_MS);
-  heartbeat.unref?.();
-  const downTimer = setInterval(() => downWatch.check(connectedNow), DOWN_CHECK_MS);
-  downTimer.unref?.();
-  const janitor = setInterval(() => {
-    try {
-      const eff = getEffective();
-      if (eff) store.janitor(Date.now(), eff.retention);
-    } catch {
-      log('janitor_error', {});
-    }
-  }, JANITOR_MS);
-  janitor.unref?.();
-  ledger.startTimers();
 
   ctx.setStatus({ ...ctx.getStatus(), running: true, connected: false, lastStartAt: started, terminalDisconnect: false, lastError: null, busy: false, activeRuns: 0, activeRunStartedAt: null });
 
-  const takeRestartSlot = () => {
-    const at = Date.now();
-    return store.bumpCounter(`conn_restart:${utcDay(at)}`, at + 2 * 86400000, LIVENESS_RESTARTS_PER_DAY).ok;
-  };
-  // Every step runs, whatever the one before it did: the caller still has to report terminal to the host.
-  const stopAll = async () => {
-    clearInterval(heartbeat);
-    clearInterval(janitor);
-    clearInterval(downTimer);
-    try {
-      exitRef?.stop();
-      await gate.stop();
-    } catch {
-      log('status_error', { reason: 'stop' });
-    }
-    try {
-      store.setControl('connected', 'false', 'connection');
-    } catch {
-      log('status_error', { reason: 'connection' });
-    }
-    try {
-      stopServices();
-    } catch {
-      log('status_error', { reason: 'services' });
-    }
-  };
-  const alertQuietly = (kind, detail) => {
-    try {
-      store.addAlert(kind, detail);
-    } catch {
-      log('status_error', { reason: 'alert' });
-    }
-  };
-
-  try {
-    await runConnection({
-      account,
-      abortSignal: ctx.abortSignal,
-      onInbound: (evt) => gate.onInbound(evt),
-      exitDeps: { store, policy, getEffective, secrets: liveSecrets, log },
-      onExit: (exit) => {
-        exitRef = exit;
-        gate.attachExit(exit);
-      },
-      onStatus,
-      onAlert: alertQuietly,
-      takeRestartSlot,
-      log,
-      userAgent: USER_AGENT,
-    });
-  } catch (err) {
-    // A fatal close stays stopped. The code is quoted as is; the cause is not inferred.
-    if (typeof err?.closeCode === 'number') {
-      const savedToFile = saveCloseFile(dbPath, err.closeCode);
-      try {
-        store.setControl('terminal_close', err.closeCode, 'connection');
-        if (savedToFile) dropCloseFile(dbPath);
-      } catch {
-        log('status_error', { reason: 'terminal_close' });
-        if (!savedToFile) unsavedClose = err.closeCode;
-      }
-      alertQuietly('terminal_close', { closeCode: err.closeCode });
-      log('connection_fatal', { closeCode: err.closeCode });
-      await stopAll();
-      terminal(ctx, `gateway closed with code ${err.closeCode}`);
-      return;
-    }
-    log('connection_error', { kind: String(err?.name ?? 'Error').slice(0, 32) });
-    alertQuietly('connection_failed', { kind: String(err?.name ?? 'Error').slice(0, 32) });
-    await stopAll();
+  const result = await connectAccount({
+    account,
+    abortSignal: ctx.abortSignal,
+    gate,
+    exitDeps: { store, policy, getEffective, secrets: liveSecrets, log },
+    onExit: (exit) => {
+      exitRef = exit;
+    },
+    onStatus,
+    store,
+    log,
+    dbPath,
+    userAgent: USER_AGENT,
+  });
+  // The host still has to hear terminal once everything has stopped.
+  await stopRun({ controls, getExit: () => exitRef, gate, store, log, closeServices: stopServices });
+  if (result.outcome === 'fatal') {
+    terminal(ctx, `gateway closed with code ${result.closeCode}`);
+    return;
+  }
+  if (result.outcome === 'failed') {
     terminal(ctx, 'connection failed');
     return;
   }
-  await stopAll();
   ctx.setStatus({ ...ctx.getStatus(), running: false, connected: false, lastStopAt: Date.now() });
 }
 

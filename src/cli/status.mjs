@@ -1,9 +1,10 @@
 // Status report for the console. No cost or ID leaves this machine through it; IDs are masked here too.
 import { existsSync } from 'node:fs';
+import { runtimeOf } from '../clo-plugin/lib/core/config.js';
 import { isQuietHours, shanghaiDay } from '../clo-plugin/lib/core/ids.js';
 import { openStore } from '../clo-plugin/lib/core/store.js';
 import { maskId, readConfig, readEffective } from './common.mjs';
-import { inspectGateway } from './lifecycle.mjs';
+import { inspectGateway, recordRuntime, RUNTIME_LABEL } from './lifecycle.mjs';
 
 const HEARTBEAT_FRESH_MS = 90000;
 
@@ -27,6 +28,9 @@ export function collectStatus(ctx) {
     configError,
     mode: cfg?.mode ?? null,
     effectiveMode: effective?.mode ?? null,
+    // What the next start runs, and what the PID record says is running. They differ until a stop and a start.
+    runtime: cfg ? runtimeOf(cfg) : runtimeOf(effective),
+    pidRuntime: gateway.record ? recordRuntime(gateway.record) : null,
     qqEnabled: cfg?.qq?.enabled ?? false,
     appIdMasked: cfg?.qq?.appId ? maskId(cfg.qq.appId) : null,
     identityConfirmed: Boolean(cfg?.qq?.appId) && cfg?.acks?.identityConfirmedAppId === cfg?.qq?.appId,
@@ -80,7 +84,9 @@ export function formatStatus(s) {
   lines.push(`QQ：${s.qqEnabled ? '启用' : '关闭'}，AppID ${s.appIdMasked ?? '未填'}，身份已确认：${yn(s.identityConfirmed)}${s.db?.readyUsername ? `，READY 用户名：${s.db.readyUsername}` : ''}`);
   lines.push(`D3：${s.d3Recorded ? '已记录' : '未记录，live 会被拒绝'}`);
   const pidText = { none: '没有 PID 文件', gone: '记录的进程已不在', mismatch: 'PID 已被其他进程占用', unknown: '查不到进程状态，可能还在运行', running: `进程 ${s.pid} 在运行` }[s.pidState];
-  lines.push(`Gateway：${pidText}；心跳新鲜：${yn(s.heartbeatFresh)}；判定存活：${yn(s.alive)}`);
+  const label = RUNTIME_LABEL[s.pidRuntime ?? s.runtime] ?? 'Gateway';
+  lines.push(`${label}：${pidText}；心跳新鲜：${yn(s.heartbeatFresh)}；判定存活：${yn(s.alive)}`);
+  if (s.runtime === 'own' || s.pidRuntime === 'own') lines.push(`运行时：配置为 ${s.runtime}${s.pidRuntime && s.pidRuntime !== s.runtime ? `，记录的进程是 ${s.pidRuntime}，clo stop 再 clo start 才会切换` : ''}`);
   if (s.groups.length === 0) lines.push('群：无（空列表表示全部关闭）');
   for (const g of s.groups) {
     lines.push(`群 ${g.label}（${g.idMasked}）：暂停 ${yn(g.paused)}，插话 ${yn(g.interject)}，点名 ${yn(g.nameMention)}，显示名 ${yn(g.displayNames)}，已告知 ${yn(g.noticeGiven)}，owner ${g.owners} 人`);

@@ -149,6 +149,44 @@ export function gatewayArgs(paths, env, port) {
   return [...GATEWAY_NODE_FLAGS, `--import=${pathToFileURL(OUTPUT_FILTER).href}`, ...nodeImports(env), gatewayEntry(paths, env), 'gateway', 'run', '--port', String(port), '--bind', 'loopback'];
 }
 
+// --- The own runtime: src/bot/main.mjs on the private Node, with no host and no port. ---
+
+export const botEntry = (paths) => join(paths.repoRoot, 'src', 'bot', 'main.mjs');
+
+// The entry start runs. Only test mode can point it elsewhere, as it can for the Gateway.
+export function ownEntry(paths, env) {
+  return isTestMode(env) && env.CLO_TEST_BOT_ENTRY ? resolve(env.CLO_TEST_BOT_ENTRY) : botEntry(paths);
+}
+
+// The Gateway's env, minus what only the host reads: its OPENCLAW_* settings and the control-port token. The key keeps
+// the name the Gateway gets. CLO_EFFECTIVE_PATH tells the bot which effective.json to read.
+export function ownEnv(paths, parentEnv, { secrets = {} } = {}) {
+  const env = gatewayEnv(paths, parentEnv, { secrets });
+  for (const k of Object.keys(env)) {
+    if (k.startsWith('OPENCLAW_')) delete env[k];
+  }
+  env.CLO_EFFECTIVE_PATH = paths.effectiveJson;
+  return env;
+}
+
+// Same as gatewayEnvForCheck, for the own runtime.
+export function ownEnvForCheck(paths, parentEnv) {
+  const secrets = Object.fromEntries(ENV_FILE_KEYS.map((k) => [k, 'check-only']));
+  return ownEnv(paths, parentEnv, { secrets });
+}
+
+// Node flags the bot must never get: a listening debugger, or a proxy taken from the environment.
+const OWN_FORBIDDEN_ARG = /^--(inspect|debug|use-env-proxy|port|bind)\b/;
+
+export function ownArgs(paths, env) {
+  return [...GATEWAY_NODE_FLAGS, ...nodeImports(env), ownEntry(paths, env)];
+}
+
+// Names only. The flags in ownArgs that would open a port or a proxy path. Empty is the only good answer.
+export function forbiddenOwnArgs(args) {
+  return args.filter((a) => OWN_FORBIDDEN_ARG.test(a));
+}
+
 // For commands that only read, such as plugins inspect: same isolation, no secrets.
 export function hostCliEnv(paths, parentEnv) {
   return gatewayEnv(paths, parentEnv);
@@ -273,12 +311,52 @@ export function requireSecrets(cfg, secrets, { renamed = [] } = {}) {
   if (missing.length) throw new CliError(`.env 缺少：${missing.join('、')}。${renamedKeyHint(renamed, missing)}`);
 }
 
+export const RUNTIME_LABEL = Object.freeze({ openclaw: 'Gateway', own: '可洛进程' });
+// A record written before the runtime switch was always the Gateway.
+export const recordRuntime = (record) => record?.runtime ?? 'openclaw';
+
+// A running process reads effective.json for each event, so a runtime switch written under it would run one runtime's
+// rules inside the other (the own reply hold is smaller than what a host turn can cost). Only a record that is proved
+// gone or reused lets the switch through. Nothing is looked up when there is no record or no switch.
+export function assertRuntimeSwitchAllowed(ctx, runtime) {
+  const record = readPidRecord(ctx.paths);
+  if (!record || recordRuntime(record) === runtime) return;
+  const { state } = inspectGateway(ctx.paths, ctx.env);
+  if (state === 'gone' || state === 'mismatch' || state === 'none') return;
+  const was = recordRuntime(record);
+  throw new CliError(`${RUNTIME_LABEL[was]}（${was} 运行时，进程 ${record.pid}）${state === 'running' ? '还在运行' : '可能还在运行'}，不能在它运行时把运行时换成 ${runtime}。先 clo stop，再 clo apply 或 clo start。`);
+}
+
 export async function startGateway(ctx, cfg, { secrets, lookup = processInfo }) {
   const { paths, env } = ctx;
   const port = cfg.gatewayPort ?? DEFAULT_PORT;
   if (!(await portFree(port))) throw new CliError(`端口 ${port} 已被占用。没有动占用它的进程；请改 gatewayPort 或先结束它。`);
-
   const token = ensureGatewayToken(paths);
+  return spawnRecorded(ctx, { runtime: 'openclaw', args: gatewayArgs(paths, env, port), childEnv: gatewayEnv(paths, env, { secrets, token }), port, lookup });
+}
+
+// The own runtime listens on no port. The Gateway's port is still checked: something on it is most likely a Gateway
+// this project did not record, which would be a second consumer of the same AppID.
+export async function startOwn(ctx, cfg, { secrets, lookup = processInfo }) {
+  const { paths, env } = ctx;
+  const port = cfg.gatewayPort ?? DEFAULT_PORT;
+  if (!(await portFree(port))) {
+    throw new CliError(`端口 ${port} 有程序在监听，可能是没有记录的 OpenClaw Gateway。同一个 AppID 只能有一个消费者，没有启动。没有动占用它的进程；确认它不是 Gateway 后，改 gatewayPort 或先结束它。`);
+  }
+  const args = ownArgs(paths, env);
+  const bad = forbiddenOwnArgs(args);
+  if (bad.length) throw new CliError(`可洛进程的启动参数含有不允许的选项：${bad.join('、')}。没有启动。`);
+  if (!existsSync(ownEntry(paths, env))) throw new CliError('没有 src/bot/main.mjs，不能用 own 运行时启动。');
+  return spawnRecorded(ctx, { runtime: 'own', args, childEnv: ownEnv(paths, env, { secrets }), port: null, lookup });
+}
+
+export function startRuntime(ctx, cfg, opts) {
+  return (cfg.runtime ?? 'openclaw') === 'own' ? startOwn(ctx, cfg, opts) : startGateway(ctx, cfg, opts);
+}
+
+async function spawnRecorded(ctx, { runtime, args, childEnv, port, lookup }) {
+  const { paths, env } = ctx;
+  const label = RUNTIME_LABEL[runtime];
   for (const d of [paths.logsDir, dirname(paths.pidFile), paths.gatewayCwd, join(paths.runtime, 'temp'), join(paths.runtime, 'appdata', 'Roaming'), join(paths.runtime, 'appdata', 'Local')]) {
     mkdirSync(d, { recursive: true });
   }
@@ -286,9 +364,9 @@ export async function startGateway(ctx, cfg, { secrets, lookup = processInfo }) 
   const logFd = openSync(paths.gatewayLog, 'a');
   let child;
   try {
-    child = spawn(privateNode(paths), gatewayArgs(paths, env, port), {
+    child = spawn(privateNode(paths), args, {
       cwd: paths.gatewayCwd,
-      env: gatewayEnv(paths, env, { secrets, token }),
+      env: childEnv,
       detached: true,
       windowsHide: true,
       stdio: ['ignore', logFd, logFd],
@@ -301,10 +379,10 @@ export async function startGateway(ctx, cfg, { secrets, lookup = processInfo }) 
   child.on('exit', (code) => { exited = { code }; });
   child.on('error', (e) => { spawnError = e; });
   await new Promise((r) => { setTimeout(r, EARLY_EXIT_WATCH_MS); });
-  if (spawnError) throw new CliError(`Gateway 启动失败：${spawnError.code ?? '未知错误'}`);
-  if (exited) throw new CliError(`Gateway 启动后立刻退出，退出码 ${exited.code}。详情见日志：${paths.gatewayLog}`);
+  if (spawnError) throw new CliError(`${label} 启动失败：${spawnError.code ?? '未知错误'}`);
+  if (exited) throw new CliError(`${label} 启动后立刻退出，退出码 ${exited.code}。详情见日志：${paths.gatewayLog}`);
 
-  // The child we spawned is the Gateway itself: the env above keeps the host from relaunching into a second process.
+  // The child we spawned is the process itself: for the Gateway, the env above keeps the host from relaunching.
   // With no PID record, nothing could stop it later. This is the child we just spawned, by its handle.
   // Unref too, or a child that survived the kill would hold this command open until it exits.
   const endChild = () => {
@@ -316,17 +394,17 @@ export async function startGateway(ctx, cfg, { secrets, lookup = processInfo }) 
   const readable = (i) => Boolean(i?.startTime && i?.commandLine);
   let info = null;
   for (let i = 0; i < START_LOOKUP_TRIES && !readable(info); i += 1) info = lookup(child.pid, env);
-  if (!readable(info)) throw new CliError(`读不到 Gateway 进程信息，无法记录 PID，${endChild()}`);
+  if (!readable(info)) throw new CliError(`读不到 ${label} 进程信息，无法记录 PID，${endChild()}`);
   try {
     writeAtomic(paths.pidFile, `${JSON.stringify({
-      pid: child.pid, startTime: info.startTime, commandDigest: digestOf(info.commandLine), port, startedAt: new Date(ctx.now()).toISOString(),
+      pid: child.pid, startTime: info.startTime, commandDigest: digestOf(info.commandLine), port, runtime, startedAt: new Date(ctx.now()).toISOString(),
     }, null, 2)}\n`);
   } catch (e) {
     throw new CliError(`写不进 PID 文件（${e.code ?? '未知错误'}），${endChild()}`);
   }
   child.unref();
-  ctx.log('gateway_started', { count: child.pid });
-  return { pid: child.pid, port };
+  ctx.log('gateway_started', { count: child.pid, kind: runtime });
+  return { pid: child.pid, port, runtime };
 }
 
 const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
@@ -467,6 +545,6 @@ export function stopGateway(ctx) {
   spawnSync(systemExe(env, 'taskkill.exe'), ['/PID', String(record.pid), '/T', '/F'], { env: osToolEnv(env), windowsHide: true });
   if (!waitForGone(record.pid, env)) throw new CliError(`进程 ${record.pid} 没有退出。PID 文件保留，可以再试一次。`);
   rmSync(paths.pidFile, { force: true });
-  ctx.log('gateway_stopped', { count: record.pid });
-  return { stopped: true, pid: record.pid };
+  ctx.log('gateway_stopped', { count: record.pid, kind: recordRuntime(record) });
+  return { stopped: true, pid: record.pid, runtime: recordRuntime(record) };
 }

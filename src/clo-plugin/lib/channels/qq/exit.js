@@ -68,7 +68,11 @@ export function classifySendError(err) {
   return { qqCode, httpStatus };
 }
 
-export function createExit({ bot, store, policy, getEffective, secrets = [], log = () => {}, now = Date.now, appId = null, sleep = realSleep }) {
+export function createExit({ bot, store, policy, getEffective, secrets = [], log = () => {}, now = Date.now, appId = null, sleep = realSleep, runtime = 'openclaw' }) {
+  if (runtime !== 'openclaw' && runtime !== 'own') throw new TypeError('createExit: runtime must be openclaw or own');
+  // Fixed when the process builds it, never read from the effective file: a clo apply under a running process must not
+  // switch it halfway, so the host process keeps its notice filter whatever the file says.
+  const own = runtime === 'own';
   const turns = new Map();
   const wakers = new Set();
   let stopped = false;
@@ -447,8 +451,9 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
     return insertParts(ref, 'reply_url_stripped', parts, getEffective());
   }
 
-  // Steps 8 and 9, with one URL-free resend for 40054010.
-  async function deliver(turn, firstParts, kind, eff, ownerStopped) {
+  // Steps 8 and 9, with one URL-free resend for 40054010. posted collects each part that reached the group or may have:
+  // sent, or uncertain. A part refused for its content, or one never sent, is not in it.
+  async function deliver(turn, firstParts, kind, eff, ownerStopped, posted = []) {
     const ref = refOf(turn);
     let parts = firstParts;
     let urlsRemoved = false;
@@ -471,6 +476,7 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
       }
       // Nobody asked for an interjection, and one that arrives 45 s late has missed the conversation.
       const result = await postPart(ref, rows[i], parts[i], { connectAttempts: turn.required ? SEND_CONNECT_ATTEMPTS : 1, ownerStopped });
+      if (result.ok || result.action === 'continue' || result.reason === 'send_uncertain') posted.push(parts[i]);
       if (result.ok || result.action === 'continue') continue;
       abortRest(rows, i + 1);
       if (result.action === 'url_refused') {
@@ -538,6 +544,12 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
       const body = typeof text === 'string' ? text.trim() : '';
       if (!body || SILENT.test(body)) return suppressed('silent');
       if (t.turn.cls === 'command') return suppressed('command');
+      // With no host there are no host notices: what arrives here is the model's text, and the checks below still apply.
+      if (own) {
+        t.buffer.push(body);
+        log('exit_collect', { eventKey: t.turn.eventKey, count: t.buffer.length });
+        return { messageIds: [], visibleReplySent: true };
+      }
       const kept = isHostNotice(body) ? '' : withoutHostNotices(body);
       if (kept !== body) {
         t.hostError = true;
@@ -589,7 +601,11 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
         ? splitParts(plain, eff.qq.maxPartChars, maxParts)
         : clipToSentence(plain, Math.min(eff.qq.interjectMaxChars, eff.qq.maxPartChars));
       if (parts.length === 0) return finishEmpty(t, failed);
-      return deliver(turn, parts, 'reply', eff, ownerStopped);
+      if (!own) return deliver(turn, parts, 'reply', eff, ownerStopped);
+      // The own runtime keeps her posted words in the group's memory ring, so the gate is told which ones went out.
+      const posted = [];
+      const out = await deliver(turn, parts, 'reply', eff, ownerStopped, posted);
+      return posted.length > 0 ? { ...out, posted } : out;
     },
 
     sendFixed,

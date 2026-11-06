@@ -12,10 +12,12 @@
 
 阶段编号、哪些在真实环境验证过、哪些只在模拟环境验证过，见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
+**过渡期：两套运行时。** 用户已决定去掉 OpenClaw。项目自己的运行时已经写好，放在配置项 `runtime: "own"` 后面，**默认仍是 `openclaw`，现在跑的也是它，上面这些真实记录都是在 OpenClaw 上得到的**。新运行时在真实 QQ 上的验收一项都没有做，只有离线测试（mock QQ、mock 模型）。这份 README 写的都是 openclaw 路线，另有说明的除外。怎么切换、怎么回退、改了什么，见 [docs/own-runtime.md](docs/own-runtime.md)。
+
 ## 你需要准备什么
 
 - **Windows x64 和 PowerShell 7。** `setup.ps1` 用到了 Windows PowerShell 5.1 没有的参数。项目自带私有 Node，不用系统 Node，也不改 PATH。
-- **够用的内存。** 离线测试（Windows，mock QQ，mock 模型）里，Gateway 空闲约 750–850 MB，跑过一个回合后约 1.2–1.4 GB，几乎都是 OpenClaw 宿主本身。放到 VPS 上至少要 2 GB，4 GB 更稳妥。Linux 上的数字没有量过，真实 QQ 和真实模型下也没有量过。详见 [DEPLOYMENT.md](DEPLOYMENT.md) 的“内存”。
+- **够用的内存。** 离线测试（Windows，mock QQ，mock 模型）里，Gateway 空闲约 750–850 MB，跑过一个回合后约 1.2–1.4 GB，几乎都是 OpenClaw 宿主本身。放到 VPS 上至少要 2 GB，4 GB 更稳妥。Linux 上的数字没有量过，真实 QQ 和真实模型下也没有量过。详见 [DEPLOYMENT.md](DEPLOYMENT.md) 的“内存”。新运行时（`runtime: "own"`）在同样的离线条件下约 75–85 MB 工作集，一次样本，见 [docs/own-runtime.md](docs/own-runtime.md)。
 - **你自己注册的 QQ 机器人。** 到 [q.qq.com](https://q.qq.com) 用单独的 QQ 号创建，这个项目不提供账号。个人认证、模型信息这些由平台要求，如实填写。注册后拿到 AppID 和 AppSecret。IP 白名单留空。换号不保证隔离风险。
 - **一个你能管理的小测试群。** 不要先用真实的群。群主要愿意打开下面说的权限。
 - **一个 OpenRouter Key，带每日限额。** 给这个项目单独建一个 Key，在 OpenRouter 上设每日限额（`limit_reset` 为 daily）。没有每日限额不能进入 live。
@@ -236,7 +238,7 @@ Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度�
 - 本地数字是估算，真实费用以 OpenRouter 账单为准。对账差额过大或读不到 Key 时，付费自动暂停。
 - 实际花费的小样本：测试群 18 次 @ 回复共 $0.2382，平均 $0.0132。没命中缓存的约 $0.03–$0.04，命中的约 $0.005–$0.012。改人设后下一条总是没命中缓存。会话越长越贵，每个会话最多只测到 8 轮，也没有遇到压缩。插话冷却 8 分钟比缓存的 5 分钟长，所以插话通常没有缓存，一次约 $0.04。这些样本很少，不能当预算依据。
 
-另有一个可选的付费探测工具，用来量真实的 token、费用和对账延迟：最坏 $1.5470，最多 9 次模型调用。用法和约束见 [DEPLOYMENT.md](DEPLOYMENT.md) 的“付费探测工具”。
+另有一个可选的付费探测工具，用来量真实的 token、费用和对账延迟：最坏 $1.5484，最多 9 次模型调用。用法和约束见 [DEPLOYMENT.md](DEPLOYMENT.md) 的“付费探测工具”。
 
 ## 数据和隐私
 
@@ -256,6 +258,8 @@ Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度�
 | `.runtime/temp/openclaw/*.log` | 宿主文件日志。`silent` 时不写 | 由宿主管理 |
 | OpenClaw 会话库（`.runtime/state/agents/main/agent/openclaw-agent.sqlite`） | **被派发的回合正文在这里，模型的思考文字、每回合的提示词副本和全文搜索索引也在这里，模型服务方的错误原文也在这里，包括审核返回的 `flagged_input`** | 由宿主管理，这一版**没有**删除接口，`/new` 也不会删除旧内容（Q6 核对过） |
 | OpenRouter、模型提供方 | 收到的消息。开了显示名开关的群，主模型（Opus）的回答请求还带当前发言人和近期发言人的显示名；判定模型（Haiku）只收代号 | 以它们的政策为准，本项目控制不了 |
+
+**换到自己的运行时，这张表还不能改。** 按代码，`runtime: "own"` 下没有 OpenClaw 会话库，也不访问 `clawhub.ai`，她的回复只在内存里；但这只在离线测试里看过，真实运行里还没有确认，以前跑出来的会话库也不会因为切换而删除。所以上面的会话库和 `clawhub.ai` 两条照样成立，告知草稿也不改。见 [docs/own-runtime.md](docs/own-runtime.md)。
 
 **没有实现按成员删除数据的功能（随记忆一起推迟）。** 规则 5.10 的删除请求现在无法完整满足，这是已知缺口。
 
@@ -292,6 +296,8 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
                目标校验、内容规则、限额，然后才发到 QQ
 ```
 
+上图是默认的 openclaw 路线。`runtime: "own"` 时中间那一段换成 `src/bot/main.mjs` 一个进程：gate 直接把回合交给 `src/clo-plugin/lib/core/turn.js`，每回合一次 OpenRouter 请求，没有工具，不监听端口；连接、gate、出口、账本和内容策略是同一份代码。见 [docs/own-runtime.md](docs/own-runtime.md)。
+
 控制台在 `src/cli/`，运行状态都在项目的 `.runtime/` 里，不碰默认的 OpenClaw 目录。设计细节见 [docs/group-chat-design.md](docs/group-chat-design.md)。
 
 **为什么用 WebSocket，不用 Webhook。** 机器人主动连出去，只需要出站网络，不用开入站端口、域名和 HTTPS，放到远程服务器上也一样。Webhook 的好处主要是 Serverless 和多副本，而这里每个 AppID 只能有一个实例，用不上。换成 Webhook 还会失去 4914、4915 这类停止信号、连接健康判断和 READY 带来的身份确认，这些都要重新设计；SDK 自带的 Webhook 接收层也要先过安全审查才能对公网开放。原因和没确认的部分见 `DECISIONS.md`。
@@ -316,7 +322,10 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 .\.runtime\node\node.exe --test --test-concurrency=1 tests/unit/*.test.mjs
 .\.runtime\node\node.exe --test --test-concurrency=1 tests/seam/*.test.mjs
 .\.runtime\node\node.exe --test --test-concurrency=1 tests/e2e/*.test.mjs   # 真实 Gateway，一个文件一个文件跑
+.\.runtime\node\node.exe --test --test-concurrency=1 tests/e2e-own/<文件>.test.mjs   # 自己的运行时，一个文件一个文件跑
 ```
+
+`tests/e2e-own/` 启动真实的 `src/bot/main.mjs`，QQ 和模型同样是 mock。它和 `tests/e2e/` 怎么一一对应，见 [docs/own-runtime.md](docs/own-runtime.md) 的“测试对照”。
 
 单元和接缝要几分钟，机器忙时更久，没有可靠的时长记录。e2e 串行有记录的一次约 88 分钟。这些测试证明的是接线，不是平台行为。最近的结果和没跑的部分见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
@@ -358,6 +367,7 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 | [DEPLOYMENT.md](DEPLOYMENT.md) | 现状、在哪里验证过、未解决事项、已知限制、付费探测工具 |
 | [DECISIONS.md](DECISIONS.md) | 决定和理由，平台实测得到的事实 |
 | [docs/group-chat-design.md](docs/group-chat-design.md) | 群聊部分的设计（英文） |
+| [docs/own-runtime.md](docs/own-runtime.md) | 自己的运行时：现状、切换和回退、改了什么、测试对照 |
 | [docs/q0a-guide.zh.md](docs/q0a-guide.zh.md) | 只监听、不回复的实测指引 |
 | [docs/wiring-trial.md](docs/wiring-trial.md) | 第一次离线接线试验的报告 |
 | [persona/](persona/) | 人设、内容范围、判定提示词、告知草稿 |

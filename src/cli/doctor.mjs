@@ -2,13 +2,14 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { runtimeOf } from '../clo-plugin/lib/core/config.js';
 import { checkSentinels, sha256Hex } from '../clo-plugin/lib/core/contentPolicy.js';
 import { extractPolicySection } from '../clo-plugin/lib/core/render.js';
 import { SCHEMA_VERSION } from '../clo-plugin/lib/core/store.js';
 import { isTestMode, readConfig, readVersionsLock, renderAll } from './common.mjs';
-import { duplicateLinesHint, ensureGatewayEnvClean, gatewayEnvForCheck, hostCliEnv, inspectArgs, oldLinesHint, parseEnvFile, privateNode, renamedEnvNames, requireSecrets } from './lifecycle.mjs';
+import { duplicateLinesHint, ensureGatewayEnvClean, forbiddenOwnArgs, gatewayEnvForCheck, hostCliEnv, inspectArgs, oldLinesHint, ownArgs, ownEntry, ownEnvForCheck, parseEnvFile, privateNode, renamedEnvNames, requireSecrets } from './lifecycle.mjs';
 
 const FORBIDDEN = ['@tencent-connect/openclaw-qqbot', '@openclaw/qqbot', '@agent-wechat/agent-wechat', '@tencent-weixin/openclaw-weixin'];
 const FORBIDDEN_DIR = /qqbot|agent-wechat|openclaw-weixin/i;
@@ -19,6 +20,9 @@ const DEFAULT_BOOTSTRAP_TOTAL = 60000;
 const CLOUD_DIR = /(^|[\\/])(OneDrive[^\\/]*|Dropbox|Google Drive|GoogleDrive|iCloud ?Drive|iCloudDrive|Box Sync|坚果云|Nutstore|百度网盘同步盘|BaiduSyncdisk|腾讯微云|WeDrive)([\\/]|$)/i;
 const GITIGNORED = ['.env', 'config.json', '.runtime/'];
 const PROXY_KEY = /proxy/i;
+// A server or a listening socket in the bot's own files. The bot only connects out.
+const LISTEN_CALL = /\bcreateServer\s*\(|\.listen\s*\(/;
+const HOST_PACKAGES = ['openclaw', '@openclaw/perplexity-plugin'];
 
 export const CONFIG_LEVEL = 'config';
 export const FULL_LEVEL = 'full';
@@ -110,10 +114,16 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
     fresh = renderAll(ctx, cfg);
     return true;
   });
-  attempt('openclaw_json', () => {
-    onDisk = readJson(paths.openclawJson);
-    return true;
-  });
+  // The runtime the next start runs. An unreadable config already fails config_valid; the default is then checked.
+  const runtime = runtimeOf(cfg);
+  const host = runtime === 'openclaw';
+  // The own runtime has no host config, so nothing below may need openclaw.json, and none of the host checks run.
+  if (host) {
+    attempt('openclaw_json', () => {
+      onDisk = readJson(paths.openclawJson);
+      return true;
+    });
+  }
 
   const defaults = onDisk?.agents?.defaults ?? {};
   const overrides = agentOverrides(onDisk);
@@ -140,11 +150,9 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
     const sdkRoot = packageRoots?.[0] ?? paths.repoRoot;
     const bad = [];
     if (process.versions.node !== lock.node?.version) bad.push('node');
-    for (const [name, root, file] of [
-      ['@tencent-connect/qqbot-nodejs', sdkRoot, repoLock],
-      ['openclaw', pkgRoot, runtimeLock],
-      ['@openclaw/perplexity-plugin', pkgRoot, runtimeLock],
-    ]) {
+    // The own runtime runs on the locked Node and the SDK only. The host packages are checked while they can run.
+    const packages = [['@tencent-connect/qqbot-nodejs', sdkRoot, repoLock], ...(host ? HOST_PACKAGES.map((n) => [n, pkgRoot, runtimeLock]) : [])];
+    for (const [name, root, file] of packages) {
       const want = lock.npm?.[name];
       if (!want || installedVersion(root, name) !== want.version || lockedIntegrity(file, name) !== want.integrity) bad.push(name);
     }
@@ -156,54 +164,69 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
     return resolve(process.execPath).toLowerCase() === want || '没有用项目私有 Node 运行';
   });
 
-  attempt('conversation_access', () => bothCfg(() => onDisk.plugins?.entries?.clo?.hooks?.allowConversationAccess === true
-    || 'plugins.entries.clo.hooks.allowConversationAccess 不是 true，before_agent_run 不会生效'));
-  attempt('skip_bootstrap', () => bothCfg(() => defaults.skipBootstrap === true || 'agents.defaults.skipBootstrap 不是 true'));
-  attempt('context_injection', () => bothCfg(() => {
-    const values = [defaults.contextInjection, ...overrides.map((a) => a.contextInjection)];
-    return values.some((v) => BAD_INJECTION.has(v)) ? 'contextInjection 会去掉 AGENTS.md（含 agents.entries、agents.list 的覆盖）' : true;
-  }));
-  attempt('bootstrap_limits', () => bothCfg(() => {
-    const maxes = [defaults.bootstrapMaxChars ?? DEFAULT_BOOTSTRAP_MAX, ...overrides.map((a) => a.bootstrapMaxChars).filter(Number.isFinite)];
-    const totals = [defaults.bootstrapTotalMaxChars ?? DEFAULT_BOOTSTRAP_TOTAL, ...overrides.map((a) => a.bootstrapTotalMaxChars).filter(Number.isFinite)];
-    const sizes = ['AGENTS.md', 'SOUL.md', 'IDENTITY.md'].map((f) => readFileSync(join(paths.workspace, f), 'utf8').length);
-    if (sizes[0] > Math.min(...maxes)) return `AGENTS.md 有 ${sizes[0]} 字符，超过 bootstrapMaxChars ${Math.min(...maxes)}，策略可能被截断`;
-    const total = sizes.reduce((a, b) => a + b, 0);
-    if (total > Math.min(...totals)) return `工作区文件共 ${total} 字符，超过 bootstrapTotalMaxChars ${Math.min(...totals)}`;
-    return { ok: true, detail: `AGENTS.md ${sizes[0]} 字符` };
-  }));
-  attempt('node_turn', () => bothCfg(() => onDisk.nodeHost?.workerRuns?.enabled !== true || 'nodeHost.workerRuns 开着，回合可能走 node turn'));
-  attempt('tools_policy', () => bothCfg(() => {
-    const t = onDisk.tools ?? {};
-    if (!Array.isArray(t.allow) || t.allow.length === 0) return 'tools.allow 为空';
-    if (t.toolSearch !== false) return 'tools.toolSearch 不是 false';
-    if ((t.deny ?? []).some((d) => String(d).startsWith('group:'))) return 'tools.deny 含 group:*，每个回合都会失败';
-    if (!(t.deny ?? []).includes('message')) return 'tools.deny 没有 message';
-    return true;
-  }));
-  attempt('silent_reply', () => bothCfg(() => defaults.silentReply?.group === 'allow' || 'silentReply.group 不是 allow'));
-  attempt('dm_scope', () => bothCfg(() => onDisk.session?.dmScope === 'per-channel-peer' || 'session.dmScope 不是 per-channel-peer'));
-  attempt('no_fallback_model', () => bothCfg(() => (defaults.model?.fallbacks ?? []).length === 0 || 'agents.defaults.model.fallbacks 不为空'));
+  if (host) {
+    attempt('conversation_access', () => bothCfg(() => onDisk.plugins?.entries?.clo?.hooks?.allowConversationAccess === true
+      || 'plugins.entries.clo.hooks.allowConversationAccess 不是 true，before_agent_run 不会生效'));
+    attempt('skip_bootstrap', () => bothCfg(() => defaults.skipBootstrap === true || 'agents.defaults.skipBootstrap 不是 true'));
+    attempt('context_injection', () => bothCfg(() => {
+      const values = [defaults.contextInjection, ...overrides.map((a) => a.contextInjection)];
+      return values.some((v) => BAD_INJECTION.has(v)) ? 'contextInjection 会去掉 AGENTS.md（含 agents.entries、agents.list 的覆盖）' : true;
+    }));
+    attempt('bootstrap_limits', () => bothCfg(() => {
+      const maxes = [defaults.bootstrapMaxChars ?? DEFAULT_BOOTSTRAP_MAX, ...overrides.map((a) => a.bootstrapMaxChars).filter(Number.isFinite)];
+      const totals = [defaults.bootstrapTotalMaxChars ?? DEFAULT_BOOTSTRAP_TOTAL, ...overrides.map((a) => a.bootstrapTotalMaxChars).filter(Number.isFinite)];
+      const sizes = ['AGENTS.md', 'SOUL.md', 'IDENTITY.md'].map((f) => readFileSync(join(paths.workspace, f), 'utf8').length);
+      if (sizes[0] > Math.min(...maxes)) return `AGENTS.md 有 ${sizes[0]} 字符，超过 bootstrapMaxChars ${Math.min(...maxes)}，策略可能被截断`;
+      const total = sizes.reduce((a, b) => a + b, 0);
+      if (total > Math.min(...totals)) return `工作区文件共 ${total} 字符，超过 bootstrapTotalMaxChars ${Math.min(...totals)}`;
+      return { ok: true, detail: `AGENTS.md ${sizes[0]} 字符` };
+    }));
+    attempt('node_turn', () => bothCfg(() => onDisk.nodeHost?.workerRuns?.enabled !== true || 'nodeHost.workerRuns 开着，回合可能走 node turn'));
+    attempt('tools_policy', () => bothCfg(() => {
+      const t = onDisk.tools ?? {};
+      if (!Array.isArray(t.allow) || t.allow.length === 0) return 'tools.allow 为空';
+      if (t.toolSearch !== false) return 'tools.toolSearch 不是 false';
+      if ((t.deny ?? []).some((d) => String(d).startsWith('group:'))) return 'tools.deny 含 group:*，每个回合都会失败';
+      if (!(t.deny ?? []).includes('message')) return 'tools.deny 没有 message';
+      return true;
+    }));
+    attempt('silent_reply', () => bothCfg(() => defaults.silentReply?.group === 'allow' || 'silentReply.group 不是 allow'));
+    attempt('dm_scope', () => bothCfg(() => onDisk.session?.dmScope === 'per-channel-peer' || 'session.dmScope 不是 per-channel-peer'));
+    attempt('no_fallback_model', () => bothCfg(() => (defaults.model?.fallbacks ?? []).length === 0 || 'agents.defaults.model.fallbacks 不为空'));
+  }
 
-  attempt('policy_section', () => {
-    const policyFile = fresh?.effective.contentPolicy.policyFile;
-    if (!policyFile) return '没有配置';
-    const agents = readFileSync(join(paths.workspace, 'AGENTS.md'), 'utf8');
-    const section = extractPolicySection(agents, fresh.effective.contentPolicy.version);
-    if (section === null) return 'AGENTS.md 里没有完整的内容策略段';
-    return sha256Hex(section) === sha256Hex(readFileSync(policyFile)) || 'AGENTS.md 的策略段与 CONTENT-POLICY.md 不一致';
-  });
-  attempt('persona_hashes', () => {
-    if (!fresh) return '没有配置';
-    for (const [name, text] of Object.entries(fresh.workspace.files)) {
-      if (readFileSync(join(paths.workspace, name), 'utf8') !== text) return `${name} 与 persona 渲染结果不一致，运行 clo apply`;
-    }
-    if (existsSync(join(paths.workspace, 'BOOTSTRAP.md'))) return '工作区里有 BOOTSTRAP.md';
-    const prompt = readFileSync(paths.systemPromptFile, 'utf8');
-    if (prompt !== fresh.workspace.systemPrompt) return 'system-prompt.md 与渲染结果不一致，运行 clo apply';
-    const s = checkSentinels(prompt, fresh.effective.contentPolicy.version);
-    return s.ok || `system-prompt.md 的策略标记：${s.reason}`;
-  });
+  if (host) {
+    attempt('policy_section', () => {
+      const policyFile = fresh?.effective.contentPolicy.policyFile;
+      if (!policyFile) return '没有配置';
+      const agents = readFileSync(join(paths.workspace, 'AGENTS.md'), 'utf8');
+      const section = extractPolicySection(agents, fresh.effective.contentPolicy.version);
+      if (section === null) return 'AGENTS.md 里没有完整的内容策略段';
+      return sha256Hex(section) === sha256Hex(readFileSync(policyFile)) || 'AGENTS.md 的策略段与 CONTENT-POLICY.md 不一致';
+    });
+    attempt('persona_hashes', () => {
+      if (!fresh) return '没有配置';
+      for (const [name, text] of Object.entries(fresh.workspace.files)) {
+        if (readFileSync(join(paths.workspace, name), 'utf8') !== text) return `${name} 与 persona 渲染结果不一致，运行 clo apply`;
+      }
+      if (existsSync(join(paths.workspace, 'BOOTSTRAP.md'))) return '工作区里有 BOOTSTRAP.md';
+      const prompt = readFileSync(paths.systemPromptFile, 'utf8');
+      if (prompt !== fresh.workspace.systemPrompt) return 'system-prompt.md 与渲染结果不一致，运行 clo apply';
+      const s = checkSentinels(prompt, fresh.effective.contentPolicy.version);
+      return s.ok || `system-prompt.md 的策略标记：${s.reason}`;
+    });
+  } else {
+    // The bot sends this file as the system block, so it is checked whole and by its markers.
+    attempt('system_prompt', () => {
+      if (!fresh) return '没有配置';
+      const prompt = readFileSync(paths.systemPromptFile, 'utf8');
+      if (prompt !== fresh.workspace.systemPrompt) return 'system-prompt.md 与渲染结果不一致，运行 clo apply';
+      const section = extractPolicySection(prompt, fresh.effective.contentPolicy.version);
+      if (section === null || sha256Hex(section) !== sha256Hex(readFileSync(fresh.effective.contentPolicy.policyFile))) return 'system-prompt.md 的策略段与 CONTENT-POLICY.md 不一致';
+      const s = checkSentinels(prompt, fresh.effective.contentPolicy.version);
+      return s.ok || `system-prompt.md 的策略标记：${s.reason}`;
+    });
+  }
   attempt('claude_md_baseline', () => {
     const bytes = readFileSync(join(paths.repoRoot, 'CLAUDE.md'));
     const start = bytes.indexOf(Buffer.from('### 7.1 '));
@@ -212,14 +235,20 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
     const want = readFileSync(join(paths.repoRoot, 'tests', 'fixtures', 'claude-md-7x.sha256'), 'utf8').trim();
     return createHash('sha256').update(bytes.subarray(start, end)).digest('hex') === want || 'CLAUDE.md §7.1–7.5 与基线不一致';
   });
-  attempt('render_fresh', () => {
-    if (!fresh || !onDisk) return '没有配置';
-    return sameJson(fresh.openclaw, onDisk) || 'openclaw.json 与新渲染的结果不一致，不要手改；运行 clo apply';
-  });
+  if (host) {
+    attempt('render_fresh', () => {
+      if (!fresh || !onDisk) return '没有配置';
+      return sameJson(fresh.openclaw, onDisk) || 'openclaw.json 与新渲染的结果不一致，不要手改；运行 clo apply';
+    });
+  }
   attempt('effective_mode', () => {
     if (!cfg) return '没有配置';
     const e = readJson(paths.effectiveJson);
     return e.mode === cfg.mode || 'effective.json 的 mode 与 config.json 不一致，运行 clo apply';
+  });
+  attempt('effective_runtime', () => {
+    if (!cfg) return '没有配置';
+    return runtimeOf(readJson(paths.effectiveJson)) === runtime || 'effective.json 的 runtime 与 config.json 不一致，运行 clo apply';
   });
   attempt('db_version', () => {
     if (!existsSync(paths.db)) return { ok: true, detail: '数据库还没创建，首次启动时创建' };
@@ -238,14 +267,34 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
     if (!cfg) return '没有配置';
     return cfg.searchProvider === 'none' || 'searchProvider 必须是 none';
   });
-  attempt('gateway_env', () => {
-    const child = gatewayEnvForCheck(paths, env);
-    const bad = ensureGatewayEnvClean(child);
-    if (bad.length) return `Gateway 环境含有不该有的变量：${bad.join('、')}`;
-    // The host's openrouter provider and the plugin read this name.
-    return Boolean(child.OPENROUTER_API_KEY) || 'Gateway 环境里没有 OPENROUTER_API_KEY 这个名字，Key 传不过去';
-  });
-  attempt('proxy_config', () => bothCfg(() => !hasKeyMatching(onDisk, PROXY_KEY) || 'openclaw.json 含 proxy 设置'));
+  if (host) {
+    attempt('gateway_env', () => {
+      const child = gatewayEnvForCheck(paths, env);
+      const bad = ensureGatewayEnvClean(child);
+      if (bad.length) return `Gateway 环境含有不该有的变量：${bad.join('、')}`;
+      // The host's openrouter provider and the plugin read this name.
+      return Boolean(child.OPENROUTER_API_KEY) || 'Gateway 环境里没有 OPENROUTER_API_KEY 这个名字，Key 传不过去';
+    });
+    attempt('proxy_config', () => bothCfg(() => !hasKeyMatching(onDisk, PROXY_KEY) || 'openclaw.json 含 proxy 设置'));
+  } else {
+    attempt('bot_env', () => {
+      const child = ownEnvForCheck(paths, env);
+      const bad = [...ensureGatewayEnvClean(child), ...Object.keys(child).filter((k) => k.startsWith('OPENCLAW_'))];
+      if (bad.length) return `可洛进程的环境含有不该有的变量：${bad.join('、')}`;
+      if (!child.OPENROUTER_API_KEY) return '可洛进程的环境里没有 OPENROUTER_API_KEY 这个名字，Key 传不过去';
+      return child.CLO_EFFECTIVE_PATH === paths.effectiveJson || '可洛进程的环境里 CLO_EFFECTIVE_PATH 不是这份 effective.json';
+    });
+    attempt('bot_entry', () => existsSync(ownEntry(paths, env)) || '没有 src/bot/main.mjs，own 运行时没有入口');
+    // Static, so it can run before start: no listening flag on the command line, no server call in the bot's files.
+    attempt('bot_no_listen', () => {
+      const bad = forbiddenOwnArgs(ownArgs(paths, env));
+      if (bad.length) return `启动参数含有会监听或走代理的选项：${bad.join('、')}`;
+      const dir = dirname(ownEntry(paths, env));
+      if (!existsSync(dir)) return '没有 src/bot/main.mjs，own 运行时没有入口';
+      const listening = readdirSync(dir).filter((n) => /\.(mjs|js)$/.test(n) && LISTEN_CALL.test(readFileSync(join(dir, n), 'utf8')));
+      return listening.length ? `这些文件会开监听端口：${listening.join('、')}` : true;
+    });
+  }
   attempt('live_gate', () => {
     if (!cfg) return '没有配置';
     if (cfg.mode !== 'live') return { ok: true, detail: '当前是 dry-run' };
@@ -271,14 +320,16 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
     // A leftover old line is ignored, whatever the mode. Say so, because it looks like it still does something.
     attempt('env_old_names', () => oldLinesHint(paths.envFile) || true, 'warn');
     attempt('env_duplicates', () => duplicateLinesHint(paths.envFile) || true, 'warn');
-    attempt('hook_registered', () => {
-      if (!statSync(paths.openclawJson, { throwIfNoEntry: false })) return '没有 openclaw.json';
-      return inspectHooks(ctx, { run });
-    });
+    if (host) {
+      attempt('hook_registered', () => {
+        if (!statSync(paths.openclawJson, { throwIfNoEntry: false })) return '没有 openclaw.json';
+        return inspectHooks(ctx, { run });
+      });
+    }
   }
 
   const failed = checks.filter((c) => !c.ok && c.severity === 'error');
-  return { ok: failed.length === 0, level, testMode: isTestMode(env), checks, failed: failed.map((c) => c.id) };
+  return { ok: failed.length === 0, level, runtime, testMode: isTestMode(env), checks, failed: failed.map((c) => c.id) };
 }
 
 export function formatDoctor(report) {

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { makeContext } from '../../src/cli/common.mjs';
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, inspectHooks, runDoctor } from '../../src/cli/doctor.mjs';
@@ -323,4 +323,107 @@ test('real host: with allowConversationAccess the hooks are registered; without 
 
 test('the project files doctor reads are there', () => {
   for (const p of ['CLAUDE.md', 'tests/fixtures/claude-md-7x.sha256', 'persona/CONTENT-POLICY.md', '.gitignore']) assert.ok(existsSync(join(ROOT, p)), p);
+});
+
+// --- The own runtime: no host config, and its own checks. ---
+
+const HOST_ONLY = ['openclaw_json', 'conversation_access', 'skip_bootstrap', 'context_injection', 'bootstrap_limits', 'node_turn', 'tools_policy', 'silent_reply', 'dm_scope', 'no_fallback_model', 'policy_section', 'persona_hashes', 'render_fresh', 'gateway_env', 'proxy_config', 'hook_registered'];
+const OWN_ONLY = ['system_prompt', 'bot_env', 'bot_entry', 'bot_no_listen'];
+
+async function preparedOwn(label) {
+  const root = await prepared(label, { ...enabledConfig(), runtime: 'own' });
+  const entry = join(root, 'bot', 'main.mjs');
+  mkdirSync(join(root, 'bot'), { recursive: true });
+  writeFileSync(entry, '// stand-in entry\n');
+  return { root, env: { CLO_TEST_BOT_ENTRY: entry }, entry };
+}
+const ids = (report) => report.checks.map((c) => c.id);
+
+test('own: a fresh install passes with no openclaw.json, runs none of the host checks and all of its own', async () => {
+  const { root, env } = await preparedOwn('own-clean');
+  assert.equal(existsSync(statePath(root)), false, 'apply wrote no host config');
+  const report = doctor(root, {}, env);
+  assert.deepEqual(report.failed, [], formatDoctor(report));
+  assert.equal(report.runtime, 'own');
+  for (const id of HOST_ONLY) assert.ok(!ids(report).includes(id), id);
+  for (const id of [...OWN_ONLY, 'effective_runtime', 'lock_versions', 'private_node', 'claude_md_baseline', 'forbidden_plugins', 'dm_closed', 'search_off', 'db_version', 'live_gate']) assert.ok(ids(report).includes(id), id);
+
+  // Positive control: the same install switched to openclaw needs the host config it does not have.
+  const cfgFile = join(root, 'config.json');
+  writeFileSync(cfgFile, JSON.stringify({ ...JSON.parse(readFileSync(cfgFile, 'utf8')), runtime: 'openclaw' }));
+  const host = doctor(root, {}, env);
+  assert.ok(failedIds(host).includes('openclaw_json'), formatDoctor(host));
+  assert.ok(failedIds(host).includes('effective_runtime'), 'effective.json still says own');
+  for (const id of OWN_ONLY) assert.ok(!ids(host).includes(id), id);
+});
+
+test('own: the system prompt is checked whole, by its policy section and by its markers', async () => {
+  const { root, env } = await preparedOwn('own-prompt');
+  const prompt = join(root, '.runtime', 'clo', 'system-prompt.md');
+  const original = readFileSync(prompt, 'utf8');
+  assert.deepEqual(failedIds(doctor(root, {}, env)), [], 'control');
+  writeFileSync(prompt, original.replace('## 内容范围', '## 内容范围（已改）'));
+  assert.ok(failedIds(doctor(root, {}, env)).includes('system_prompt'), 'one edited policy line');
+  writeFileSync(prompt, original.replace('<!-- clo-policy-end:1 -->', ''));
+  assert.ok(failedIds(doctor(root, {}, env)).includes('system_prompt'), 'no end marker');
+  writeFileSync(prompt, 'no markers here');
+  assert.ok(failedIds(doctor(root, {}, env)).includes('system_prompt'), 'nothing left');
+  assert.equal((await clo(root, ['apply'])).code, 0);
+  assert.deepEqual(failedIds(doctor(root, {}, env)), [], 'apply restores it');
+});
+
+test('own: a missing entry, a listening bot file and a stale effective runtime each fail', async () => {
+  const { root, env, entry } = await preparedOwn('own-entry');
+  assert.deepEqual(failedIds(doctor(root, {}, env)), [], 'control');
+  const missing = doctor(root, {}, { CLO_TEST_BOT_ENTRY: join(root, 'nowhere', 'main.mjs') });
+  assert.ok(failedIds(missing).includes('bot_entry'), formatDoctor(missing));
+
+  writeFileSync(join(dirname(entry), 'side.mjs'), "import { createServer } from 'node:http';\ncreateServer(() => {}).listen(0);\n");
+  const listens = doctor(root, {}, env);
+  assert.ok(failedIds(listens).includes('bot_no_listen'), formatDoctor(listens));
+  assert.match(formatDoctor(listens), /side\.mjs/);
+  writeFileSync(join(dirname(entry), 'side.mjs'), "// connects out only: sock.connect(443, 'example.invalid')\n");
+  assert.deepEqual(failedIds(doctor(root, {}, env)), [], 'a file that only connects out passes');
+
+  const effective = join(root, '.runtime', 'clo', 'effective.json');
+  writeFileSync(effective, JSON.stringify({ ...JSON.parse(readFileSync(effective, 'utf8')), runtime: 'openclaw' }));
+  assert.ok(failedIds(doctor(root, {}, env)).includes('effective_runtime'));
+});
+
+test('own: lock_versions still checks the Node and the SDK, and no longer the host packages', async () => {
+  const { root, env } = await preparedOwn('own-lock');
+  const lockFile = join(root, 'versions.lock.json');
+  const good = readFileSync(lockFile, 'utf8');
+  const hostOff = JSON.parse(good);
+  hostOff.npm.openclaw.version = '2026.1.1';
+  writeFileSync(lockFile, JSON.stringify(hostOff));
+  assert.ok(!failedIds(doctor(root, {}, env)).includes('lock_versions'), 'the host package is not needed');
+  const cfgFile = join(root, 'config.json');
+  const cfg = JSON.parse(readFileSync(cfgFile, 'utf8'));
+  writeFileSync(cfgFile, JSON.stringify({ ...cfg, runtime: 'openclaw' }));
+  assert.ok(failedIds(doctor(root, {}, env)).includes('lock_versions'), 'positive control: under openclaw it is');
+  writeFileSync(cfgFile, JSON.stringify(cfg));
+  const nodeOff = JSON.parse(good);
+  nodeOff.node.version = '20.0.0';
+  writeFileSync(lockFile, JSON.stringify(nodeOff));
+  assert.ok(failedIds(doctor(root, {}, env)).includes('lock_versions'), 'node');
+  const sdkOff = JSON.parse(good);
+  sdkOff.npm['@tencent-connect/qqbot-nodejs'].integrity = 'sha512-wrong';
+  writeFileSync(lockFile, JSON.stringify(sdkOff));
+  assert.ok(failedIds(doctor(root, {}, env)).includes('lock_versions'), 'sdk');
+});
+
+test('own: the full level never asks a host, and still checks .env', async () => {
+  const { root, env } = await preparedOwn('own-full');
+  let asked = 0;
+  const run = () => { asked += 1; return { status: 1, stdout: '' }; };
+  const report = runDoctor(ctxOf(root, env), { level: FULL_LEVEL, run });
+  assert.deepEqual(report.failed, [], formatDoctor(report));
+  assert.equal(asked, 0);
+  assert.ok(report.checks.some((c) => c.id === 'env_file' && c.ok));
+  const cfgFile = join(root, 'config.json');
+  writeFileSync(cfgFile, JSON.stringify({ ...JSON.parse(readFileSync(cfgFile, 'utf8')), runtime: 'openclaw' }));
+  assert.equal((await clo(root, ['apply'])).code, 0);
+  runDoctor(ctxOf(root, env), { level: FULL_LEVEL, run });
+  assert.equal(asked, 1, 'positive control: under openclaw the host is asked');
 });

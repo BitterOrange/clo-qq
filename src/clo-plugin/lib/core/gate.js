@@ -1,7 +1,7 @@
 // Inbound gate: everything between normalize and the host turn, in the order of design section 5.1.
 // Non-admitted traffic leaves before any write or buffer. Writes commit before the effect they allow.
 import { randomUUID } from 'node:crypto';
-import { commandRoute, forwardAck, parseCommand, runLocalCommand } from './commands.js';
+import { commandRoute, forwardAck, listedCommand, parseCommand, runLocalCommand } from './commands.js';
 import { createContextBuffer } from './context.js';
 import { namePattern, routeDecision, shapeCurrentText } from './decision.js';
 import { checkDisplayName, speakerLabel } from './displayName.js';
@@ -14,6 +14,10 @@ const HOUR = 3600000;
 const PASSIVE_WINDOW_MS = 285000;
 const INTERJECT_LEASE_MS = 120000;
 const STOP_GRACE_MS = 5000;
+// Own runtime: how long an aborted run gets to end before its group's queue moves on without it.
+const ABORT_GRACE_MS = 5000;
+const ABANDONED = Symbol('abandoned');
+const abortReason = (why) => new DOMException(why, 'AbortError');
 const INVALID_STREAK_ALERT = 5;
 const NON_TERMINAL = ['received', 'queued', 'deciding', 'approved', 'dispatching', 'delivering'];
 const TERMINAL = new Set(['ignored', 'stale', 'merged', 'paused', 'dry_run', 'skipped', 'completed', 'silent',
@@ -129,7 +133,8 @@ export function usageMicros(usage, price) {
   return micros > 0 ? { micros: Math.ceil(micros), source: 'computed' } : null;
 }
 
-export function createGate({ store, ledger, policy, getEffective, decide, dispatchTurn, log = () => {}, now = Date.now, timers = {} }) {
+export function createGate({ store, ledger, policy, getEffective, decide, dispatchTurn, log = () => {}, now = Date.now, timers = {}, runtime = 'openclaw' }) {
+  if (runtime !== 'openclaw' && runtime !== 'own') throw new TypeError('createGate: runtime must be openclaw or own');
   const setTimer = timers.setTimer ?? setTimeout;
   const clearTimer = timers.clearTimer ?? clearTimeout;
   let exit = null;
@@ -148,6 +153,17 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
   const crisisSenders = new Map();
   const bypassSenders = new Map();
   const abort = new AbortController();
+  // Which runtime this process is, fixed when it is built: the plugin is 'openclaw', the bot is 'own'. The effective
+  // file can change under a running process (clo apply), and must never switch its behaviour halfway. A file that names
+  // the other runtime is logged once per change; the process goes on as what it is.
+  const runtimeOf = () => runtime;
+  let fileRuntimeSeen = runtime;
+  function noteFileRuntime(eff) {
+    const named = eff?.runtime ?? 'openclaw';
+    if (named === fileRuntimeSeen) return;
+    fileRuntimeSeen = named;
+    if (named !== runtime) log('runtime_mismatch', { process: runtime, file: named });
+  }
 
   const contextCaps = (eff) => ({
     maxItems: eff.retention.contextMaxItems,
@@ -258,9 +274,42 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
 
   // A text in danger is never taken for a command: no exact owner command matches the list, and a slash word
   // in front of those words must not cost the person their answer. The worst the host does with it is leave the failure line.
+  // With the own runtime there is no host parser to guess at: only a listed owner command is a command.
   function commandIn(rec) {
+    if (runtimeOf() === 'own') {
+      const listed = listedCommand(rec.evt.text);
+      return listed && !isCrisis(rec) ? listed : null;
+    }
     const cmd = parseCommand(rec.evt.text);
     return cmd && commandShaped(rec.evt.text) && !isCrisis(rec) ? cmd : null;
+  }
+
+  // /stop marks every running turn of the group. With the own runtime it also aborts the run, except where a reply
+  // for a person in danger has already been handed over: that one still goes out.
+  function stopFlights(groupKey, own) {
+    for (const flight of flights.get(groupKey) ?? []) {
+      flight.aborted = true;
+      // A reply the host already handed over was written before this /stop. For a person in danger it still goes out.
+      flight.replyBeforeStop = exit?.hasReply?.(flight.turnId) === true;
+      if (own && !(flight.replyBeforeStop && inDanger(flight.rec, flight.cls))) flight.controller.abort(abortReason('owner_stop'));
+    }
+  }
+
+  function recordStop(rec) {
+    store.setControl(stopControl(rec.groupKey), rec.evt.timestampMs, 'owner');
+    ownerStops.set(rec.groupKey, { arrival: rec.arrival, msgTs: rec.evt.timestampMs });
+  }
+
+  // Own runtime: /new, /reset and /stop never leave the gate. The ack is the same fixed line the host path sends.
+  async function runOwnCommand(rec, cmd) {
+    if (cmd.name === 'new' || cmd.name === 'reset') context.clear(rec.groupKey);
+    if (cmd.name === 'stop') {
+      stopFlights(rec.groupKey, true);
+      recordStop(rec);
+    }
+    const ack = await exit.commandAck(refOf(rec), forwardAck(`/${cmd.name}`));
+    log('command_ack', { eventKey: rec.eventKey, reason: ack?.reason ?? null });
+    return end(rec, 'received', 'completed', 'cmd_owner');
   }
 
   async function handleCommand(rec, cmd, eff, group) {
@@ -276,17 +325,13 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       log('command_ack', { eventKey: rec.eventKey, reason: ack?.reason ?? null });
       return end(rec, 'received', 'completed', 'cmd_owner');
     }
+    if (runtimeOf() === 'own') return runOwnCommand(rec, cmd);
     const authorizedCommand = `/${cmd.name}`;
     // The buffer is uploaded with the next turn, so a reset has to reach it as well as the host session.
     if (cmd.name === 'new' || cmd.name === 'reset') context.clear(rec.groupKey);
     if (cmd.name === 'stop') {
-      for (const flight of flights.get(rec.groupKey) ?? []) {
-        flight.aborted = true;
-        // A reply the host already handed over was written before this /stop. For a person in danger it still goes out.
-        flight.replyBeforeStop = exit?.hasReply?.(flight.turnId) === true;
-      }
-      store.setControl(stopControl(rec.groupKey), rec.evt.timestampMs, 'owner');
-      ownerStops.set(rec.groupKey, { arrival: rec.arrival, msgTs: rec.evt.timestampMs });
+      stopFlights(rec.groupKey, false);
+      recordStop(rec);
     }
     if (!store.transition(rec.eventKey, 'received', 'dispatching')) return undefined;
     crashpoint('dispatching');
@@ -359,11 +404,15 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
 
   async function runTurn(rec, turn, holdId, eff) {
     const started = now();
-    const flight = { aborted: false, replyBeforeStop: false, turnId: turn.turnId, rec, cls: turn.cls, droppedOnStop: false };
+    const own = runtime === 'own';
+    // The signal belongs to the gate: /stop, gate.stop() and, with the own runtime, the turn's deadline abort it.
+    const flight = { aborted: false, replyBeforeStop: false, turnId: turn.turnId, rec, cls: turn.cls, droppedOnStop: false, own, controller: new AbortController() };
     if (turn.cls !== 'command') {
       if (!flights.has(rec.groupKey)) flights.set(rec.groupKey, new Set());
       flights.get(rec.groupKey).add(flight);
+      if (own) context.touch(rec.groupKey, started);
     }
+    if (stopped) flight.controller.abort(abortReason('shutdown'));
     running.add(flight);
     try {
       await runFlight(rec, turn, holdId, eff, flight, started);
@@ -385,7 +434,8 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     try {
       exit.beginTurn(turn);
       try {
-        result = await dispatchTurn(turn);
+        // The host path calls straight through, at the same moment it always has.
+        result = flight.own ? await callDispatch(turn, flight) : await dispatchTurn(turn, { signal: flight.controller.signal });
       } catch {
         // Whether the model ran is unknown, so settlement treats it as having run.
         log('dispatch_error', { eventKey: rec.eventKey });
@@ -415,10 +465,74 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     const reason = fin?.reason ?? (TERMINAL.has(fin?.state) ? fin.state : 'exit_refused');
     store.transition(rec.eventKey, ['dispatching', 'delivering'], state, { reason });
     log('turn_end', { eventKey: rec.eventKey, groupKey: rec.groupKey, state, reason, tier: turn.tier, durationMs: now() - started });
+    if (flight.own) noteOwnTurn(rec, result, fin);
     if (hostRefused) {
       if (await noteHostRefused(rec, turn, reason, ownerStopped())) rec.spoke = true;
     } else if (inDanger(rec, turn.cls) && !flight.droppedOnStop && await noteDangerLost(rec, turn, reason, stopAborts())) {
       rec.spoke = true;
+    }
+  }
+
+  // Own runtime only; the host has its own watchdog and ignores the signal. Here the gate's deadline aborts the run, and
+  // a run that has not ended within the grace after any abort is left behind: its hold stays unsettled, any late text
+  // finds the turn closed at the exit, and late usage still settles the hold.
+  async function callDispatch(turn, flight) {
+    const { signal } = flight.controller;
+    let run;
+    try {
+      run = Promise.resolve(dispatchTurn(turn, { signal }));
+    } catch (err) {
+      run = Promise.reject(err);
+    }
+    let graceTimer = null;
+    let onAbort = null;
+    const abandoned = new Promise((resolve) => {
+      onAbort = () => {
+        graceTimer = setTimer(() => resolve(ABANDONED), ABORT_GRACE_MS);
+        graceTimer?.unref?.();
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    });
+    const deadline = setTimer(() => flight.controller.abort(abortReason('deadline')), Math.max(turn.deadlineAt - now(), 0));
+    deadline?.unref?.();
+    try {
+      const outcome = await Promise.race([run, abandoned]);
+      if (outcome !== ABANDONED) return outcome;
+      log('turn_abandoned', { eventKey: turn.eventKey, groupKey: turn.groupKey, tier: turn.tier });
+      run.then((late) => tryQuietly(() => {
+        const known = usageMicros(late?.usage, getEffective()?.models?.primary?.price);
+        if (known) ledger.applyLateUsage(turn.eventKey, { actualMicros: known.micros, source: known.source, model: late.usage.model });
+      }), () => {});
+      return { started: true, hostError: false, aborted: true, usage: null };
+    } finally {
+      clearTimer(deadline);
+      if (graceTimer) clearTimer(graceTimer);
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  // Own runtime, after the turn's row is closed. The provider streak is counted here, as the host's model_call_ended
+  // hook counts it on the host path: an abort says nothing about the model, and a refused start ran nothing. Only a
+  // failure the runner blamed on the provider (it carries info) counts against it. A refusal, a tool call, an odd ending
+  // or empty text is a failed turn the provider still answered (it reports usage), which counts as a good call, as a
+  // completed call does on the host path. A failed turn with neither, such as a call cut early to keep the passive
+  // window, says nothing about the provider and leaves the streak alone. Then her
+  // posted words join the group's memory ring. Only parts the exit reports as sent or possibly out are kept: a reply
+  // dropped for its content, one QQ refused, a fixed line and provider text never get there.
+  function noteOwnTurn(rec, result, fin) {
+    if (result && result.started !== false && result.aborted !== true) {
+      tryQuietly(() => {
+        const info = result.info && typeof result.info === 'object' ? result.info : null;
+        if (result.hostError !== true) ledger.noteProviderOk();
+        else if (info) ledger.noteProviderError({ httpStatus: info.status ?? null, limitSource: info.limitSource ?? null });
+        else if (result.usage) ledger.noteProviderOk();
+      });
+    }
+    const posted = Array.isArray(fin?.posted) ? fin.posted.filter((p) => typeof p === 'string' && p) : [];
+    if (posted.length > 0) {
+      context.pushOwn(rec.groupKey, { text: posted.join('\n'), ts: now() });
+      armSweep();
     }
   }
 
@@ -811,8 +925,11 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
   // sent before it and delivered late. Nobody is owed an interjection, so this drops no question.
   const interjectionRefused = (rec) => olderThanStop(rec) || rec.evt.timestampMs <= stopOf(rec.groupKey)?.msgTs;
 
+  // With the host, a message from the same second as /stop reaches it and meets its cutoff. The own runtime has no host,
+  // so the gate applies the same rule itself: the same second is not newer, and is skipped. Words of danger still go on.
   function stoppedByOwner(rec) {
-    return olderThanStop(rec) && !isCrisis(rec);
+    const notNewer = runtimeOf() === 'own' ? interjectionRefused(rec) : olderThanStop(rec);
+    return notNewer && !isCrisis(rec);
   }
 
   // Everything is read here and now: queued work may have waited behind several turns. Null means the event has ended.
@@ -1102,6 +1219,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     async onInbound(evt) {
       if (stopped || !evt) return;
       const eff = getEffective();
+      if (eff) noteFileRuntime(eff);
       if (eff?.mode === 'dry-run' && evt.kind === 'group' && evt.conversationId && !evt.senderIsBot) {
         tryQuietly(() => store.recordDiscovery({ groupId: evt.conversationId, memberId: evt.senderId, now: now() }));
       }
@@ -1133,6 +1251,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       if (stopping) return stopping;
       stopped = true;
       abort.abort();
+      for (const flight of running) flight.controller.abort(abortReason('shutdown'));
       if (sweepTimer) clearTimer(sweepTimer);
       sweepTimer = null;
       const done = (async () => {

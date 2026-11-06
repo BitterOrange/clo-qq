@@ -2,15 +2,16 @@
 import { appendFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ConfigError, livePreconditions, OPENROUTER_BASE_URL } from '../clo-plugin/lib/core/config.js';
+import { ConfigError, livePreconditions, OPENROUTER_BASE_URL, runtimeOf } from '../clo-plugin/lib/core/config.js';
 import { checkSentinels, loadPolicy, sha256Hex } from '../clo-plugin/lib/core/contentPolicy.js';
 import { createLedger } from '../clo-plugin/lib/core/ledger.js';
 import { callWorstMicros, fetchCatalog, lockFromCatalog, resolveSelector, validateModels } from '../clo-plugin/lib/core/models.js';
 import { extractPolicySection, writeAtomic } from '../clo-plugin/lib/core/render.js';
-import { apply, assertApplicable, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, renderAll, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock } from './common.mjs';
+import { apply as applyRender, assertApplicable as checkApplicable, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, renderAll, requiredHoldMicros, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock } from './common.mjs';
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, runDoctor } from './doctor.mjs';
-import { assertTestModeWired, inspectGateway, inspectStartLock, parseEnvFile, renamedEnvNames, renamedKeyHint, requireSecrets, startGateway, startLockFile, stopGateway, withStartLock } from './lifecycle.mjs';
+import { assertRuntimeSwitchAllowed, assertTestModeWired, inspectGateway, inspectStartLock, parseEnvFile, recordRuntime, renamedEnvNames, renamedKeyHint, requireSecrets, RUNTIME_LABEL, startLockFile, startRuntime, stopGateway, withStartLock } from './lifecycle.mjs';
 import { collectStatus, formatStatus, RESIDUAL_EXIT, residualBehind } from './status.mjs';
+import { liveBotLease, STOP_REQUEST_KEY } from '../clo-plugin/lib/channels/qq/lease.js';
 
 const USAGE = `用法：clo <命令>
   apply                              按 config.json 重新生成运行配置
@@ -61,6 +62,18 @@ function onOff(value, name) {
   throw new CliError(`${name} 只能是 on 或 off。`);
 }
 
+// Every check before a config write, and every apply, in this console go through these two: a runtime switch never
+// lands under a running process of the other runtime, and a refused one leaves config.json as it was.
+function assertApplicable(ctx, cfg, opts) {
+  assertRuntimeSwitchAllowed(ctx, runtimeOf(cfg));
+  return checkApplicable(ctx, cfg, opts);
+}
+
+function apply(ctx, cfg, opts) {
+  assertRuntimeSwitchAllowed(ctx, runtimeOf(cfg));
+  return applyRender(ctx, cfg, opts);
+}
+
 function printWarnings(ctx, cfg) {
   for (const w of assertValid(ctx, cfg).warnings) ctx.out(`提醒：${w.path} ${w.message}`);
 }
@@ -78,7 +91,9 @@ function cmdApply(ctx) {
   const cfg = readConfig(ctx);
   printWarnings(ctx, cfg);
   const r = apply(ctx, cfg);
-  ctx.out(`已生成运行配置。模式：${r.effective.mode}。${r.openclawChanged ? 'openclaw.json 有变化。' : 'openclaw.json 没有变化。'}`);
+  const runtime = runtimeOf(r.effective);
+  if (runtime === 'own') ctx.out(`已生成运行配置。模式：${r.effective.mode}。运行时：own，不生成 openclaw.json。`);
+  else ctx.out(`已生成运行配置。模式：${r.effective.mode}。${r.openclawChanged ? 'openclaw.json 有变化。' : 'openclaw.json 没有变化。'}`);
   return 0;
 }
 
@@ -128,10 +143,10 @@ async function gatherLiveFacts(ctx, cfg) {
   const facts = { now: ctx.now(), env: ctx.env };
   facts.doctorOk = runDoctor(ctx, { level: CONFIG_LEVEL }).ok;
   facts.policyOk = policyPasses(ctx, cfg);
-  const lock = usableLock(cfg, readModelsLock(ctx.paths));
-  facts.modelsLocked = Boolean(lock);
-  // The same figure as ledger.holdMicros('reply_required'). Without a price, 'models' or the ledger refuses anyway.
-  if (lock?.primary?.price) facts.requiredHoldMicros = 2 * callWorstMicros(lock.primary.price, cfg.claudeModel);
+  facts.modelsLocked = Boolean(usableLock(cfg, readModelsLock(ctx.paths)));
+  // ledger.holdMicros('reply_required') itself, on the effective file just rendered, so the runtime's own hold rule
+  // applies. Without a price it is null, and 'models' or the ledger refuses anyway.
+  facts.requiredHoldMicros = requiredHoldMicros(readEffective(ctx));
   const secrets = parseEnvFile(ctx.paths.envFile);
   return withStoreAsync(ctx, async (store) => {
     const number = (k) => {
@@ -167,6 +182,7 @@ async function cmdModeLive(ctx) {
   }
   const dry = { ...cfg, mode: 'dry-run' };
   assertValid(ctx, dry);
+  assertRuntimeSwitchAllowed(ctx, runtimeOf(dry));
   // A hand-edited 'live' goes first, or a refusal below would leave a config that apply and start both refuse.
   if (cfg.mode !== 'dry-run') writeConfig(ctx, dry);
   // Fresh render first, so doctor and the ledger read this config and not a stale one.
@@ -540,9 +556,9 @@ function raisedPrice(oldLock, lock) {
 
 const samePrice = (a, b) => PRICE_KEYS.every((k) => a.price[k] === b.price[k]);
 
-function budgetWarning(ctx, cfg, lock) {
-  const worst = 2 * callWorstMicros(lock.primary.price, cfg.claudeModel);
-  if (worst > cfg.budget.addressedUsd * 1e6) ctx.out(`提醒：一次必答回合预留 ${usd(worst)}，超过日预算 $${cfg.budget.addressedUsd}，这样 @ 永远得不到额度。`);
+function budgetWarning(ctx, cfg, effective) {
+  const worst = requiredHoldMicros(effective);
+  if (worst !== null && worst > cfg.budget.addressedUsd * 1e6) ctx.out(`提醒：一次必答回合预留 ${usd(worst)}，超过日预算 $${cfg.budget.addressedUsd}，这样 @ 永远得不到额度。`);
 }
 
 // slot names the one model a set command is about: the other must still resolve to what is locked, and this one counts
@@ -568,8 +584,8 @@ function commitModels(ctx, next, catalog, flags, { changed: named, slot = null }
   assertApplicable(ctx, next, { lock });
   writeConfig(ctx, next);
   writeModelsLock(ctx, lock, { qqPlatformNotified, changed });
-  apply(ctx, next);
-  budgetWarning(ctx, next, lock);
+  const { effective } = apply(ctx, next);
+  budgetWarning(ctx, next, effective);
   ctx.log('cli_model', { model: lock.primary.id, count: changed ? 1 : 0 });
   ctx.out(`已锁定：主模型 ${lock.primary.id}，判定模型 ${lock.decision.id}。`);
   if (changed && next.qq?.enabled) ctx.out('已记录：你确认向平台报告了这次模型变更（QQ 协议 §4.2）。');
@@ -705,17 +721,39 @@ function cmdDoctor(ctx, { flags }) {
 
 const CMDLINE_HINT = '读不到它的命令行，它很可能是用更高权限启动的，还在运行。从启动它的 shell 里运行这个命令。';
 
+// A bot with no PID record that still holds the account: its lease in clo.db is fresh and its process alive. A start
+// that clo was stopped in the middle of can leave one. It listens on no port, so nothing else shows it.
+function untrackedBot(ctx) {
+  if (!existsSync(ctx.paths.db)) return null;
+  return withStore(ctx, (store) => liveBotLease({ store, now: ctx.now }));
+}
+
 async function startLocked(ctx) {
   const cfg = readConfig(ctx);
   assertTestModeWired(cfg, ctx.env);
+  const runtime = runtimeOf(cfg);
   const current = inspectGateway(ctx.paths, ctx.env);
-  if (current.state === 'running') throw new CliError(`Gateway 已在运行（进程 ${current.record.pid}）。`);
+  // One PID record for both runtimes, so whichever is recorded and alive blocks the other: one consumer per AppID.
+  if (current.state === 'running') {
+    const was = recordRuntime(current.record);
+    if (was !== runtime) {
+      throw new CliError(`${RUNTIME_LABEL[was]}（${was} 运行时，进程 ${current.record.pid}）还在运行。同一个 AppID 只能有一个消费者，不启动 ${runtime} 运行时。先 clo stop，再 clo start。`);
+    }
+    throw new CliError(`${RUNTIME_LABEL[was]} 已在运行（进程 ${current.record.pid}）。`);
+  }
   if (current.state === 'unknown') {
     throw new CliError(current.cause === 'cmdline_unreadable'
       ? `进程 ${current.record.pid} 可能还在运行。PID 文件保留。${CMDLINE_HINT}`
       : `查不到进程 ${current.record.pid} 的状态，可能还在运行。PID 文件保留，请稍后再试。`);
   }
   if (current.state !== 'none') rmSync(ctx.paths.pidFile, { force: true });
+  // Before apply: a runtime switch written now would not stop it, and the other runtime would connect beside it.
+  const untracked = untrackedBot(ctx);
+  if (untracked) {
+    throw new CliError(untracked.pid === null
+      ? 'clo.db 里的连接租约读不出来，可能有可洛进程还连着这个 AppID。不启动，请稍后再试。'
+      : `有一个可洛进程（进程 ${untracked.pid}）还连着这个 AppID，PID 文件里没有它。同一个 AppID 只能有一个消费者，不启动。先运行 clo stop 请它停下，再 clo start。`);
+  }
 
   const secrets = parseEnvFile(ctx.paths.envFile);
   requireSecrets(cfg, secrets, { renamed: renamedEnvNames(ctx.paths.envFile) });
@@ -730,8 +768,9 @@ async function startLocked(ctx) {
   for (const c of report.checks) {
     if (!c.ok && ['env_old_names', 'env_duplicates'].includes(c.id)) ctx.out(`提醒：${c.detail}`);
   }
-  const { pid, port } = await startGateway(ctx, cfg, { secrets });
-  ctx.out(`Gateway 已启动：进程 ${pid}，端口 ${port}（仅 loopback），模式 ${cfg.mode}。`);
+  const { pid, port } = await startRuntime(ctx, cfg, { secrets });
+  if (runtime === 'own') ctx.out(`可洛进程已启动（own 运行时）：进程 ${pid}，不监听端口，模式 ${cfg.mode}。`);
+  else ctx.out(`Gateway 已启动：进程 ${pid}，端口 ${port}（仅 loopback），模式 ${cfg.mode}。`);
   ctx.out('连上 QQ 要等一会儿，用 clo status 确认“心跳新鲜”和“已连接”。');
   return 0;
 }
@@ -749,6 +788,19 @@ function cmdStop(ctx) {
     return 1;
   }
   const r = stopGateway(ctx);
+  // No record, but a bot still holds the account: it is asked to stop through clo.db, the way it polls for, and no
+  // process is signalled. Its own stop drops the lease and the heartbeat.
+  const untracked = !r.stopped && r.reason === 'no_pid_file' ? untrackedBot(ctx) : null;
+  if (untracked?.pid) {
+    withStore(ctx, (store) => store.setControl(STOP_REQUEST_KEY, String(untracked.pid), 'cli'));
+    ctx.log('bot_stop_requested', { count: untracked.pid, kind: 'own' });
+    ctx.out(`没有 PID 文件，但可洛进程（进程 ${untracked.pid}）还连着这个 AppID。已请它自己停下，没有结束任何进程。几秒后用 clo status 确认连接已断开。`);
+    return 0;
+  }
+  if (untracked) {
+    ctx.out('没有 PID 文件，但 clo.db 里的连接租约读不出来，可能有可洛进程还连着这个 AppID。没有动任何进程，请稍后再试 clo stop。');
+    return 1;
+  }
   const noteDown = () => {
     if (!existsSync(ctx.paths.db)) return;
     withStore(ctx, (store) => {
@@ -759,7 +811,7 @@ function cmdStop(ctx) {
   };
   if (r.stopped) {
     noteDown();
-    ctx.out(`已停止 Gateway（进程 ${r.pid}）。`);
+    ctx.out(`已停止 ${RUNTIME_LABEL[r.runtime]}（进程 ${r.pid}）。`);
     return 0;
   }
   if (r.reason === 'lookup_failed') {

@@ -1,7 +1,7 @@
 // G4 and design section 5.4. Admin rights are checked by stable ID, separately from chat rights.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { commandRoute, forwardAck, parseCommand } from '../../src/clo-plugin/lib/core/commands.js';
+import { commandRoute, forwardAck, listedCommand, parseCommand } from '../../src/clo-plugin/lib/core/commands.js';
 import { deferred, makeEffective, makeHarness, MEMBER, OWNER, USAGE } from '../fixtures/inbound.mjs';
 
 const cmd = (h, text, senderId = OWNER) => h.event({ text, senderId, isRealAt: true });
@@ -338,4 +338,9 @@ test('positive control: the same words of danger with no slash, and the owner\'s
   assert.equal(h.dispatched.at(-1).authorizedCommand, '/stop');
   assert.equal(h.state(stop), 'completed:sent');
   await h.close();
+});
+
+test('listedCommand: under the own runtime only the listed shapes are commands', () => {
+  for (const t of ['/status', '/clo status', '/clo pause all', '/clo resume interject', '/new', '/reset', '/stop', '／STOP', '​/new']) assert.ok(listedCommand(t), t);
+  for (const t of ['/think 一下', '/help', '/model x', '/stop now', '/new x', '/clo', '/clo pause foo', '/new@bot', '/', '你好', '']) assert.equal(listedCommand(t), null, t);
 });
