@@ -12,6 +12,8 @@
 
 阶段编号、哪些在真实环境验证过、哪些只在模拟环境验证过，见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
+**分支：** 这里是 `native-runtime`，原生运行时在真实 QQ 验收通过、合并之前只在这个分支上。没有原生运行时、只走 OpenClaw 路线的版本在 [`master`](https://github.com/BitterOrange/clo-qq/tree/master)。
+
 **过渡期：两套运行时。** 用户已决定去掉 OpenClaw。项目自己的运行时已经写好，放在配置项 `runtime: "own"` 后面，**默认仍是 `openclaw`，现在跑的也是它，上面这些真实记录都是在 OpenClaw 上得到的**。新运行时在真实 QQ 上的验收一项都没有做，只有离线测试（mock QQ、mock 模型）。这份 README 写的都是 openclaw 路线，另有说明的除外。怎么切换、怎么回退、改了什么，见 [docs/own-runtime.md](docs/own-runtime.md)。
 
 ## 你需要准备什么
