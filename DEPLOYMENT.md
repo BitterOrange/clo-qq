@@ -73,6 +73,21 @@
 | 主模型 | 选择器 `opus-latest`，锁定为 `anthropic/claude-opus-5.5`，目录价 $4/$20 | `clo model refresh` 写入 `models.lock`。Q5 和 Q6 真实调用过 |
 | 判定模型 | `anthropic/claude-haiku-5.5`，目录价 $0.1/$0.5 | Q5 和 Q7 真实调用过 |
 
+## 内存
+
+**只在离线测试里量过**：Windows，私有 Node，mock QQ，mock 模型。真实 QQ、真实模型和长时间运行下没有量过，跑久了会不会涨也不知道。
+
+| 情况 | Gateway 内存 |
+|---|---|
+| 空闲 | 约 750–850 MB |
+| 跑过一个回合 | 约 1.2–1.4 GB |
+
+- 几乎都是 OpenClaw 宿主本身。去掉 clo 插件只少约 50 MB。
+- 上面是现在的启动方式量出来的：`clo start` 给 Gateway 设 `NODE_DISABLE_COMPILE_CACHE=1`，并在入口脚本前加 Node 参数 `--max-semi-space-size=8`。以前设的是 `NODE_COMPILE_CACHE`，宿主看到它不是自己的缓存目录，就重新拉起自己，`clo start` 记下的其实是启动器，真正的 Gateway 是它的子进程。现在只有一个进程，记下的 PID 就是 Gateway。
+- 和以前比：关掉编译缓存，空闲少约 185 MB，一个回合后少约 265 MB，启动慢约 0.5–1 秒；semi-space 参数一个回合后再少约 70 MB，峰值工作集少约 300 MB。两种设置下 `tests/e2e/qq-group-reply.test.mjs` 都是 19 项全过。
+- 读锁定版本的宿主源码，`gateway run` 在 Windows 上别的重新拉起都关着：栈大小那次被前台 `gateway run` 和 `OPENCLAW_NO_RESPAWN=1` 跳过，重启留在进程内，`node run` 和 `connect` 才走的节点启动器不涉及。这是读代码得出的，`tests/e2e/qq-first-run.test.mjs` 只在 mock 环境下确认了没有同命令行的子进程。
+- **远程部署：** VPS 至少 2 GB 内存，4 GB 更稳妥。Linux 上的数字没有量过。
+
 `doctor` 查不到 `@tencent-connect/openclaw-qqbot`、`@openclaw/qqbot`、`@agent-wechat/agent-wechat`、`@tencent-weixin/openclaw-weixin`，没有第二个消费者。这条检查保留，防止同一账号出现两个消费者。
 
 ## 进真实群前要修

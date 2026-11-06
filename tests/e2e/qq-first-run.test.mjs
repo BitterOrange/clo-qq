@@ -1,10 +1,14 @@
 // The README's first real step, through the real console and a real Gateway: dry-run, no model lock and no model
 // key, then ID capture, group add, owner add, clear. QQ and OpenRouter are loopback mocks; every value is fake.
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
+import { osToolEnv } from '../../src/cli/lifecycle.mjs';
 import { fullAt, nextId, plain } from '../fixtures/qq-events.mjs';
+import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { allocPort, GROUP_A, MEMBER, OWNER, pidAlive, readJsonl, until } from '../harness/gateway.mjs';
 import { startMockOpenRouter } from '../harness/mock-openrouter.mjs';
 import { startMockQq } from '../harness/mock-qq.mjs';
@@ -15,6 +19,8 @@ let model;
 let r;
 let env;
 let gatewayPid;
+// Every process under the recorded one when it was up. Stop must leave none of them.
+let gatewayTree = [];
 let identifiesAtStart;
 // The console's own network calls, so a read that swallows its error is still seen. The Gateway has its own mock.
 const consoleFetches = [];
@@ -24,6 +30,45 @@ const noNetwork = (url) => {
 };
 const run = (argv, opts = {}) => clo(r.root, argv, { env, fetch: noNetwork, ...opts });
 const pidFile = () => join(r.root, '.runtime', 'pids', 'gateway.json');
+const SYSTEM32 = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
+
+// PIDs that hold a listening TCP socket on the port. A listening row has a foreign address of port 0, which reads
+// the same whatever language the OS shows its state column in.
+function listenerPids(port) {
+  const out = spawnSync(join(SYSTEM32, 'NETSTAT.EXE'), ['-ano'], { cwd: tmpdir(), env: cleanChildEnv(), encoding: 'utf8', windowsHide: true, timeout: 60000 });
+  assert.equal(out.status, 0, 'netstat ran');
+  const pids = new Set();
+  for (const line of out.stdout.split(/\r?\n/)) {
+    const cols = line.trim().split(/\s+/);
+    if (cols[0] !== 'TCP' || cols.length < 5) continue;
+    if (cols[1].endsWith(`:${port}`) && /:0$/.test(cols[2])) pids.add(Number(cols[cols.length - 1]));
+  }
+  return [...pids];
+}
+
+// The processes started under pid since it started, with their command lines. Read only: nothing is signalled.
+function processTree(pid) {
+  const script = "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+    + 'Get-CimInstance Win32_Process | ForEach-Object { @{ pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; cmd=$_.CommandLine; start=$_.CreationDate.ToUniversalTime().ToString("o") } } | ConvertTo-Json -Compress';
+  const out = spawnSync(join(SYSTEM32, 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script], {
+    cwd: tmpdir(), env: osToolEnv(process.env), encoding: 'utf8', windowsHide: true, timeout: 60000, maxBuffer: 64 * 1024 * 1024,
+  });
+  assert.equal(out.status, 0, 'the process list was read');
+  const all = JSON.parse(out.stdout);
+  const root = all.find((p) => p.pid === pid);
+  assert.ok(root, 'the recorded process is in the list');
+  const tree = [];
+  const walk = (parent) => {
+    for (const p of all) {
+      if (p.ppid === parent.pid && p.start >= parent.start && !tree.includes(p)) {
+        tree.push(p);
+        walk(p);
+      }
+    }
+  };
+  walk(root);
+  return { root, tree };
+}
 
 before(async () => {
   qq = await startMockQq();
@@ -71,7 +116,15 @@ test('starts with no model lock and no model key, and connects', { timeout: 3000
   assert.equal(qq.peak(), 1);
   const bot = withDb(r.root, (store) => store.getControl('ready_username'));
   assert.equal(bot, 'mock-bot', 'the identity check in the README has something to show');
-  gatewayPid = readJson(pidFile()).pid;
+  const rec = readJson(pidFile());
+  gatewayPid = rec.pid;
+  // The recorded PID is the Gateway itself, not a launcher whose child does the work: it holds the Gateway port,
+  // and nothing under it runs the same command line.
+  assert.deepEqual(listenerPids(rec.port), [rec.pid], 'the recorded process alone listens on the Gateway port');
+  const { root, tree } = processTree(rec.pid);
+  assert.ok(root.cmd?.includes('gateway run'), 'positive control: the command line was readable');
+  assert.deepEqual(tree.filter((p) => p.cmd === root.cmd).map((p) => p.pid), [], 'no child relaunched with the same command line');
+  gatewayTree = tree.map((p) => p.pid);
   identifiesAtStart = qq.identifies.length;
 });
 
@@ -140,6 +193,8 @@ test('stop ends it, the socket closes, and nothing is left running or outside th
   const stopped = await run(['stop']);
   assert.equal(stopped.code, 0, stopped.err);
   assert.equal(pidAlive(rec.pid), false);
+  assert.deepEqual(gatewayTree.filter(pidAlive), [], 'nothing that start left running survives stop');
+  assert.deepEqual(listenerPids(rec.port), [], 'and nothing listens on the port');
   assert.equal(existsSync(pidFile()), false);
   assert.equal(withDb(r.root, (store) => store.getControl('heartbeat_at')), null, 'a stopped Gateway leaves no heartbeat to read as fresh');
   assert.equal(JSON.parse((await run(['status', '--json'])).out).heartbeatFresh, false);

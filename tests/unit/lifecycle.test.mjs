@@ -8,9 +8,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { digestOf, duplicateEnvNames, duplicateLinesHint, gatewayEnv, inspectGateway, lookupProcess, oldLinesHint, parseEnvFile, inspectStartLock, processInfo, readPidRecord, renamedEnvNames, startGateway, startLockFile, stopGateway, withStartLock } from '../../src/cli/lifecycle.mjs';
+import { digestOf, duplicateEnvNames, duplicateLinesHint, gatewayArgs, gatewayEnv, inspectGateway, openclawEntry, lookupProcess, oldLinesHint, parseEnvFile, inspectStartLock, processInfo, readPidRecord, renamedEnvNames, startGateway, startLockFile, stopGateway, withStartLock } from '../../src/cli/lifecycle.mjs';
 import { makeContext } from '../../src/cli/common.mjs';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
+import { e2eGatewayArgs, e2eGatewayEnv } from '../harness/gateway.mjs';
 import { APP_ID, baseConfig, clo, configOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, NODE, readJson, ROOT, testEnv, withDb } from './_cli-helper.mjs';
 
 const roots = [];
@@ -131,6 +132,41 @@ test('the Gateway env is an allowlist: no proxy, no parent key, only what .env g
   assert.ok(child.USERPROFILE.startsWith(r.root));
   assert.ok(child.OPENCLAW_STATE_DIR.startsWith(r.root));
   assert.ok(!child.PATH.toLowerCase().includes('nodejs'), 'the system Node is not on PATH');
+});
+
+// A compile cache that is not the host's own folder makes openclaw.mjs relaunch itself, and the recorded PID would be
+// a launcher. The semi-space flag must be a Node argument: NODE_OPTIONS never reaches the child.
+test('the Gateway runs with the compile cache off and a small semi-space, as one process', () => {
+  const r = makeRoot('memtune', null);
+  roots.push(r);
+  const ctx = makeContext({ env: testEnv(r.root), stdout: { write() {} }, stderr: { write() {} } });
+  const child = gatewayEnv(ctx.paths, ctx.env, { token: 'T' });
+  assert.equal(child.NODE_DISABLE_COMPILE_CACHE, '1');
+  assert.equal('NODE_COMPILE_CACHE' in child, false, 'no cache folder is handed on');
+  assert.equal(child.OPENCLAW_NO_RESPAWN, '1', 'positive control: the env under test is the one start builds');
+  assert.equal(gatewayEnv(ctx.paths, { ...ctx.env, NODE_COMPILE_CACHE: 'x' }).NODE_COMPILE_CACHE, undefined, 'and none comes from the parent');
+  const args = gatewayArgs(ctx.paths, ctx.env, 18790);
+  const entry = args.indexOf(openclawEntry(ctx.paths));
+  assert.ok(entry > 0, 'positive control: the entry script is in the args');
+  const flag = args.indexOf('--max-semi-space-size=8');
+  assert.ok(flag >= 0 && flag < entry, 'the flag comes before the entry script, so Node takes it and not the host');
+  assert.deepEqual(args.slice(entry + 1), ['gateway', 'run', '--port', '18790', '--bind', 'loopback']);
+});
+
+test('the e2e harness starts the Gateway with the same env and args as clo start', () => {
+  const r = makeRoot('harness-drift', null);
+  roots.push(r);
+  const ctx = makeContext({ env: testEnv(r.root), stdout: { write() {} }, stderr: { write() {} } });
+  const harnessEnv = e2eGatewayEnv(r.root, ctx.paths);
+  const startEnv = gatewayEnv(ctx.paths, ctx.env, { token: 'T' });
+  for (const k of ['NODE_DISABLE_COMPILE_CACHE', 'NODE_COMPILE_CACHE', 'NODE_OPTIONS', 'OPENCLAW_NO_RESPAWN', 'OPENCLAW_NO_AUTO_UPDATE', 'OPENCLAW_OFFLINE', 'PATH', 'HOME', 'OPENCLAW_CONFIG_PATH']) {
+    assert.equal(harnessEnv[k], startEnv[k], k);
+  }
+  assert.equal(harnessEnv.NODE_DISABLE_COMPILE_CACHE, '1', 'positive control: the compared value is set');
+  const harnessArgs = e2eGatewayArgs(r.root, 18790);
+  assert.deepEqual(harnessArgs, gatewayArgs(ctx.paths, { ...ctx.env, CLO_TEST_NODE_IMPORT: NET_GUARD }, 18790));
+  assert.ok(harnessArgs.includes('--max-semi-space-size=8'));
+  assert.ok(harnessArgs.some((a) => /net-guard\.mjs$/.test(a)), 'the harness still loads the net guard');
 });
 
 test('start, status, a second start, stop: own PID only, secrets by env, bystander unharmed', { timeout: 180000 }, async () => {

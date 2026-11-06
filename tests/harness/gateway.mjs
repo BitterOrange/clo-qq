@@ -9,7 +9,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { resolvePaths } from '../../src/clo-plugin/lib/core/config.js';
 import { hmacKey } from '../../src/clo-plugin/lib/core/ids.js';
+import { gatewayArgs, gatewayEnv } from '../../src/cli/lifecycle.mjs';
 import { cleanChildEnv } from './clean-env.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -18,8 +20,6 @@ export const NODE = join(ROOT, '.runtime', 'node', 'node.exe');
 export const OPENCLAW = join(ROOT, '.runtime', 'pkg', 'node_modules', 'openclaw', 'openclaw.mjs');
 export const PLUGIN_DIR = join(ROOT, 'src', 'clo-plugin');
 const NET_GUARD = join(HERE, 'net-guard.mjs');
-const OUTPUT_FILTER = join(ROOT, 'src', 'cli', 'host-output-filter.mjs');
-const COMPILE_CACHE = join(tmpdir(), 'clo-e2e-compile-cache');
 export const FAKE_MODEL_KEY = 'sk-or-v1-FAKE-KEY-FOR-LOCAL-MOCK-ONLY';
 export const FAKE_QQ_SECRET = 'FAKE-QQ-SECRET-FOR-LOCAL-MOCK-ONLY';
 const FAKE_GATEWAY_TOKEN = 'FAKE-GATEWAY-TOKEN-FOR-LOCAL-MOCK-ONLY';
@@ -88,40 +88,28 @@ export function deepMerge(a, b) {
   return out;
 }
 
-function childEnv(tmp, paths, extra = {}) {
-  const keep = {};
+// The environment clo start builds, from the same builder, so a Gateway here runs the way the console starts it.
+// Only the temp folders stay in the test root, where tests look for them. Built from an allowlist, so no proxy
+// variable or real key in the parent can reach the child.
+export function e2eGatewayEnv(tmp, paths, extra = {}) {
+  const parent = { CLO_TEST_ROOT: tmp, CLO_NET_GUARD_LOG: join(tmp, 'net-guard.jsonl') };
   for (const k of ['SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS']) {
-    if (process.env[k]) keep[k] = process.env[k];
+    if (process.env[k]) parent[k] = process.env[k];
   }
-  // Built from an allowlist, so no proxy variable or real key in the parent can reach the child.
+  const secrets = { CLO_QQ_APP_ID: APP_ID, CLO_QQ_APP_SECRET: FAKE_QQ_SECRET, CLO_CHAT_API_KEY: FAKE_MODEL_KEY };
   return {
-    ...keep,
-    PATH: `${dirname(NODE)};${process.env.SystemRoot ?? 'C:\\Windows'}\\System32`,
-    HOME: paths.home,
-    USERPROFILE: paths.home,
+    ...gatewayEnv(paths, parent, { secrets, token: FAKE_GATEWAY_TOKEN }),
     APPDATA: join(tmp, 'appdata', 'Roaming'),
     LOCALAPPDATA: join(tmp, 'appdata', 'Local'),
     TEMP: join(tmp, 'temp'),
     TMP: join(tmp, 'temp'),
-    OPENCLAW_HOME: paths.home,
-    OPENCLAW_STATE_DIR: paths.stateDir,
-    OPENCLAW_CONFIG_PATH: paths.openclawJson,
-    OPENCLAW_WORKSPACE_DIR: paths.workspace,
-    OPENCLAW_GATEWAY_TOKEN: FAKE_GATEWAY_TOKEN,
-    OPENCLAW_NO_AUTO_UPDATE: '1',
-    OPENCLAW_DISABLE_BONJOUR: '1',
-    OPENCLAW_OFFLINE: '1',
-    OPENCLAW_NO_RESPAWN: '1',
-    OPENCLAW_EXEC_SHELL_SNAPSHOT: '0',
-    NODE_COMPILE_CACHE: COMPILE_CACHE,
-    CLO_NET_GUARD_LOG: join(tmp, 'net-guard.jsonl'),
-    CLO_TEST_ROOT: tmp,
-    CLO_QQ_APP_ID: APP_ID,
-    CLO_QQ_APP_SECRET: FAKE_QQ_SECRET,
-    OPENROUTER_API_KEY: FAKE_MODEL_KEY,
-    NODE_NO_WARNINGS: '1',
     ...extra,
   };
+}
+
+// The arguments clo start passes, from the same builder: Node flags, output filter, net guard, entry, gateway run.
+export function e2eGatewayArgs(tmp, port) {
+  return gatewayArgs(resolvePaths({ CLO_TEST_ROOT: tmp }), { CLO_TEST_ROOT: tmp, CLO_TEST_NODE_IMPORT: NET_GUARD }, port);
 }
 
 export function makeTmp(label) {
@@ -151,8 +139,7 @@ export function pidAlive(pid) {
 export async function startGateway({ tmp, env, port, label = 'gateway', waitReady = true, cwd }) {
   const logPath = join(tmp, `${label}.log`);
   const guardArg = `--import=${pathToFileURL(NET_GUARD).href}`;
-  const filterArg = `--import=${pathToFileURL(OUTPUT_FILTER).href}`;
-  const child = spawn(NODE, [filterArg, guardArg, OPENCLAW, 'gateway', 'run', '--port', String(port), '--bind', 'loopback'], {
+  const child = spawn(NODE, e2eGatewayArgs(tmp, port), {
     cwd,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -183,7 +170,7 @@ export async function startGateway({ tmp, env, port, label = 'gateway', waitRead
     },
     async stop() {
       if (exited) return exited;
-      // /T covers a launcher respawn child. Only this handle's own process tree is touched.
+      // /T also ends any child the Gateway started. Only this handle's own process tree is touched.
       spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true });
       await until(() => exited, `gateway pid ${child.pid} to exit`, 15000);
       return exited;
@@ -241,7 +228,7 @@ export async function startStack({ label, groups = { [GROUP_A]: {} }, mode = 'li
   if (decision) model.setDecision(decision);
   const port = await allocPort();
 
-  const { buildEffective, resolvePaths } = await import('../../src/clo-plugin/lib/core/config.js');
+  const { buildEffective } = await import('../../src/clo-plugin/lib/core/config.js');
   const { renderOpenclaw, renderWorkspace, writeAtomic } = await import('../../src/clo-plugin/lib/core/render.js');
   const paths = resolvePaths({ CLO_TEST_ROOT: tmp });
   for (const d of [paths.home, paths.stateDir, paths.workspace, paths.cloDir, paths.logsDir, paths.gatewayCwd]) mkdirSync(d, { recursive: true });
@@ -257,7 +244,7 @@ export async function startStack({ label, groups = { [GROUP_A]: {} }, mode = 'li
   const openclaw = deepMerge(renderOpenclaw(cfg, eff, paths, { testMode: { apiKey: FAKE_MODEL_KEY } }), overrides);
   writeAtomic(paths.openclawJson, JSON.stringify(openclaw, null, 2));
 
-  const environment = childEnv(tmp, paths, env);
+  const environment = e2eGatewayEnv(tmp, paths, env);
   let gw = null;
   let generations = 0;
   let readyBase = 0;

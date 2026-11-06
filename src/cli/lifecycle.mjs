@@ -110,10 +110,13 @@ export function gatewayEnv(paths, parentEnv, { secrets = {}, token = null } = {}
     OPENCLAW_WORKSPACE_DIR: paths.workspace,
     OPENCLAW_NO_AUTO_UPDATE: '1',
     OPENCLAW_DISABLE_BONJOUR: '1',
-    // Keeps restarts in this process, so the PID we recorded stays the Gateway (read in docs/gateway/embedding.md).
+    // Keeps the host's own restarts in this process, and its stack-size relaunch off (docs/gateway/embedding.md).
     OPENCLAW_NO_RESPAWN: '1',
     OPENCLAW_EXEC_SHELL_SNAPSHOT: '0',
-    NODE_COMPILE_CACHE: join(paths.runtime, 'compile-cache'),
+    // With a compile cache that is not its own folder, openclaw.mjs relaunches itself and the PID we record becomes
+    // a launcher whose child is the real Gateway. With the cache off it stays one process, so the recorded PID is
+    // the Gateway itself. The cache also cost memory: about 185 MB idle in offline runs, for about 0.5-1 s of start.
+    NODE_DISABLE_COMPILE_CACHE: '1',
     NODE_NO_WARNINGS: '1',
   };
   if (token) base.OPENCLAW_GATEWAY_TOKEN = token;
@@ -138,8 +141,12 @@ function gatewayEntry(paths, env) {
   return isTestMode(env) && env.CLO_TEST_GATEWAY_ENTRY ? resolve(env.CLO_TEST_GATEWAY_ENTRY) : openclawEntry(paths);
 }
 
+// A smaller young generation: less memory after a turn and a lower peak, in offline runs. It has to be an argument,
+// since NODE_OPTIONS never reaches the child.
+export const GATEWAY_NODE_FLAGS = Object.freeze(['--max-semi-space-size=8']);
+
 export function gatewayArgs(paths, env, port) {
-  return [`--import=${pathToFileURL(OUTPUT_FILTER).href}`, ...nodeImports(env), gatewayEntry(paths, env), 'gateway', 'run', '--port', String(port), '--bind', 'loopback'];
+  return [...GATEWAY_NODE_FLAGS, `--import=${pathToFileURL(OUTPUT_FILTER).href}`, ...nodeImports(env), gatewayEntry(paths, env), 'gateway', 'run', '--port', String(port), '--bind', 'loopback'];
 }
 
 // For commands that only read, such as plugins inspect: same isolation, no secrets.
@@ -297,6 +304,7 @@ export async function startGateway(ctx, cfg, { secrets, lookup = processInfo }) 
   if (spawnError) throw new CliError(`Gateway 启动失败：${spawnError.code ?? '未知错误'}`);
   if (exited) throw new CliError(`Gateway 启动后立刻退出，退出码 ${exited.code}。详情见日志：${paths.gatewayLog}`);
 
+  // The child we spawned is the Gateway itself: the env above keeps the host from relaunching into a second process.
   // With no PID record, nothing could stop it later. This is the child we just spawned, by its handle.
   // Unref too, or a child that survived the kill would hold this command open until it exits.
   const endChild = () => {
