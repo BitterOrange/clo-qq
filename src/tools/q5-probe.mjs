@@ -25,7 +25,7 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isLoopback } from '../cli/common.mjs';
-import { gatewayEnv, openclawEntry, parseEnvFile, privateNode } from '../cli/lifecycle.mjs';
+import { GATEWAY_NODE_FLAGS, gatewayEnv, openclawEntry, parseEnvFile, privateNode } from '../cli/lifecycle.mjs';
 import { registerTools } from '../clo-plugin/lib/channels/qq/tools.js';
 import { buildEffective, OPENROUTER_BASE_URL, resolvePaths } from '../clo-plugin/lib/core/config.js';
 import { POLICY_V1_SHA256 } from '../clo-plugin/lib/core/contentPolicy.js';
@@ -661,7 +661,9 @@ export async function runGatewayStage({ plan, catalog, baseUrl, key, tracker, re
       turnCallLimit: plan.guardCallLimit ?? limit,
     });
     logFd = openSync(paths.gatewayLog, 'a');
+    // The same Node flags as clo start, so the probe measures the Gateway as it is really started.
     child = spawnImpl(privateNode(paths), [
+      ...GATEWAY_NODE_FLAGS,
       `--import=${pathToFileURL(OUTPUT_FILTER).href}`,
       `--import=${pathToFileURL(GUARD).href}`,
       ...(testMode || guardAllowedHost ? testImports.map((f) => `--import=${pathToFileURL(f).href}`) : []),

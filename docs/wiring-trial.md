@@ -158,7 +158,7 @@ mock QQ → SDK WebSocket → 我们的 gate → 真实 agent run → 真实 pro
 
 - 真实 QQ 的一切：事件形状、`is_you`、全量模式、发送错误码、资格门槛。
 - 真实 OpenRouter 的请求形状。OpenRouter 插件按 base URL 判断是否走原生路线，mock 的地址不是 `openrouter.ai`，所以这里没有归因头、`reasoning` 或缓存标记。Q5 要重查。`models.providers.openrouter.request.allowPrivateNetwork` 是这次测试才用的配置。
-- 优雅停机。Windows 上只测了 `taskkill /T /F`（Gateway 由启动器派生，进程 ID 不同；停止后已确认都不在了）和 `channels.stop`。没有测 Ctrl+C、关机、睡眠。
+- 优雅停机。Windows 上只测了 `taskkill /T /F`（当时 Gateway 由启动器派生，进程 ID 不同；停止后已确认都不在了。现在记录的 PID 就是 Gateway 本身，没有启动器）和 `channels.stop`。没有测 Ctrl+C、关机、睡眠。
 - 重启后的去重和 SDK 重连时的重复投递（骨架没有去重）。
 - 回合进行中重载通道时，迟到的 `deliver` 会怎样（exit 持有的 SDK 对象已经停止）。
 - 同一回合多段回复、长回复分段（只见过一个 final）。
@@ -173,7 +173,7 @@ cd <项目目录>
 .\.runtime\node\node.exe --test --test-concurrency=1 --test-reporter=spec "tests/e2e/*.test.mjs"
 ```
 
-当时 53 项约 13–15 分钟，现在 e2e 文件多了，全量串行约 90 分钟。只连 loopback，不需要任何真实密钥，也不读 `.env`。`qq-prompt-observation` 把详细观察写到临时目录里一个新的 `clo-prompt-observation-*` 文件夹（含完整系统提示词）并打印路径，不写进项目。`%TEMP%` 下 `clo-e2e-*` 是临时目录，测试结束时清理；`clo-e2e-compile-cache` 是 Node 编译缓存，可随时删除。
+当时 53 项约 13–15 分钟，现在 e2e 文件多了，全量串行约 90 分钟。只连 loopback，不需要任何真实密钥，也不读 `.env`。`qq-prompt-observation` 把详细观察写到临时目录里一个新的 `clo-prompt-observation-*` 文件夹（含完整系统提示词）并打印路径，不写进项目。`%TEMP%` 下 `clo-e2e-*` 是临时目录，测试结束时清理。当时还有 `clo-e2e-compile-cache` 作 Node 编译缓存；现在 harness 关闭编译缓存（`NODE_DISABLE_COMPILE_CACHE=1`），不再创建它，旧的文件夹可随时删除。
 
 文件：`src/clo-plugin/`、`tests/e2e/`（`qq-load`、`qq-lifecycle`、`qq-group-reply`、`qq-prompt-observation`）、`tests/harness/`（`gateway`、`mock-openrouter`、`mock-qq`、`net-guard`）。
 

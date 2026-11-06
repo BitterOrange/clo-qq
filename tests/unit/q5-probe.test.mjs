@@ -13,6 +13,7 @@ import {
   assertIsolated, assertNoQqRoute, buildPlan, classifyError, createSpendTracker, extraPriceFields, FAKE_APP_ID, FAKE_QQ_SECRET, FIXED, HOST_ADDED, parseCli, priceAboveCeiling, PRICE_CEILING, PRIMARY_ID,
   probeConfig, q5GatewayEnv, renderForProbe, reportedCostMicros, resolveEndpoint, restrictedFetch, runGatewayStage, runProbe, sanitizeResult, suggestConfig, sweepOldRunRoots, tokenCostMicros, TURN_CALL_LIMIT, watchStopSignals,
 } from '../../src/tools/q5-probe.mjs';
+import { GATEWAY_NODE_FLAGS, gatewayArgs } from '../../src/cli/lifecycle.mjs';
 import { resolvePaths } from '../../src/clo-plugin/lib/core/config.js';
 import { DECISION_INPUT_TOKENS } from '../../src/clo-plugin/lib/core/ledger.js';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
@@ -769,6 +770,22 @@ test('the Gateway is spawned with the allowlist, the fake QQ identity, the guard
   assert.ok(env.CLO_Q5_CALL_LOG);
   assert.ok(env.CLO_Q5_TURN_FILE);
   assert.equal(lines.find((l) => l.kind === 'gateway').state, 'gateway_not_connected');
+});
+
+test('the Gateway gets the same Node flags as clo start, before any import, and the same host command', async () => {
+  const { spawnImpl } = await stageWith();
+  const [{ args }] = spawnImpl.calls;
+  const port = Number(args[args.indexOf('--port') + 1]);
+  const paths = resolvePaths({});
+  // Built from gatewayArgs, not the constant alone, so a flag lifecycle adds inline is caught too.
+  const startArgs = gatewayArgs(paths, {}, port);
+  const flagsOf = (a) => a.slice(0, a.findIndex((x) => x.startsWith('--import=')));
+  assert.ok(GATEWAY_NODE_FLAGS.length > 0, 'positive control: clo start does pass flags');
+  assert.deepEqual(flagsOf(startArgs), [...GATEWAY_NODE_FLAGS], 'control: lifecycle puts them first');
+  assert.deepEqual(flagsOf(args), flagsOf(startArgs));
+  const tail = (a) => a.slice(a.indexOf('gateway'));
+  assert.deepEqual(tail(args), tail(startArgs));
+  assert.equal(args[args.indexOf('gateway') - 1].replace(/\\/g, '/').split('/').pop(), startArgs[startArgs.indexOf('gateway') - 1].replace(/\\/g, '/').split('/').pop());
 });
 
 test('outside test mode the guard names only the model host, and the native route has no test switches', async () => {

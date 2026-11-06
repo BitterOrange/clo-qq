@@ -19,7 +19,9 @@ let model;
 let r;
 let env;
 let gatewayPid;
-// Every process under the recorded one when it was up. Stop must leave none of them.
+// The recorded process and every process under it when it was up, each as PID plus start time, so a PID the OS
+// later hands to an unrelated process does not count. Stop must leave none of them.
+let gatewayRoot;
 let gatewayTree = [];
 let identifiesAtStart;
 // The console's own network calls, so a read that swallows its error is still seen. The Gateway has its own mock.
@@ -46,15 +48,20 @@ function listenerPids(port) {
   return [...pids];
 }
 
-// The processes started under pid since it started, with their command lines. Read only: nothing is signalled.
-function processTree(pid) {
+// Every process on the machine, with parent, command line and start time. Read only: nothing is signalled.
+function processList() {
   const script = "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
     + 'Get-CimInstance Win32_Process | ForEach-Object { @{ pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; cmd=$_.CommandLine; start=$_.CreationDate.ToUniversalTime().ToString("o") } } | ConvertTo-Json -Compress';
   const out = spawnSync(join(SYSTEM32, 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script], {
     cwd: tmpdir(), env: osToolEnv(process.env), encoding: 'utf8', windowsHide: true, timeout: 60000, maxBuffer: 64 * 1024 * 1024,
   });
   assert.equal(out.status, 0, 'the process list was read');
-  const all = JSON.parse(out.stdout);
+  return JSON.parse(out.stdout);
+}
+
+// The processes started under pid since it started, with their command lines.
+function processTree(pid) {
+  const all = processList();
   const root = all.find((p) => p.pid === pid);
   assert.ok(root, 'the recorded process is in the list');
   const tree = [];
@@ -68,6 +75,21 @@ function processTree(pid) {
   };
   walk(root);
   return { root, tree };
+}
+
+const sameProcess = (a, b) => a.pid === b.pid && a.start === b.start;
+
+// Which of the given processes still run: the same PID with the same start time in a fresh process list.
+function stillRunning(procs) {
+  const all = processList();
+  return procs.filter((p) => all.some((q) => sameProcess(p, q)));
+}
+
+// Which of the given processes hold a listening socket on the port. Another test may bind the port once it is
+// free, so a listener only counts when it is one of these processes, not merely any process on the port.
+function listenersAmong(port, procs) {
+  const listening = new Set(listenerPids(port));
+  return stillRunning(procs.filter((p) => listening.has(p.pid)));
 }
 
 before(async () => {
@@ -124,7 +146,8 @@ test('starts with no model lock and no model key, and connects', { timeout: 3000
   const { root, tree } = processTree(rec.pid);
   assert.ok(root.cmd?.includes('gateway run'), 'positive control: the command line was readable');
   assert.deepEqual(tree.filter((p) => p.cmd === root.cmd).map((p) => p.pid), [], 'no child relaunched with the same command line');
-  gatewayTree = tree.map((p) => p.pid);
+  gatewayRoot = root;
+  gatewayTree = tree;
   identifiesAtStart = qq.identifies.length;
 });
 
@@ -187,14 +210,22 @@ test('the whole step used no model, no Key read, no catalog read and no send', (
   assert.ok(qq.identifies.length >= 1, 'positive control: the Gateway did talk to the mock QQ');
 });
 
-test('stop ends it, the socket closes, and nothing is left running or outside the guard', { timeout: 120000 }, async () => {
+test('stop ends it, the socket closes, and nothing is left running or outside the guard', { timeout: 120000 }, async (t) => {
   const rec = readJson(pidFile());
   assert.ok(pidAlive(rec.pid), 'positive control: it was running');
+  assert.ok(gatewayRoot, 'the start step captured the Gateway process');
+  assert.equal(gatewayRoot.pid, rec.pid, 'the captured process is the recorded one');
+  const captured = [gatewayRoot, ...gatewayTree];
+  t.diagnostic(`captured the Gateway and ${gatewayTree.length} descendant(s)`);
+  // Positive controls for the same checks run after stop: the captured Gateway is found by PID plus start time,
+  // and it is the listener on its port.
+  assert.deepEqual(stillRunning([gatewayRoot]).map((p) => p.pid), [rec.pid], 'positive control: the snapshot finds the running Gateway');
+  assert.deepEqual(listenersAmong(rec.port, captured).map((p) => p.pid), [rec.pid], 'positive control: the Gateway is seen listening');
   const stopped = await run(['stop']);
   assert.equal(stopped.code, 0, stopped.err);
   assert.equal(pidAlive(rec.pid), false);
-  assert.deepEqual(gatewayTree.filter(pidAlive), [], 'nothing that start left running survives stop');
-  assert.deepEqual(listenerPids(rec.port), [], 'and nothing listens on the port');
+  assert.deepEqual(stillRunning(captured).map((p) => p.pid), [], 'nothing that start left running survives stop');
+  assert.deepEqual(listenersAmong(rec.port, captured).map((p) => p.pid), [], 'and none of it listens on the port');
   assert.equal(existsSync(pidFile()), false);
   assert.equal(withDb(r.root, (store) => store.getControl('heartbeat_at')), null, 'a stopped Gateway leaves no heartbeat to read as fresh');
   assert.equal(JSON.parse((await run(['status', '--json'])).out).heartbeatFresh, false);
