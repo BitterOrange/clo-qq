@@ -36,7 +36,7 @@ test('.env.example holds placeholders only, under the current names', () => {
     assert.match(line, /^[A-Z_]+=$/, 'a value in .env.example');
     names.push(line.slice(0, -1));
   }
-  assert.deepEqual(names, ['CLO_QQ_APP_ID', 'CLO_QQ_APP_SECRET', 'CLO_CHAT_API_KEY', 'CLO_SEARCH_API_KEY']);
+  assert.deepEqual(names, ['CLO_QQ_APP_ID', 'CLO_QQ_APP_SECRET', 'CLO_CHAT_API_KEY', 'CLO_SEARCH_API_KEY', 'CLO_TEST_API_KEY']);
   assert.match(text, /only with OpenRouter/);
   assert.match(text, /OpenAI-compatible endpoints are not\s+(# )?supported yet/);
   assert.match(text, /Nothing reads it/);

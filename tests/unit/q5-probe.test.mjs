@@ -10,12 +10,14 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import {
-  assertIsolated, assertNoQqRoute, assertOwnNoQqRoute, buildPlan, OWN_TURN_CALL_LIMIT, ownEffective, runOwnStage, classifyError, createSpendTracker, extraPriceFields, FAKE_APP_ID, FAKE_QQ_SECRET, FIXED, HOST_ADDED, parseCli, priceAboveCeiling, PRICE_CEILING, PRIMARY_ID,
+  assertIsolated, assertNoQqRoute, assertOwnNoQqRoute, buildPlan, checkCatalog, OPENROUTER_REASONING_FLOOR_TOKENS, OWN_FIELD_PRICE_BOUND, OWN_PRICE_CEILING, OWN_TURN_CALL_LIMIT, ownEffective, ownHistory, ownPresendRefusal, ownTurn, ownTurnBound,
+  PROBE_KEY_NAME, PROBE_MAX_TOKENS, runOwnStage, classifyError, createSpendTracker, extraPriceFields, FAKE_APP_ID, FAKE_QQ_SECRET, FIXED, HOST_ADDED, parseCli, priceAboveCeiling, PRICE_CEILING, PRIMARY_ID,
   probeConfig, q5GatewayEnv, renderForProbe, reportedCostMicros, resolveEndpoint, restrictedFetch, runGatewayStage, runProbe, sanitizeResult, suggestConfig, sweepOldRunRoots, tokenCostMicros, TURN_CALL_LIMIT, watchStopSignals,
 } from '../../src/tools/q5-probe.mjs';
 import { GATEWAY_NODE_FLAGS, gatewayArgs } from '../../src/cli/lifecycle.mjs';
 import { resolvePaths } from '../../src/clo-plugin/lib/core/config.js';
 import { DECISION_INPUT_TOKENS, replyHoldMicros } from '../../src/clo-plugin/lib/core/ledger.js';
+import { buildTurnRequest } from '../../src/clo-plugin/lib/core/turn.js';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { decisionText, defaultCatalog, startMockOpenRouter } from '../harness/mock-openrouter.mjs';
 import { NODE, ROOT } from './_cli-helper.mjs';
@@ -867,7 +869,8 @@ test('the CLI keeps the key out of stdout, stderr and results, and takes only th
   }
   const src = readFileSync(PROBE, 'utf8');
   assert.equal(src.match(/parseEnvFile\(/g).length, 1, 'one read of .env');
-  assert.ok(src.includes("parseEnvFile(paths.envFile, ['CLO_CHAT_API_KEY'])"));
+  assert.ok(src.includes('parseEnvFile(paths.envFile, [keyName])'), 'one name, picked by runtime');
+  assert.equal(PROBE_KEY_NAME.openclaw, 'CLO_CHAT_API_KEY');
   assert.ok(!/process\.env\.(OPENROUTER_API_KEY|CLO_CHAT_API_KEY)\s*=/.test(src), 'never put into its own environment');
 });
 
@@ -1441,31 +1444,78 @@ const ownPlan = buildPlan(ROOT, { runtime: 'own' });
 const isOwnTurn = (rec) => Array.isArray(rec.body?.messages?.[0]?.content);
 const ownRequests = (m) => m.requests.filter(isOwnTurn);
 const FAKE_IDS = ['Q5FAKEGROUP', 'Q5FAKEOWNER', 'Q5FAKEMEMBER', 'Q5FAKEBOT', FAKE_APP_ID, '127.0.0.1'];
-// The own turns answer this unless a test says otherwise. The direct primary calls keep the mock's default.
+// The own turns answer this unless a test says otherwise.
 const ANSWER = '四个：春夏秋冬。';
+// The cap the user agreed to for the own probe.
+const OWN_CAP = 0.1;
+// The real catalog row at the locked price. The mock's default row has a $6.25 cache write, above the own ceiling.
+const LOCKED = Object.freeze({ prompt: '0.000004', completion: '0.00002', input_cache_read: '0.0000002', input_cache_write: '0.000005', input_cache_write_1h: '0.000008' });
+const LOCKED_PRICE = { inputPerM: 4, outputPerM: 20, cacheReadPerM: 0.2, cacheWritePerM: 5 };
+const lockedCatalog = (pricing = LOCKED) => defaultCatalog().map((r) => (r.id.includes('opus') ? { ...r, pricing } : r));
+// Near the real shape: a cold turn writes the system prompt to the cache, a warm one reads it. Both costs sit at the
+// locked price, so the price check passes.
+const COLD = Object.freeze({ prompt_tokens: 4500, completion_tokens: 150, prompt_tokens_details: { cache_write_tokens: 4400 }, cost: 0.025 });
+const WARM = Object.freeze({ prompt_tokens: 4700, completion_tokens: 150, prompt_tokens_details: { cached_tokens: 4400 }, cost: 0.006 });
+// The turn-1 figure counted for COLD: the tokens at the catalog price, which are more than the reported cost.
+const COLD_COUNTED = 100 * 4 + 4400 * 5 + 150 * 20;
+const T1_BOUND = ownPlan.turns[0].boundMicros;
 
 async function ownMock(turnStep) {
   const m = await mock();
-  m.setScript((rec, n) => (isOwnTurn(rec)
-    ? (turnStep?.(rec, ownRequests(m).length) ?? { text: ANSWER, usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0.002 } })
-    : { text: '四个。', usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0.001 } }));
+  m.setCatalog(lockedCatalog());
+  m.setScript((rec) => {
+    if (!isOwnTurn(rec)) return { text: '四个。', usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0.001 } };
+    const n = ownRequests(m).length;
+    return turnStep?.(rec, n) ?? { text: ANSWER, usage: n === 1 ? COLD : WARM };
+  });
   return m;
 }
 
-const ownRun = (m, over = {}) => run(m, { plan: ownPlan, gatewayStage: async () => { throw new Error('the Gateway stage must not run'); }, ...over });
+const ownRun = (m, over = {}) => run(m, { plan: ownPlan, maxUsd: OWN_CAP, gatewayStage: async () => { throw new Error('the Gateway stage must not run'); }, ...over });
+const ownLines = (r) => r.lines.filter((l) => l.kind === 'own_turn');
+// Turn 2's gate figure, computed here from the body the mock received and the formula the plan prints.
+const gateFormula = (body, p1) => Math.ceil((Math.ceil(1.05 * p1) + Buffer.byteLength(JSON.stringify(body.messages[1]), 'utf8') + 64) * 5.5 + 1200 * 22);
+const byteBound = (body) => Math.ceil((Buffer.byteLength(JSON.stringify(body.messages), 'utf8') + 500) * 5.5 + body.max_tokens * 22);
 
-test('own plan: one request per turn at one worst-case call, no tool, and a user message with no ID in it', () => {
+test('own plan: no direct call, two turns of one request, turn 1 bounded from its exact bytes, and turn 2 gated', () => {
   assert.equal(ownPlan.runtime, 'own');
+  assert.equal(ownPlan.calls.length, 0);
   assert.equal(OWN_TURN_CALL_LIMIT, 1);
   assert.equal(ownPlan.turnCallLimit, 1);
+  assert.equal(ownPlan.maxModelCalls, 2);
   assert.deepEqual(ownPlan.turns.map((t) => t.id), ['own_turn_1', 'own_turn_2']);
-  assert.equal(ownPlan.turns[0].worstMicros, ownPlan.turnCallWorstMicros);
-  assert.equal(ownPlan.maxModelCalls, ownPlan.calls.length + ownPlan.turns.length);
-  assert.equal(ownPlan.totalWorstMicros, ownPlan.calls.reduce((a, c) => a + c.worstMicros, 0) + ownPlan.turns.length * ownPlan.turnCallWorstMicros);
-  assert.equal(ownPlan.tool, undefined, 'the own runner sends no tools');
-  // Positive control: the Gateway plan holds two calls a turn and carries the tool schema.
-  assert.equal(plan.turns[0].worstMicros, 2 * ownPlan.turnCallWorstMicros);
+  assert.deepEqual(OWN_PRICE_CEILING, { inputPerM: 5.5, outputPerM: 22 });
+  assert.equal(PROBE_MAX_TOKENS, 1200);
+  assert.equal(ownPlan.probeMaxTokens, PROBE_MAX_TOKENS);
+  assert.ok(PROBE_MAX_TOKENS > OPENROUTER_REASONING_FLOOR_TOKENS, 'max_tokens must be above the reasoning floor');
+  assert.equal(OPENROUTER_REASONING_FLOOR_TOKENS, 1024);
+  // Turn 1's bound, computed here from the exact body the runner would build.
+  const body = buildTurnRequest({ models: { primary: { id: PRIMARY_ID, effort: 'low', maxTokens: 1200 } } }, ownPlan.texts.systemPrompt, ownTurn(FIXED.turns[0], { at: Date.now(), i: 0 }));
+  const bytes = Buffer.byteLength(JSON.stringify(body.messages), 'utf8');
+  assert.equal(ownPlan.turns[0].messageBytes, bytes);
+  assert.equal(T1_BOUND, Math.ceil((bytes + 500) * 5.5 + 1200 * 22));
+  assert.equal(T1_BOUND, 94144, 'the figure the docs carry');
+  assert.equal(ownPlan.turns[0].worstMicros, T1_BOUND);
+  assert.equal(ownPlan.turns[1].boundMicros, null, 'turn 2 has no static bound: it is gated at run time');
+  assert.equal(ownPlan.turns[1].gated, true);
+  assert.equal(ownPlan.totalWorstMicros, T1_BOUND);
+  assert.ok(ownPlan.totalWorstMicros <= 100000, 'within the agreed $0.10');
+  // The production fields stay as they are, for suggestConfig only, and no turn figure is derived from them.
+  assert.equal(ownPlan.primaryMaxTokens, 3000);
+  assert.equal(ownPlan.contextTokens, 24000);
+  assert.equal(ownPlan.turnCallWorstMicros, undefined);
+  // The field bound is the locked price plus 10%, so a new lock cannot leave it behind.
+  const lock = JSON.parse(readFileSync(join(ROOT, 'versions.lock.json'), 'utf8')).models.lock.primary.price;
+  for (const k of ['inputPerM', 'outputPerM', 'cacheReadPerM', 'cacheWritePerM']) assert.ok(Math.abs(OWN_FIELD_PRICE_BOUND[k] - lock[k] * 1.1) < 1e-9, k);
+  assert.equal(OWN_PRICE_CEILING.inputPerM, Math.max(OWN_FIELD_PRICE_BOUND.inputPerM, OWN_FIELD_PRICE_BOUND.cacheWritePerM));
+  // Positive control in the same run: the Gateway plan is unchanged.
+  assert.equal(plan.totalWorstMicros, 1548352);
+  assert.equal(plan.calls.length, 5);
+  assert.equal(plan.turnCallWorstMicros, 282000);
+  assert.equal(plan.turns[0].worstMicros, 2 * 282000);
+  assert.equal(plan.probeMaxTokens, undefined);
   assert.ok(plan.tool);
+  assert.equal(ownPlan.tool, undefined, 'the own runner sends no tools');
   assert.equal(ownPlan.userPreview.length, 2);
   const [first, second] = ownPlan.userPreview.map((u) => u.split('\n'));
   assert.match(first[0], /^\[clo-turn class=at time=\S+ \S+ Asia\/Shanghai\]$/);
@@ -1475,7 +1525,18 @@ test('own plan: one request per turn at one worst-case call, no tool, and a user
   assert.throws(() => buildPlan(ROOT, { runtime: 'gateway' }), /unknown runtime/);
 });
 
-test('own plan without --approve: the runner layout is printed, with no request and no .env read', async () => {
+test('the turn bound: the byte bound with no earlier figure, else the smaller of it and the one from turn 1', () => {
+  const body = buildTurnRequest({ models: { primary: { id: PRIMARY_ID, effort: 'low', maxTokens: 1200 } } }, ownPlan.texts.systemPrompt, ownTurn(FIXED.turns[1], { at: Date.now(), i: 1, history: ownHistory(FIXED.turns[0], Date.now(), ANSWER) }));
+  assert.equal(ownTurnBound(body), byteBound(body));
+  assert.equal(ownTurnBound(body, COLD), gateFormula(body, 4500));
+  assert.ok(ownTurnBound(body, COLD) < byteBound(body), 'from turn 1 it is tighter');
+  // P1 is the larger of the prompt and what the cache holds.
+  assert.equal(ownTurnBound(body, { prompt_tokens: 10, prompt_tokens_details: { cached_tokens: 3000, cache_write_tokens: 1000 } }), gateFormula(body, 4000));
+  // A turn 1 that reported more than its bytes cannot raise the bound above the byte bound.
+  assert.equal(ownTurnBound(body, { prompt_tokens: 50000 }), byteBound(body));
+});
+
+test('own plan without --approve: the bounds, the gate and the guarantees are printed, with no request and no .env read', async () => {
   const m = await mock();
   const root = cliRoot('ownplan');
   const fsLog = join(root, 'fs.log');
@@ -1485,32 +1546,55 @@ test('own plan without --approve: the runner layout is printed, with no request 
   assert.match(r.stdout, /no Gateway, no QQ and no mock QQ/);
   for (const u of ownPlan.userPreview) assert.ok(r.stdout.includes(u), 'the exact user message');
   assert.ok(!r.stdout.includes(HOST_ADDED.runtimeContextPrefix), 'nothing the host would add');
-  assert.ok(r.stdout.includes(`At most ${ownPlan.maxModelCalls} model calls`));
+  assert.ok(r.stdout.includes('Planned calls: 0 direct, then 2 turns'));
+  assert.ok(r.stdout.includes('At most 2 model calls'));
+  assert.ok(r.stdout.includes(`own_turn_1: own turn runner, bound $0.0941 = (${ownPlan.turns[0].messageBytes} bytes of messages + 500) x $5.5/M + 1200 x $22/M`));
+  assert.ok(r.stdout.includes('recorded as skipped_cap and nothing is sent'));
+  assert.ok(r.stdout.includes(`its user message is ${ownPlan.turn2BaseUserBytes} bytes plus the answer's bytes`), 'the threshold moves with the answer');
+  // Turn 1's bound is conditional: it rests on three things only checked after turn 1 is charged.
+  assert.ok(r.stdout.includes('turn 1 stays within $0.0941 provided its completion tokens are at most max_tokens (1200), its prompt tokens are at most the message bytes plus 500, and the price charged is at or below the ceiling above'));
+  assert.ok(r.stdout.includes('each is checked after turn 1, so a breach stops the run only after turn 1 was charged'));
+  assert.doesNotMatch(r.stdout, /provably|strictly/, 'no unconditional claim for turn 1');
+  assert.ok(r.stdout.includes('provided the usage OpenRouter reports is accurate'));
+  // The total also rests on turn 2 itself: nothing checks its price or its prompt before it leaves, and it is the last turn.
+  assert.ok(r.stdout.includes('and provided turn 2 costs no more than B2: its price charged at or below the ceiling above, its completion tokens at most max_tokens, and its prompt tokens within the estimate B2 used (the margin 1.05 and the slack 64 are allowances, not derived from data)'));
+  assert.ok(r.stdout.includes('Turn 2 is the last turn, so the checks after it only report a breach; they prevent nothing.'));
+  assert.ok(r.stdout.includes('Turn 2 is sent only if its bound B2 fits in what is left under --max-usd.'));
+  assert.doesNotMatch(r.stdout, /Turn 2 can use at most what is left/, 'no claim that turn 2 is capped by what is left');
+  assert.ok(r.stdout.includes('unconditional backstop'));
+  assert.ok(r.stdout.includes('No max_price is sent'));
+  assert.ok(r.stdout.includes("an inference from OpenRouter's routing docs"));
+  assert.ok(r.stdout.includes('No data in this mode: content_policy_block, decision_prompt and the ledger.decisionHoldInputTokens suggestion'));
+  assert.ok(r.stdout.includes('CLO_TEST_API_KEY'));
+  assert.ok(!r.stdout.includes(FIXED.baselineSystem), 'no direct call text in this mode');
+  assert.ok(!r.stdout.includes(plan.texts.decisionPrompt.trimEnd()), 'and no decision prompt');
   assert.equal(paid(m) + m.other.length, 0);
   assert.equal(existsSync(fsLog), false);
   // Positive control: the default is still the Gateway plan.
   const gw = await cli([], { root });
   assert.ok(gw.stdout.includes(HOST_ADDED.runtimeContextPrefix));
+  assert.ok(gw.stdout.includes(FIXED.baselineSystem));
   assert.doesNotMatch(gw.stdout, /runtime own/);
 });
 
-test('own run: both turns go through the runner, one request each, with the locked model, the cache marker and no ID', async () => {
+test('own run: both turns go through the runner, one request each, with the probe max_tokens, the cache marker and no ID', async () => {
   const m = await ownMock();
   const parent = tempDir('ownparent');
   const r = await ownRun(m, { tempParent: parent });
   assert.equal(r.stopReason, null, r.said);
-  assert.equal(m.requests.length, ownPlan.calls.length + 2, 'positive control: the direct calls ran too');
+  assert.equal(m.requests.length, 2, 'no direct call: only the two turns');
   const reqs = ownRequests(m);
   assert.equal(reqs.length, 2, 'exactly one request per turn');
   for (const rec of reqs) {
     const b = rec.body;
+    assert.deepEqual(Object.keys(b).sort(), ['max_tokens', 'messages', 'model', 'provider', 'reasoning', 'stream', 'usage']);
     assert.equal(b.model, PRIMARY_ID);
     assert.equal(b.stream, false);
-    assert.equal(b.max_tokens, ownPlan.primaryMaxTokens);
-    assert.deepEqual(b.reasoning, { effort: ownPlan.primaryEffort });
+    assert.equal(b.max_tokens, 1200, 'the probe cap, not the production one');
+    assert.notEqual(b.max_tokens, ownPlan.primaryMaxTokens);
+    assert.deepEqual(b.reasoning, { effort: 'low' });
     assert.deepEqual(b.provider, { require_parameters: true });
     assert.deepEqual(b.usage, { include: true });
-    for (const k of ['tools', 'tool_choice', 'models', 'route', 'user', 'fallbacks']) assert.equal(b[k], undefined, k);
     assert.equal(b.messages.length, 2);
     assert.deepEqual(b.messages[0].content, [{ type: 'text', text: ownPlan.texts.systemPrompt, cache_control: { type: 'ephemeral' } }]);
     assert.equal(typeof b.messages[1].content, 'string');
@@ -1524,26 +1608,342 @@ test('own run: both turns go through the runner, one request each, with the lock
   assert.deepEqual(u1.recent, []);
   assert.equal(u2.text, FIXED.turns[1]);
   assert.deepEqual(u2.recent, [{ who: 'U1', text: FIXED.turns[0] }, { who: '可洛', text: ANSWER }], 'her answer to turn 1 is in turn 2 as her own line');
-  const lines = r.lines.filter((l) => l.kind === 'own_turn');
+  const lines = ownLines(r);
   assert.deepEqual(lines.map((l) => [l.state, l.guardRequests, l.collects, l.cacheMarker, l.sameSystem]), [['completed', 1, 1, true, true], ['completed', 1, 1, true, true]]);
-  assert.deepEqual(lines.map((l) => l.countedUsd), [0.002, 0.002]);
+  assert.deepEqual(lines.map((l) => l.countedUsd), [COLD_COUNTED / 1e6, 0.006]);
+  // Each line carries the bound the turn was let through on: turn 1's static one, turn 2's gate figure.
+  assert.equal(lines[0].worstUsd, T1_BOUND / 1e6);
+  assert.equal(lines[1].worstUsd, gateFormula(reqs[1].body, 4500) / 1e6);
+  assert.ok(gateFormula(reqs[1].body, 4500) < byteBound(reqs[1].body));
   assert.equal(r.totals.countedAtWorstMicros, 0);
+  assert.ok(r.totals.totalMicros <= OWN_CAP * 1e6);
   assert.equal(r.lines.find((l) => l.kind === 'own_stage').state, 'finished');
   assert.equal(r.lines.find((l) => l.kind === 'run_start').runtime, 'own');
+  assert.match(r.said, /Content-policy block, decision prompt and the decision hold: no data/);
+  assert.doesNotMatch(r.said, /tokens above baseline/);
   assert.ok(!r.raw.includes(ANSWER), 'the answer is not in the results');
   assert.ok(!r.raw.includes(FAKE_KEY));
   assert.deepEqual(readdirSync(parent), [], 'no temp root: nothing on disk in this mode');
   assert.equal(existsSync(join(tmpdir(), 'clo-q5-own-unused')), false);
 });
 
+test('the turn 2 gate: a cheap short turn 1 lets it through; a dear or a long-answer turn 1 skips it with nothing sent', async () => {
+  // Turn 1 counted at its catalog tokens, and close to a full 1200-token answer.
+  const dear = await ownMock((rec, n) => (n === 1 ? { text: ANSWER, usage: { prompt_tokens: 4500, completion_tokens: 1200, prompt_tokens_details: { cache_write_tokens: 4400 }, cost: 0.046 } } : undefined));
+  const d = await ownRun(dear);
+  assert.equal(d.stopReason, null, 'a skip is a planned branch, not a failure');
+  assert.equal(ownRequests(dear).length, 1, 'turn 2 never left');
+  const [d1, d2] = ownLines(d);
+  assert.equal(d1.countedUsd, (100 * 4 + 4400 * 5 + 1200 * 20) / 1e6);
+  assert.equal(d2.state, 'skipped_cap');
+  assert.equal(d2.guardRequests, 0);
+  assert.equal(d2.countedUsd, 0);
+  assert.ok(d1.countedUsd * 1e6 + d2.worstUsd * 1e6 > OWN_CAP * 1e6, 'it would have passed the cap');
+  assert.match(d.said, /own_turn_2: skipped_cap\. Its bound \$\d\.\d{4} plus the \$0\.0464 counted so far would pass the cap \$0\.1000, so nothing was sent\./);
+  assert.match(d.said, /warm turn was skipped, so the cache read was not measured/);
+  const measure = d.lines.find((l) => l.name === 'warm_cache_read');
+  assert.equal(measure.state, 'skipped_cap');
+  assert.equal(measure.tokens, null);
+  assert.equal(d.totals.totalMicros, (100 * 4 + 4400 * 5 + 1200 * 20));
+
+  // The same cheap turn 1 with a long answer: turn 2's user message carries it, so its bound grows past the room left.
+  const LONG = '春'.repeat(2000);
+  const long = await ownMock((rec, n) => (n === 1 ? { text: LONG, usage: COLD } : undefined));
+  const l = await ownRun(long);
+  assert.equal(l.stopReason, null);
+  assert.equal(ownRequests(long).length, 1, 'turn 2 never left');
+  const [l1, l2] = ownLines(l);
+  assert.equal(l1.countedUsd, COLD_COUNTED / 1e6);
+  assert.equal(l2.state, 'skipped_cap');
+  assert.ok(COLD_COUNTED + l2.worstUsd * 1e6 > OWN_CAP * 1e6);
+
+  // Positive control: the same turn 1 with the short answer sends turn 2.
+  const short = await ownMock((rec, n) => (n === 1 ? { text: ANSWER, usage: COLD } : undefined));
+  const s = await ownRun(short);
+  assert.equal(s.stopReason, null);
+  assert.equal(ownRequests(short).length, 2);
+  assert.equal(ownLines(s)[1].state, 'completed');
+  assert.ok(ownLines(s)[1].worstUsd < l2.worstUsd, 'the bound moved with the answer length');
+});
+
+test('a turn with no usage counts at its own bound, not a production worst, and stops the run with no cap flag', async () => {
+  for (const usage of [null, { prompt_tokens: 4000, completion_tokens: 20, cost: 0 }]) {
+    const m = await ownMock(() => ({ text: ANSWER, usage }));
+    const r = await ownRun(m);
+    assert.equal(r.stopReason, 'usage_missing', JSON.stringify(usage));
+    assert.equal(ownRequests(m).length, 1, 'the second turn did not run');
+    const line = ownLines(r)[0];
+    assert.equal(line.usageMissing, true);
+    assert.equal(line.countedUsd, T1_BOUND / 1e6);
+    assert.equal(r.totals.countedAtWorstMicros, T1_BOUND);
+    assert.equal(r.totals.missingCount, 1);
+    assert.ok(r.totals.totalMicros <= r.totals.capMicros);
+    assert.deepEqual(r.keyCheck.flags, [], 'no tracker_above_cap');
+    assert.doesNotMatch(r.said, /running total went past the cap/);
+  }
+  // Positive control: a turn with usage counts what it reported, at the catalog tokens.
+  const fine = await ownMock();
+  const ok = await ownRun(fine);
+  assert.equal(ownLines(ok)[0].usageMissing, false);
+  assert.equal(ownLines(ok)[0].countedUsd, COLD_COUNTED / 1e6);
+  assert.equal(ok.totals.countedAtWorstMicros, 0);
+});
+
+test('after turn 1: a cost above the tokens at the locked price plus 10%, too many output or prompt tokens, each stop', async () => {
+  const fieldBound = tokenCostMicros(COLD, OWN_FIELD_PRICE_BOUND);
+  assert.equal(fieldBound, Math.ceil(100 * 4.4 + 4400 * 5.5 + 150 * 22));
+  const cases = [
+    // About what a 2x priority endpoint would charge.
+    ['price_above_bound', { ...COLD, cost: 0.05 }],
+    ['price_above_bound', { ...COLD, cost: (fieldBound + 1100) / 1e6 }],
+    ['completion_above_bound', { ...COLD, completion_tokens: 1201 }],
+    ['prompt_above_bound', { ...COLD, prompt_tokens: ownPlan.turns[0].messageBytes + 501 }],
+    ['usage_tokens_missing', { ...COLD, prompt_tokens: undefined }],
+  ];
+  for (const [stop, usage] of cases) {
+    const m = await ownMock((rec, n) => (n === 1 ? { text: ANSWER, usage } : undefined));
+    const r = await ownRun(m);
+    assert.equal(r.stopReason, stop, JSON.stringify(usage));
+    assert.equal(ownRequests(m).length, 1, `${stop}: no turn 2`);
+    assert.match(r.said, new RegExp(`Stopped after own_turn_1: ${stop}`));
+  }
+  // Positive controls: within the tolerance, and exactly at the token bounds, passes.
+  const atBounds = [
+    { ...COLD, cost: (fieldBound + 900) / 1e6 },
+    { ...COLD, completion_tokens: 1200 },
+    { ...COLD, prompt_tokens: ownPlan.turns[0].messageBytes + 500, cost: 0.06 },
+  ];
+  for (const usage of atBounds) {
+    const m = await ownMock((rec, n) => (n === 1 ? { text: ANSWER, usage } : undefined));
+    const r = await ownRun(m);
+    assert.equal(r.stopReason, null, JSON.stringify(usage));
+    assert.equal(ownLines(r)[0].state, 'completed');
+  }
+});
+
+test('the total rests on turn 2 too: accurate usage at twice the price, or a prompt past the B2 estimate, passes the cap after the fact', async () => {
+  // Turn 2 at about a 2x endpoint, no cache, a full answer, reported accurately. Nothing checks its price before it leaves.
+  const dear = await ownMock((rec, n) => (n === 2 ? { text: ANSWER, usage: { prompt_tokens: 4500, completion_tokens: 1200, cost: (4500 * 8 + 1200 * 40) / 1e6 } } : undefined));
+  const d = await ownRun(dear);
+  assert.equal(ownRequests(dear).length, 2, 'the gate let turn 2 through');
+  const [d1, d2] = ownLines(d);
+  assert.equal(d1.countedUsd, COLD_COUNTED / 1e6);
+  assert.ok(COLD_COUNTED + d2.worstUsd * 1e6 <= OWN_CAP * 1e6, 'B2 fitted under the cap');
+  assert.equal(d2.countedUsd, (4500 * 8 + 1200 * 40) / 1e6, 'the accurate figure is what is counted');
+  assert.ok(d2.countedUsd > d2.worstUsd, 'turn 2 cost more than its bound');
+  assert.ok(d.totals.totalMicros > OWN_CAP * 1e6, 'the total passed --max-usd');
+  assert.equal(d.stopReason, 'price_above_bound', 'reported only after turn 2 was charged');
+  assert.ok(d.keyCheck.flags.includes('tracker_above_cap'));
+  assert.match(d.said, /running total went past the cap/);
+
+  // Turn 2 at the locked price, but its prompt at the most the post-turn check allows, which is far past B2's estimate.
+  const T1 = { prompt_tokens: 4500, completion_tokens: 600, prompt_tokens_details: { cache_write_tokens: 4400 }, cost: (100 * 4 + 4400 * 5 + 600 * 20) / 1e6 };
+  const wide = await ownMock((rec, n) => {
+    if (n === 1) return { text: ANSWER, usage: T1 };
+    const prompt = Buffer.byteLength(JSON.stringify(rec.body.messages), 'utf8') + 500;
+    return { text: ANSWER, usage: { prompt_tokens: prompt, completion_tokens: 1200, cost: (prompt * 4 + 1200 * 20) / 1e6 } };
+  });
+  const w = await ownRun(wide);
+  assert.equal(ownRequests(wide).length, 2, 'the gate let turn 2 through');
+  const [, w2] = ownLines(w);
+  assert.ok(w2.promptTokens > Math.ceil(1.05 * 4500) + 64, 'past the estimate B2 used');
+  assert.ok(w2.countedUsd > w2.worstUsd, 'turn 2 cost more than its bound');
+  assert.ok(w.totals.totalMicros > OWN_CAP * 1e6, 'the total passed --max-usd at the locked price');
+  assert.ok(w.keyCheck.flags.includes('tracker_above_cap'));
+
+  // Positive control: turn 2 at the locked price and within the estimate stays under its bound and the cap.
+  const fine = await ownMock();
+  const f = await ownRun(fine);
+  assert.equal(f.stopReason, null);
+  assert.equal(ownRequests(fine).length, 2);
+  assert.ok(ownLines(f)[1].countedUsd <= ownLines(f)[1].worstUsd);
+  assert.ok(f.totals.totalMicros <= OWN_CAP * 1e6);
+  assert.deepEqual(f.keyCheck.flags, []);
+});
+
+// The body the runner builds for turn 1, and the context the check gets for it.
+const presendCtx = (over = {}) => ({ plan: ownPlan, messageBytes: ownPlan.turns[0].messageBytes, firstSystem: null, ...over });
+const baselineBody = () => buildTurnRequest({ models: { primary: { id: PRIMARY_ID, effort: 'low', maxTokens: 1200 } } }, ownPlan.texts.systemPrompt, ownTurn(FIXED.turns[0], { at: Date.now(), i: 0 }));
+const PRESEND = [
+  ['a tools field', (b) => { b.tools = []; }, 'presend_tools'],
+  ['a tool_choice field', (b) => { b.tool_choice = 'none'; }, 'presend_tools'],
+  ['an extra field', (b) => { b.response_format = { type: 'json_object' }; }, 'presend_fields'],
+  ['a missing field', (b) => { delete b.usage; }, 'presend_fields'],
+  ['a :suffix model', (b) => { b.model = `${PRIMARY_ID}:nitro`; }, 'presend_model'],
+  ['another model', (b) => { b.model = 'anthropic/claude-haiku-5.5'; }, 'presend_model'],
+  ['the production max_tokens', (b) => { b.max_tokens = 3000; }, 'presend_max_tokens'],
+  ['streaming', (b) => { b.stream = true; }, 'presend_stream'],
+  ['another effort', (b) => { b.reasoning = { effort: 'high' }; }, 'presend_reasoning'],
+  ['a reasoning budget', (b) => { b.reasoning = { effort: 'low', max_tokens: 5000 }; }, 'presend_reasoning'],
+  ['no usage report', (b) => { b.usage = { include: false }; }, 'presend_usage'],
+  ['a provider order', (b) => { b.provider = { require_parameters: true, order: ['anthropic'] }; }, 'presend_provider'],
+  ['a provider sort', (b) => { b.provider = { require_parameters: true, sort: 'price' }; }, 'presend_provider'],
+  ['a service tier', (b) => { b.provider = { require_parameters: true, service_tier: 'priority' }; }, 'presend_provider'],
+  ['a max_price', (b) => { b.provider = { require_parameters: true, max_price: { prompt: 4.4 } }; }, 'presend_provider'],
+  ['no require_parameters', (b) => { b.provider = {}; }, 'presend_provider'],
+  ['three messages', (b) => { b.messages.push({ role: 'user', content: 'x' }); }, 'presend_messages'],
+  ['a second cache marker', (b) => { b.messages[0].content.push({ type: 'text', text: '', cache_control: { type: 'ephemeral' } }); }, 'presend_cache_control'],
+  ['a 1h ttl', (b) => { b.messages[0].content[0].cache_control = { type: 'ephemeral', ttl: '1h' }; }, 'presend_cache_control'],
+  ['no cache marker', (b) => { delete b.messages[0].content[0].cache_control; }, 'presend_cache_control'],
+  ['another system text of the same length', (b) => { const t = b.messages[0].content[0].text; b.messages[0].content[0].text = `${t.slice(0, -1)}x`; }, 'presend_system_changed'],
+  ['more bytes than the bound', (b) => { b.messages[1].content += 'x'; }, 'presend_bytes'],
+];
+
+test('pre-send checks: each difference from the planned body has its own reason, next to the accepted body', () => {
+  assert.equal(ownPresendRefusal(baselineBody(), presendCtx()), null, 'positive control: the runner body passes');
+  for (const [name, mutate, reason] of PRESEND) {
+    const b = baselineBody();
+    mutate(b);
+    assert.equal(ownPresendRefusal(b, presendCtx()), reason, name);
+  }
+  // Turn 2 must carry turn 1's system text byte for byte.
+  assert.equal(ownPresendRefusal(baselineBody(), presendCtx({ firstSystem: ownPlan.texts.systemPrompt })), null);
+  assert.equal(ownPresendRefusal(baselineBody(), presendCtx({ firstSystem: `${ownPlan.texts.systemPrompt} ` })), 'presend_system_changed');
+  assert.equal(ownPresendRefusal(null, presendCtx()), 'presend_unreadable');
+});
+
+test('a refused body never reaches http(): the run stops with that reason and counts nothing', async () => {
+  // A stand-in runner that sends what the real one would, changed by one check's worth.
+  const standIn = (mutate) => (args) => runOwnStage({
+    ...args,
+    factories: {
+      createTurnRunner: ({ client, getEffective, readSystemPrompt }) => async (turn, { signal } = {}) => {
+        const body = buildTurnRequest(getEffective(), readSystemPrompt(), turn);
+        mutate(body);
+        const r = await client.post(body, { signal });
+        return { started: true, hostError: r.kind !== 'ok', aborted: false, usage: r.usage };
+      },
+    },
+  });
+  for (const [name, mutate, reason] of PRESEND) {
+    const m = await ownMock();
+    const r = await ownRun(m, { ownStage: standIn(mutate) });
+    assert.equal(ownRequests(m).length, 0, `${name}: nothing reached the model host`);
+    assert.equal(r.stopReason, reason, name);
+    const line = ownLines(r)[0];
+    assert.equal(line.reason, reason, name);
+    assert.equal(line.guardRequests, 0, name);
+    assert.equal(line.countedUsd, 0, name);
+    assert.equal(r.totals.totalMicros, 0, name);
+  }
+  // Positive control: the same stand-in with nothing changed does reach the host.
+  const m = await ownMock();
+  const r = await ownRun(m, { ownStage: standIn(() => {}) });
+  assert.equal(ownRequests(m).length >= 1, true);
+  assert.ok(!String(r.stopReason).startsWith('presend_'), String(r.stopReason));
+  assert.equal(ownLines(r)[0].guardRequests, 1);
+});
+
+test('own catalog check: the own ceiling on every input and output rate and tier, and the 1h write only while ttl is refused', () => {
+  const cfg = probeConfig({ repoRoot: ROOT, qqBase: 'http://127.0.0.1:9', port: 1 });
+  const check = (p, pricing) => checkCatalog(p, lockedCatalog(pricing), cfg).problems;
+  assert.deepEqual(check(ownPlan, LOCKED), [], 'positive control: the locked row, with its $8 1h write, passes');
+  for (const [name, pricing] of [
+    ['prompt', { ...LOCKED, prompt: '0.0000056' }],
+    ['cache read', { ...LOCKED, input_cache_read: '0.0000056' }],
+    ['cache write (the mock default)', { ...LOCKED, input_cache_write: '0.00000625' }],
+    ['completion', { ...LOCKED, completion: '0.000023' }],
+    ['an override prompt', { ...LOCKED, overrides: [{ min_prompt_tokens: 1, prompt: '0.000006' }] }],
+    ['an override cache write', { ...LOCKED, overrides: [{ min_prompt_tokens: 1, input_cache_write: '0.000006' }] }],
+    ['an override completion', { ...LOCKED, overrides: [{ min_prompt_tokens: 1, completion: '0.000023' }] }],
+    ['a 1h write above even the general ceiling', { ...LOCKED, input_cache_write_1h: '0.000009' }],
+  ]) assert.deepEqual(check(ownPlan, pricing), ['primary_price_above_ceiling'], name);
+  // Exactly at the ceiling is not above it.
+  assert.deepEqual(check(ownPlan, { ...LOCKED, prompt: '0.0000055', input_cache_write: '0.0000055', completion: '0.000022' }), []);
+  // With the ttl check off, the 1h write is no longer exempt, and the same locked row is refused.
+  const noTtlCheck = { ...ownPlan, refuseCacheTtl: false };
+  assert.deepEqual(check(noTtlCheck, LOCKED), ['primary_price_above_ceiling']);
+  const ttl = baselineBody();
+  ttl.messages[0].content[0].cache_control = { type: 'ephemeral', ttl: '1h' };
+  const ttlBytes = Buffer.byteLength(JSON.stringify(ttl.messages), 'utf8');
+  assert.equal(ownPresendRefusal(ttl, presendCtx({ plan: noTtlCheck, messageBytes: ttlBytes })), null, 'that is the case where a ttl could leave');
+  assert.equal(ownPresendRefusal(ttl, presendCtx({ messageBytes: ttlBytes })), 'presend_cache_control');
+  assert.equal(ownPresendRefusal(ttl, presendCtx()), 'presend_cache_control');
+  // Positive control: the Gateway plan keeps its own ceilings, so the mock's $6.25 write passes there.
+  assert.deepEqual(checkCatalog(plan, defaultCatalog(), cfg).problems, []);
+  assert.deepEqual(checkCatalog(ownPlan, defaultCatalog(), cfg).problems, ['primary_price_above_ceiling']);
+});
+
+test('an own run against a catalog above the own ceiling is refused before any paid call', async () => {
+  const m = await ownMock();
+  m.setCatalog(defaultCatalog());
+  const r = await ownRun(m);
+  assert.equal(r.stopReason, 'catalog_primary_price_above_ceiling');
+  assert.equal(paid(m), 0);
+  const ok = await ownMock();
+  assert.equal((await ownRun(ok)).stopReason, null, 'positive control: the locked row runs');
+});
+
+test('the test Key: its daily limit must not be above --max-usd either', async () => {
+  const m = await ownMock();
+  m.setKey({ limit: 0.5, limit_remaining: 0.5 });
+  const r = await ownRun(m);
+  assert.equal(r.stopReason, 'key_limit_above_cap');
+  assert.equal(paid(m), 0);
+  const ok = await ownMock();
+  ok.setKey({ limit: 0.1, limit_remaining: 0.1 });
+  assert.equal((await ownRun(ok)).stopReason, null, 'positive control: a limit at the cap runs');
+});
+
+test('the CLI: --runtime own reads CLO_TEST_API_KEY and nothing else, and refuses without it; openclaw still reads CLO_CHAT_API_KEY', async () => {
+  const TEST_KEY = 'sk-or-v1-CANARYTESTKEY-Q5-OWN-NEVER-PRINT';
+  // Only the chat Key: own refuses with no request and says what to create.
+  const m = await mock();
+  const chatOnly = cliRoot('ownnokey');
+  const refused = await cli(['--runtime', 'own', '--approve', '--max-usd', '0.1'], { root: chatOnly, base: m.base });
+  assert.equal(refused.status, 2);
+  assert.match(refused.stderr, /CLO_TEST_API_KEY is empty in \.env/);
+  assert.match(refused.stderr, /separate OpenRouter Key for this probe, with a daily limit at or below --max-usd \(\$0\.1\)/);
+  assert.ok(!`${refused.stdout}${refused.stderr}`.includes(FAKE_KEY));
+  assert.equal(paid(m) + m.other.length, 0, 'no request');
+
+  // Both keys: own uses the test Key. Turn 1 reports no usage, so the run stops before the lag wait.
+  const both = await ownMock(() => ({ text: ANSWER, usage: null }));
+  const root = cliRoot('ownkey', `CLO_CHAT_API_KEY=${FAKE_KEY}\nCLO_TEST_API_KEY=${TEST_KEY}\n`);
+  const r = await cli(['--runtime', 'own', '--approve', '--max-usd', '0.1', '--lag-minutes', '1'], { root, base: both.base });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stdout, /Run stopped: usage_missing/);
+  const reqs = ownRequests(both);
+  assert.equal(reqs.length, 1, 'positive control: the run got as far as a turn');
+  assert.equal(reqs[0].headers.authorization, `Bearer ${TEST_KEY}`);
+  assert.ok(!both.requests.some((q) => q.headers.authorization?.includes(FAKE_KEY)), 'the chat Key is not used');
+  for (const text of [r.stdout, r.stderr, readFileSync(join(root, 'captures', 'q5-results.jsonl'), 'utf8')]) {
+    assert.ok(!text.includes(TEST_KEY));
+    assert.ok(!text.includes(FAKE_KEY));
+  }
+
+  // The Gateway probe with only the test Key is refused: it reads the chat Key.
+  const gwm = await mock();
+  const testOnly = cliRoot('gwtestkey', `CLO_TEST_API_KEY=${TEST_KEY}\n`);
+  const gw = await cli(['--approve', '--max-usd', '100'], { root: testOnly, base: gwm.base });
+  assert.equal(gw.status, 2);
+  assert.match(gw.stderr, /CLO_CHAT_API_KEY is empty/);
+  assert.equal(paid(gwm) + gwm.other.length, 0);
+  assert.deepEqual(PROBE_KEY_NAME, { openclaw: 'CLO_CHAT_API_KEY', own: 'CLO_TEST_API_KEY' });
+});
+
+test('the wrapper passes -Runtime through, and refuses a runtime it does not know', () => {
+  const root = cliRoot('psown');
+  const own = ps(['-Runtime', 'own'], root);
+  assert.equal(own.status, 0, own.stderr);
+  assert.match(own.stdout, /plan \(runtime own\)/);
+  const gw = ps([], root);
+  assert.equal(gw.status, 0, gw.stderr);
+  assert.doesNotMatch(gw.stdout, /runtime own/, 'the default is openclaw');
+  assert.ok(gw.stdout.includes(HOST_ADDED.runtimeContextPrefix));
+  const bad = ps(['-Runtime', 'gateway'], root);
+  assert.notEqual(bad.status, 0);
+  assert.doesNotMatch(bad.stdout, /Q5 paid probe: plan/);
+});
+
 test('a warm turn reads the cache marker: the cache read is recorded, and its absence is said', async () => {
   const warm = await ownMock((rec, n) => ({
     text: ANSWER,
-    usage: { prompt_tokens: 4400, completion_tokens: 20, cost: n === 1 ? 0.025 : 0.007, prompt_tokens_details: n === 1 ? { cache_write_tokens: 4350 } : { cached_tokens: 4350, cache_write_tokens: 0 } },
+    usage: { prompt_tokens: 4400, completion_tokens: 20, cost: n === 1 ? 0.024 : 0.0015, prompt_tokens_details: n === 1 ? { cache_write_tokens: 4350 } : { cached_tokens: 4350, cache_write_tokens: 0 } },
   }));
   const r = await ownRun(warm);
   assert.equal(r.stopReason, null, r.said);
-  const [t1, t2] = r.lines.filter((l) => l.kind === 'own_turn');
+  const [t1, t2] = ownLines(r);
   assert.equal(t1.cacheWriteTokens, 4350);
   assert.equal(t1.cacheHit, null, 'the first turn is cold by definition');
   assert.equal(t2.cachedTokens, 4350);
@@ -1557,7 +1957,7 @@ test('a warm turn reads the cache marker: the cache read is recorded, and its ab
   const [b1, b2] = ownRequests(warm).map((q) => q.body.messages[0].content);
   assert.deepEqual(b1, b2, 'the cached prefix is byte for byte the same');
 
-  const cold = await ownMock();
+  const cold = await ownMock(() => ({ text: ANSWER, usage: COLD }));
   const c = await ownRun(cold);
   assert.equal(c.stopReason, null);
   assert.equal(c.lines.find((l) => l.name === 'warm_cache_read').cacheHit, false);
@@ -1565,46 +1965,18 @@ test('a warm turn reads the cache marker: the cache read is recorded, and its ab
   assert.doesNotMatch(c.said, /Warm turn read \d+/);
 });
 
-test('a turn with no usage counts at its worst and stops the run; a zero cost is not free either', async () => {
-  for (const usage of [null, { prompt_tokens: 4000, completion_tokens: 20, cost: 0 }]) {
-    const m = await ownMock(() => ({ text: ANSWER, usage }));
-    const r = await ownRun(m);
-    assert.equal(r.stopReason, 'usage_missing', JSON.stringify(usage));
-    assert.equal(ownRequests(m).length, 1, 'the second turn did not run');
-    const line = r.lines.find((l) => l.kind === 'own_turn');
-    assert.equal(line.usageMissing, true);
-    assert.equal(line.countedUsd, ownPlan.turnCallWorstMicros / 1e6);
-    assert.equal(r.totals.countedAtWorstMicros, ownPlan.turnCallWorstMicros);
-    assert.equal(r.totals.missingCount, 1);
-  }
-});
-
-test('the cap is checked before each turn: a first turn that overspent leaves no room for the second', async () => {
-  // Turn 1 reports everything the plan left for it and the turn after, and a little more.
-  const over = (ownPlan.totalWorstMicros - ownPlan.turnCallWorstMicros) / 1e6 + 0.01;
-  const m = await ownMock(() => ({ text: ANSWER, usage: { prompt_tokens: 100, completion_tokens: 20, cost: over } }));
-  const r = await ownRun(m);
-  assert.equal(r.stopReason, 'cap');
-  assert.equal(ownRequests(m).length, 1);
-  assert.equal(r.lines.find((l) => l.kind === 'own_stage').state, 'cap');
-  // Positive control: a first turn that stays within its worst leaves room, and the second turn runs.
-  const fine = await ownMock(() => ({ text: ANSWER, usage: { prompt_tokens: 100, completion_tokens: 20, cost: ownPlan.turnCallWorstMicros / 1e6 } }));
-  const ok = await ownRun(fine);
-  assert.equal(ok.stopReason, null);
-  assert.equal(ownRequests(fine).length, 2);
-});
-
-test('no retry on the own runtime: a 500, a 429 or a refused connection is one request, counted at worst', async () => {
+test('no retry on the own runtime: a 500, a 429 or a refused connection is one request, counted at its bound', async () => {
   for (const [status, stop] of [[500, 'own_turn_failed'], [429, 'rate_limit']]) {
     const m = await ownMock(() => ({ error: { status, body: { error: { code: status, message: `no ${CANARY}` } } } }));
     const r = await ownRun(m);
     assert.equal(r.stopReason, stop, String(status));
     assert.equal(ownRequests(m).length, 1, `${status}: one request, no retry`);
-    const line = r.lines.find((l) => l.kind === 'own_turn');
+    const line = ownLines(r)[0];
     assert.equal(line.httpStatus, status);
     assert.equal(line.state, 'failed');
     assert.equal(line.collects, 0, 'nothing reached the exit');
     assert.equal(line.usageMissing, true);
+    assert.equal(line.countedUsd, T1_BOUND / 1e6);
     assert.ok(!r.raw.includes(CANARY));
   }
   // A connection refused before anything left is the one case the runner would retry. The probe refuses even that.
@@ -1622,18 +1994,16 @@ test('no retry on the own runtime: a 500, a 429 or a refused connection is one r
   const r = await ownRun(m, { fetchImpl });
   assert.equal(attempts, 1, 'the connect retry was refused');
   assert.equal(r.stopReason, 'own_turn_not_started');
-  assert.equal(r.lines.find((l) => l.kind === 'own_turn').countedUsd, ownPlan.turnCallWorstMicros / 1e6, 'an attempt is counted at worst all the same');
+  assert.equal(ownLines(r)[0].countedUsd, T1_BOUND / 1e6, 'an attempt is counted at its bound all the same');
 });
 
 test('a second request in one turn is refused before it leaves, and stops the run', async () => {
   const twice = (n) => (args) => runOwnStage({
     ...args,
     factories: {
-      createTurnRunner: ({ client, getEffective }) => async (turn, { signal } = {}) => {
+      createTurnRunner: ({ client, getEffective, readSystemPrompt }) => async (turn, { signal } = {}) => {
         let r;
-        for (let i = 0; i < n; i += 1) {
-          r = await client.post({ model: getEffective().models.primary.id, messages: [{ role: 'system', content: [{ type: 'text', text: ownPlan.texts.systemPrompt, cache_control: { type: 'ephemeral' } }] }, { role: 'user', content: 'x' }] }, { signal });
-        }
+        for (let i = 0; i < n; i += 1) r = await client.post(buildTurnRequest(getEffective(), readSystemPrompt(), turn), { signal });
         return { started: true, hostError: r.kind !== 'ok', aborted: false, usage: r.usage };
       },
     },
@@ -1642,13 +2012,13 @@ test('a second request in one turn is refused before it leaves, and stops the ru
   const r = await ownRun(m, { ownStage: twice(2) });
   assert.equal(r.stopReason, 'turn_call_limit');
   assert.equal(ownRequests(m).length, 1, 'the second request never arrived');
-  const line = r.lines.find((l) => l.kind === 'own_turn');
+  const line = ownLines(r)[0];
   assert.equal(line.guardRequests, 1);
   assert.equal(line.refusedRequests, 1);
   // Positive control: the same stand-in runner with one request passes the limit.
   const ok = await ownMock();
   const single = await ownRun(ok, { ownStage: twice(1) });
-  assert.equal(single.lines.find((l) => l.kind === 'own_turn').refusedRequests, 0);
+  assert.equal(ownLines(single)[0].refusedRequests, 0);
   assert.equal(ownRequests(ok).length, 1);
   assert.notEqual(single.stopReason, 'turn_call_limit');
 });
@@ -1679,21 +2049,22 @@ test('no QQ route on the own runtime: a QQ address is refused before it leaves, 
   assert.ok(seen.length > 0, 'positive control: the probe did fetch');
   assert.ok(!seen.some((u) => u.includes('qq.com')), 'nothing went to QQ');
 
-  const eff = ownEffective({ repoRoot: ROOT, catalog: defaultCatalog(), baseUrl: 'https://openrouter.ai/api/v1', testMode: false });
+  const eff = ownEffective({ repoRoot: ROOT, catalog: lockedCatalog(), baseUrl: 'https://openrouter.ai/api/v1', testMode: false });
   assert.equal(eff.runtime, 'own');
   assert.equal(eff.openrouter.baseUrl, 'https://openrouter.ai/api/v1');
   assert.equal(eff.models.primary.id, PRIMARY_ID);
+  assert.equal(eff.models.primary.maxTokens, PROBE_MAX_TOKENS, 'the probe cap is what the runner sends');
   assertOwnNoQqRoute(eff);
   for (const edit of [(e) => { e.qq.apiBaseUrl = 'https://api.sgroup.qq.com'; }, (e) => { e.qq.tokenBaseUrl = ''; }, (e) => { e.qq.appId = 'REALAPPID'; }, (e) => { e.runtime = 'openclaw'; }]) {
     const e = structuredClone(eff);
     edit(e);
     assert.throws(() => assertOwnNoQqRoute(e), /loopback|identity|own runtime/);
   }
-  assert.throws(() => ownEffective({ repoRoot: ROOT, catalog: defaultCatalog(), baseUrl: 'http://127.0.0.1:6/api/v1', testMode: false }), /another model host/, 'outside test mode only the real host');
+  assert.throws(() => ownEffective({ repoRoot: ROOT, catalog: lockedCatalog(), baseUrl: 'http://127.0.0.1:6/api/v1', testMode: false }), /another model host/, 'outside test mode only the real host');
   assert.doesNotMatch(readFileSync(PROBE, 'utf8').split('// --- the own runtime stage')[1].split('// --- Key lag ---')[0], /mock-qq|qqbot|@tencent-connect|connectAccount|runConnection/, 'the own stage has no QQ client of any kind');
 });
 
-test('an interrupt during an own turn aborts the request: nothing reaches the exit, it counts at worst, and no turn follows', async () => {
+test('an interrupt during an own turn aborts the request: nothing reaches the exit, it counts at its bound, and no turn follows', async () => {
   const ac = new AbortController();
   const m = await ownMock(() => {
     setTimeout(() => ac.abort(), 20);
@@ -1704,11 +2075,11 @@ test('an interrupt during an own turn aborts the request: nothing reaches the ex
   assert.ok(Date.now() - started < 1900, 'the runner gave up at the abort, not at the answer');
   assert.equal(r.stopReason, 'interrupted');
   assert.equal(ownRequests(m).length, 1);
-  const line = r.lines.find((l) => l.kind === 'own_turn');
+  const line = ownLines(r)[0];
   assert.equal(line.state, 'aborted');
   assert.equal(line.collects, 0);
   assert.equal(line.contentChars, 0);
-  assert.equal(line.countedUsd, ownPlan.turnCallWorstMicros / 1e6, 'an aborted request may still be billed');
+  assert.equal(line.countedUsd, T1_BOUND / 1e6, 'an aborted request may still be billed');
   assert.equal(r.lag, null);
 });
 
@@ -1716,15 +2087,15 @@ test('a system prompt without the policy markers sends nothing on the own runtim
   const broken = { ...ownPlan, texts: { ...ownPlan.texts, systemPrompt: ownPlan.texts.systemPrompt.replace(/<!-- clo-policy:1 -->/g, '') } };
   assert.notEqual(broken.texts.systemPrompt, ownPlan.texts.systemPrompt, 'the marker was there to remove');
   const m = await ownMock();
-  const r = await ownRun(m, { plan: broken, maxUsd: roomy(ownPlan) });
+  const r = await ownRun(m, { plan: broken });
   assert.equal(r.stopReason, 'own_turn_not_started');
   assert.equal(ownRequests(m).length, 0);
-  const line = r.lines.find((l) => l.kind === 'own_turn');
+  const line = ownLines(r)[0];
   assert.equal(line.reason, 'policy_sentinel');
   assert.equal(line.countedUsd, 0, 'nothing left, so nothing is counted');
 });
 
-test('own suggestions: the required hold is the own ledger figure, and a cut-off own turn asks for more tokens', () => {
+test('own suggestions: the required hold is the own ledger figure, and a cut at the probe cap suggests nothing', () => {
   const prices = { inputPerM: 5, outputPerM: 20, cacheReadPerM: 0.5, cacheWritePerM: 6.25 };
   const pick = (list, name) => list.find((s) => s.name === name);
   const own = pick(suggestConfig({ plan: ownPlan, calls: [], turns: [], lag: null, prices }), 'ledger.replyRequiredHoldUsd').suggested;
@@ -1732,8 +2103,17 @@ test('own suggestions: the required hold is the own ledger figure, and a cut-off
   assert.equal(own, expected / 1e6);
   assert.equal(own, (24000 * 6.25 + 3000 * 20) / 1e6);
   assert.equal(pick(suggestConfig({ plan, calls: [], turns: [], lag: null, prices }), 'ledger.replyRequiredHoldUsd').suggested, 2 * own, 'positive control: the Gateway hold is twice that');
-  const cut = suggestConfig({ plan: ownPlan, calls: [], turns: [{ outputTokens: 2990, finishReason: 'length', hostNotices: 0 }], lag: null, prices: null });
-  assert.equal(pick(cut, 'claudeModel.maxTokens').basis, 'truncated_in_probe');
+  const cutTurn = { outputTokens: 1200, finishReason: 'length', hostNotices: 0 };
+  const cut = pick(suggestConfig({ plan: ownPlan, calls: [], turns: [cutTurn], lag: null, prices: null }), 'claudeModel.maxTokens');
+  assert.equal(cut.basis, 'probe_cap_not_production');
+  assert.equal(cut.suggested, 3000, 'no 6000 from a probe-only cap');
+  assert.equal(cut.current, 3000);
+  // Positive control: the same cut on the Gateway plan, which runs at the production cap, asks for more.
+  const gw = pick(suggestConfig({ plan, calls: [], turns: [cutTurn], lag: null, prices: null }), 'claudeModel.maxTokens');
+  assert.equal(gw.basis, 'truncated_in_probe');
+  assert.equal(gw.suggested, 6000);
   const whole = suggestConfig({ plan: ownPlan, calls: [], turns: [{ outputTokens: 100, finishReason: 'stop', hostNotices: 0 }], lag: null, prices: null });
   assert.equal(pick(whole, 'claudeModel.maxTokens').basis, 'keep_small_sample');
+  // The decision figures have no source in this mode.
+  assert.equal(pick(whole, 'ledger.decisionHoldInputTokens').basis, 'no_data');
 });

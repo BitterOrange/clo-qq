@@ -64,6 +64,7 @@ if (-not (Test-Path config.json)) { Copy-Item config.example.json config.json }
 | `CLO_QQ_APP_SECRET` | 启动就要 |
 | `CLO_CHAT_API_KEY` | 只有 live 要。这是 OpenRouter Key，启动时映射成宿主要的 `OPENROUTER_API_KEY` |
 | `CLO_SEARCH_API_KEY` | 可选，给还没实现的搜索预留，现在没有代码读它 |
+| `CLO_TEST_API_KEY` | 只有付费探测要（own 运行时的 Q5）。单独建一个 OpenRouter Key，日限额不高于这次探测的上限。机器人不用它，`clo start` 也不把它交给 Gateway 或机器人进程 |
 
 ### 3. 改 `config.json`
 
@@ -240,7 +241,9 @@ Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度�
 - 本地数字是估算，真实费用以 OpenRouter 账单为准。对账差额过大或读不到 Key 时，付费自动暂停。
 - 实际花费的小样本：测试群 18 次 @ 回复共 $0.2382，平均 $0.0132。没命中缓存的约 $0.03–$0.04，命中的约 $0.005–$0.012。改人设后下一条总是没命中缓存。会话越长越贵，每个会话最多只测到 8 轮，也没有遇到压缩。插话冷却 8 分钟比缓存的 5 分钟长，所以插话通常没有缓存，一次约 $0.04。这些样本很少，不能当预算依据。
 
-另有一个可选的付费探测工具，用来量真实的 token、费用和对账延迟：最坏 $1.5484，最多 9 次模型调用。用法和约束见 [DEPLOYMENT.md](DEPLOYMENT.md) 的“付费探测工具”。
+另有一个可选的付费探测工具，用来量真实的 token、费用和对账延迟：最坏 $1.5484，最多 9 次模型调用。新运行时的版本（`-Runtime own`）按 2026-11-06 的新计划最坏 $0.0941，最多 2 次模型调用，读专用的 `CLO_TEST_API_KEY`，还没有在真实 OpenRouter 上跑过。用法和约束见 [DEPLOYMENT.md](DEPLOYMENT.md) 的“付费探测工具”。
+
+以后可能用的省钱办法记在 [docs/cost-options.md](docs/cost-options.md)，都没有实现。
 
 ## 数据和隐私
 
@@ -370,6 +373,7 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 | [DECISIONS.md](DECISIONS.md) | 决定和理由，平台实测得到的事实 |
 | [docs/group-chat-design.md](docs/group-chat-design.md) | 群聊部分的设计（英文） |
 | [docs/own-runtime.md](docs/own-runtime.md) | 自己的运行时：现状、切换和回退、改了什么、测试对照 |
+| [docs/cost-options.md](docs/cost-options.md) | 记下来、还没有实现的省钱办法，和排除的办法 |
 | [docs/q0a-guide.zh.md](docs/q0a-guide.zh.md) | 只监听、不回复的实测指引 |
 | [docs/wiring-trial.md](docs/wiring-trial.md) | 第一次离线接线试验的报告 |
 | [persona/](persona/) | 人设、内容范围、判定提示词、告知草稿 |

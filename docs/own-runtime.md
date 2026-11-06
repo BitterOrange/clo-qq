@@ -45,7 +45,7 @@
 - own 下她自己说过的话只在内存里，停一次就没了。切回 openclaw 后，宿主会话库里切换之前的内容还在，会接着用。
 - **切到 own 不会删掉任何旧数据。** 以前在 OpenClaw 上跑过的话，`.runtime/state` 里的会话库、`.runtime/logs` 里的日志都还在，own 不读也不清它们。
 - doctor 在 own 下只查 own 要的东西：系统提示词、锁定的 Node 和 SDK、进程环境、入口文件、不监听端口，不需要 `openclaw.json`。宿主相关的检查只在 openclaw 下跑。禁止的 QQ 和其他平台插件两边都查。
-- `scripts\q5-probe.ps1` 还不能选运行时，见下面“付费探测”。
+- 付费探测用 `scripts\q5-probe.ps1 -Runtime own`，见下面“付费探测”。
 
 ## 改了什么
 
@@ -102,14 +102,18 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 
 ## 付费探测（Q5）
 
-`src/tools/q5-probe.mjs` 加了 `--runtime own`：回合走项目自己的回合程序和 OpenRouter 客户端，不启动 Gateway，也不碰 QQ。每回合最多一次请求，不重试。按现在的计划，最坏 $0.9844，最多 7 次模型调用（openclaw 版本是 $1.5484、9 次）。
+`src/tools/q5-probe.mjs` 加了 `--runtime own`，`scripts\q5-probe.ps1` 对应的参数是 `-Runtime own`（默认仍是 `openclaw`）。回合走项目自己的回合程序和 OpenRouter 客户端，不启动 Gateway，也不碰 QQ。每回合最多一次请求，不重试。
 
-两件事要先处理：
+原来的计划最坏 $0.9844，比决定里约 $0.10 的上限大，跑不了。用户 2026-11-06 定了新计划（见 [DECISIONS.md](../DECISIONS.md) 的“用户定的（2026-11-06，Q5 和费用）”）：0 次直连调用，两个回合，第 2 回合放得下才发。按新计划，运行前最坏 $0.0941，最多 2 次模型调用（openclaw 版本是 $1.5484、9 次）。
 
-- **决定里写的 Q5 上限约 $0.10，比这个最坏数小。** `-MaxUsd` 低于最坏数时工具拒绝启动，所以照现在的计划跑不了。要么缩小计划，要么由用户重新同意金额。
-- `scripts\q5-probe.ps1` 还没有传 `--runtime` 的参数，现在只能跑 openclaw 版本。
+- 第 1 回合：(11817 字节的消息 + 500) × $5.5/M + 1200 × $22/M = $0.0941。价格上限是锁定价加 10%，`max_tokens` 1200 只在探测里用。
+- 第 2 回合：发之前用它准确的请求体算界限，已经计入的花费加上它超过 `-MaxUsd` 就记 `skipped_cap`，不发。第 1 回合的回答越长，越可能被跳过。
+- 第 1 回合的 $0.0941 有前提：输出不超过 1200、输入不超过消息字节数加 500、实际单价不高于上限。这些在第 1 回合之后才查，超了就停。合计不超过 `-MaxUsd` 的前提是 OpenRouter 报告的用量准确，并且第 2 回合的实际单价不高于上限、输出不超过 1200、输入不超过 B2 估的数。第 2 回合是最后一回合，它之后的检查拦不住什么。无条件的兜底只有 Key 的日限额。
+- 读 `.env` 里专用的 `CLO_TEST_API_KEY`，不是 `CLO_CHAT_API_KEY`，没有就拒绝运行。不加 `provider.max_price`。
 
-只用 mock 测过。
+细节见 [DEPLOYMENT.md](../DEPLOYMENT.md) 的“付费探测工具”。**只用 mock 测过，没有在真实 OpenRouter 上跑过。** 付费的那一次要用户另外确认金额。
+
+正式运行的省钱办法这一轮没有做，记在 [cost-options.md](cost-options.md)。
 
 ## 测试对照
 
@@ -156,5 +160,4 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 ## 已知问题
 
 - 整合时发现 `src/bot/main.mjs` 构造闸门和出口、`src/bot/services.mjs` 构造账本时没有传 `runtime: 'own'`，进程里这三样按 openclaw 的规则跑。已经改了，`tests/unit/bot-main.test.mjs` 在 bot 进程里检查 Key 限额暂停、预留大小、`/stop` 中止回合、她的回复进下一轮上下文。只离线测过。
-- `scripts\q5-probe.ps1` 不能选运行时（见上）。
 - e2e-own 全量只以并发 4 跑过，没有串行跑过。

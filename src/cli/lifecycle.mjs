@@ -15,6 +15,7 @@ export const ENV_FILE_KEYS = Object.keys(CHILD_ENV_NAMES);
 // Old .env names. Never read as a key: finding one only changes what the refusal says.
 export const RENAMED_ENV_KEYS = { OPENROUTER_API_KEY: 'CLO_CHAT_API_KEY', CLO_SEARCH_OPENROUTER_KEY: 'CLO_SEARCH_API_KEY' };
 const OS_ENV_KEYS = ['SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS'];
+// Exact names, never a prefix: CLO_TEST_API_KEY, the paid probe's key, shares the prefix and must never reach a child.
 const TEST_ENV_KEYS = ['CLO_TEST_ROOT', 'CLO_TEST_CRASH_AT', 'CLO_NET_GUARD_LOG'];
 const DEFAULT_PORT = 18790;
 const LOG_ROTATE_BYTES = 20 * 1024 * 1024;
@@ -196,7 +197,7 @@ export function inspectArgs(paths, env) {
   return [...nodeImports(env), gatewayEntry(paths, env), 'plugins', 'inspect', 'clo', '--runtime', '--json'];
 }
 
-const FORBIDDEN_CHILD_ENV = /proxy|^PERPLEXITY_API_KEY$|^CLO_CHAT_API_KEY$|^CLO_SEARCH_API_KEY$|^CLO_SEARCH_OPENROUTER_KEY$|^NODE_OPTIONS$|^NODE_EXTRA_CA_CERTS$/i;
+const FORBIDDEN_CHILD_ENV = /proxy|^PERPLEXITY_API_KEY$|^CLO_CHAT_API_KEY$|^CLO_SEARCH_API_KEY$|^CLO_SEARCH_OPENROUTER_KEY$|^CLO_TEST_API_KEY$|^NODE_OPTIONS$|^NODE_EXTRA_CA_CERTS$/i;
 
 // Names only. Used by doctor against gatewayEnvForCheck.
 export function ensureGatewayEnvClean(childEnv) {

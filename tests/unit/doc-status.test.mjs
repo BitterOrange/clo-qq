@@ -50,7 +50,17 @@ test('the figures the user agrees to are the ones the plan prints', () => {
     assert.ok(text.includes(`最坏费用 ${worst}`) || text.includes(`最坏 ${worst}`), `${name} has the worst case`);
     assert.ok(text.includes(`最多 ${plan.maxModelCalls} 次模型调用`), `${name} has the call count`);
   }
-  for (const m of DEPLOYMENT.matchAll(/-MaxUsd (\d+\.\d+)/g)) assert.ok(Number(m[1]) * 1e6 >= plan.totalWorstMicros, `the example ${m[0]} would be refused`);
+  // Each example is checked against the plan of the runtime its line names.
+  const ownPlan = buildPlan(ROOT, { runtime: 'own' });
+  let examples = 0;
+  for (const line of DEPLOYMENT.split('\n')) {
+    for (const m of line.matchAll(/-MaxUsd (\d+\.\d+)/g)) {
+      const bound = /-Runtime own\b/.test(line) ? ownPlan.totalWorstMicros : plan.totalWorstMicros;
+      assert.ok(Number(m[1]) * 1e6 >= bound, `the example ${m[0]} would be refused: ${line.slice(0, 80)}`);
+      examples += 1;
+    }
+  }
+  assert.ok(examples >= 3, 'positive control: the examples of both runtimes were found');
   const turnRow = `$${(plan.turns.reduce((a, t) => a + t.worstMicros, 0) / 1e6).toFixed(4)}`;
   assert.ok(DEPLOYMENT.includes(turnRow), 'the Gateway row of the table, which moved with the probe text');
 });
@@ -138,7 +148,7 @@ test('the temp-root text says what happens when it cannot be deleted', () => {
 });
 
 // The repo is public. These hold what was decided for the public text.
-const PUBLIC_DOCS = ['README.md', 'DEPLOYMENT.md', 'DECISIONS.md', 'docs/group-chat-design.md', 'docs/q0a-guide.zh.md', 'docs/wiring-trial.md', 'docs/own-runtime.md'];
+const PUBLIC_DOCS = ['README.md', 'DEPLOYMENT.md', 'DECISIONS.md', 'docs/group-chat-design.md', 'docs/q0a-guide.zh.md', 'docs/wiring-trial.md', 'docs/own-runtime.md', 'docs/cost-options.md'];
 
 test('public docs do not send a reader to files that are not in the repo, or name private things', () => {
   const documentation = /^(?:127\.0\.0\.1|0\.0\.0\.0|192\.0\.2\.\d+|198\.51\.100\.\d+|203\.0\.113\.\d+)$/;
@@ -467,21 +477,126 @@ test('every host e2e file has a row in the mapping, and every own e2e file it na
   for (const r of rows) if (r[2] === '没有') assert.ok(r[3].length > 0, `${r[1]} says why it has no counterpart`);
 });
 
-test('the own probe figures are the ones its plan prints, and the gap to the agreed cap is stated', () => {
+test('the own probe figures are the ones its plan prints, and nothing says it has run', () => {
   const ownPlan = buildPlan(ROOT, { runtime: 'own' });
   const ownWorst = `$${(ownPlan.totalWorstMicros / 1e6).toFixed(4)}`;
+  const [t1, t2] = ownPlan.turns;
   assert.notEqual(ownWorst, worst, 'positive control: the two plans differ');
-  assert.ok(OWN_DOC.includes(`最坏 ${ownWorst}，最多 ${ownPlan.maxModelCalls} 次模型调用`), 'own-runtime.md has the own worst case');
-  assert.ok(OWN_DOC.includes(`openclaw 版本是 ${worst}、${plan.maxModelCalls} 次`));
-  assert.ok(DEPLOYMENT.includes(`最坏 ${ownWorst}`), 'DEPLOYMENT has it too');
-  if (ownPlan.totalWorstMicros > 100000) {
-    assert.match(OWN_DOC, /决定里写的 Q5 上限约 \$0\.10，比这个最坏数小/);
-    assert.match(DECISIONS_TEXT(), /Q5 付费探测上限约 \$0\.10/);
+  // The shape the user agreed to on 2026-11-06.
+  assert.equal(ownPlan.calls.length, 0);
+  assert.equal(ownPlan.turns.length, 2);
+  assert.equal(ownPlan.maxModelCalls, 2);
+  assert.ok(ownPlan.totalWorstMicros <= 100000, 'within the agreed Q5 cap of about $0.10');
+  assert.equal(ownPlan.totalWorstMicros, t1.boundMicros, 'the static worst case is turn 1');
+  assert.ok(t2.gated && t2.boundMicros === null, 'turn 2 is bounded at run time');
+  const counted = `最坏 ${ownWorst}，最多 ${ownPlan.maxModelCalls} 次模型调用`;
+  for (const [name, text] of [['own-runtime', OWN_DOC], ['DEPLOYMENT', DEPLOYMENT], ['README', README]]) {
+    assert.ok(text.includes(counted), `${name} has the own worst case and call count`);
   }
-  if (!/runtime/i.test(read('scripts/q5-probe.ps1'))) assert.match(OWN_DOC, /`scripts\\q5-probe\.ps1` 还没有传 `--runtime` 的参数/);
+  assert.ok(OWN_DOC.includes(`openclaw 版本是 ${worst}、${plan.maxModelCalls} 次`));
+  const t1Formula = `(${t1.messageBytes} 字节的消息 + 500) × $${ownPlan.priceCeiling.inputPerM}/M + ${ownPlan.probeMaxTokens} × $${ownPlan.priceCeiling.outputPerM}/M`;
+  assert.ok(OWN_DOC.includes(t1Formula), 'own-runtime.md has the turn-1 arithmetic');
+  assert.ok(DEPLOYMENT.includes(t1Formula), 'DEPLOYMENT has the turn-1 arithmetic');
+  assert.ok(DECISIONS_TEXT().includes(t1Formula), 'DECISIONS has the turn-1 arithmetic');
+  assert.ok(DEPLOYMENT.includes(`${ownPlan.turn2BaseUserBytes} 字节加上第 1 回合的回答`), 'the turn-2 message size is the plan\'s');
+  assert.ok(DEPLOYMENT.includes('skipped_cap') && OWN_DOC.includes('skipped_cap'));
+  // The Key the own probe reads, and the script switch that selects it.
+  const ps1 = read('scripts/q5-probe.ps1');
+  assert.match(ps1, /\[ValidateSet\('openclaw', 'own'\)\]\s*\[string\]\$Runtime = 'openclaw'/, 'the ps1 can pick the runtime, openclaw by default');
+  assert.match(ps1, /'--runtime', \$Runtime/);
+  for (const [name, text] of [['own-runtime', OWN_DOC], ['DEPLOYMENT', DEPLOYMENT], ['README', README]]) {
+    assert.ok(text.includes('-Runtime own'), `${name} names the switch`);
+    assert.ok(text.includes('CLO_TEST_API_KEY'), `${name} names the probe Key`);
+  }
+  // The gaps that A closed are gone, and the old plan is not presented as the current one.
+  for (const [name, text] of [['own-runtime', OWN_DOC], ['DEPLOYMENT', DEPLOYMENT]]) {
+    assertGone(text, ['还没有传 `--runtime` 的参数', '还不能选运行时', '不能选运行时', '照这个计划跑不了', '照现在的计划跑不了', '最多 7 次模型调用'], name);
+  }
+  // It has not run on real OpenRouter, and no doc says otherwise.
+  assert.match(OWN_DOC, /\*\*只用 mock 测过，没有在真实 OpenRouter 上跑过。\*\*/);
+  assert.match(DEPLOYMENT, /\*\*own 版本（`-Runtime own`）：没有在真实 OpenRouter 上跑过，只用 mock 测过。\*\*/);
+  assert.match(README, /还没有在真实 OpenRouter 上跑过/);
+  assert.match(DECISIONS_TEXT(), /own 的 Q5 没有在真实 OpenRouter 上跑过/);
+  for (const [name, text] of [['own-runtime', OWN_DOC], ['DEPLOYMENT', DEPLOYMENT], ['README', README], ['DECISIONS', DECISIONS_TEXT()], ['cost-options', read('docs/cost-options.md')]]) {
+    assertGone(text, ['own 的 Q5 已运行', 'own 的 Q5 已验证', 'own 版本已运行', '在真实 OpenRouter 上跑过一次', '新运行时的 Q5 已'], name);
+  }
+  // The guarantee is stated with what it rests on, not as unconditional.
+  for (const [name, text] of [['own-runtime', OWN_DOC], ['DEPLOYMENT', DEPLOYMENT]]) {
+    assert.match(text, new RegExp(`第 1 回合的 \\${ownWorst} 有前提|第 1 回合不超过 \\${ownWorst}，前提是`), `${name} states the turn-1 premise`);
+    assert.match(text, /无条件的兜底只有 Key 的日限额/, name);
+    // The total rests on turn 2's price and prompt as well as on accurate usage.
+    assert.match(text, /用量准确，并且第 2 回合的(?:花费不超过 B2，即)?实际单价不高于上限、输出不超过 1200(?: token)?、输入不超过 B2 估的数/, `${name} states the turn-2 premise`);
+    assertGone(text, ['合计不超过 `-MaxUsd`，前提是 OpenRouter 报告的用量准确。', '合计不超过 `-MaxUsd` 的前提是 OpenRouter 报告的用量准确。'], name);
+    assertGone(text, ['严格不超过'], name);
+  }
+  assert.match(DECISIONS_TEXT(), /用量准确，并且第 2 回合的实际单价不高于上限、输出不超过 1200、输入不超过 B2 估的数/, 'DECISIONS states the turn-2 premise');
+  assertGone(DECISIONS_TEXT(), ['两回合合计不超过 `--max-usd` 的前提是 OpenRouter 报告的用量准确；'], 'DECISIONS');
 });
 
 const DECISIONS_TEXT = () => read('DECISIONS.md');
+
+test('the user decisions of 2026-11-06 on Q5 and cost are recorded, and the unconfirmed probe values apart from them', () => {
+  const DECISIONS = DECISIONS_TEXT();
+  const user = DECISIONS.slice(DECISIONS.indexOf('## 用户定的（2026-11-06，Q5 和费用）'), DECISIONS.indexOf('## 开发时定的，用户还没有确认（2026-11-06，Q5 探测）'));
+  const dev = DECISIONS.slice(DECISIONS.indexOf('## 开发时定的，用户还没有确认（2026-11-06，Q5 探测）'), DECISIONS.indexOf('## 待定（决策点 D）'));
+  assert.ok(user.length > 200 && dev.length > 200, 'positive control: both sections were found, in order');
+  const ownPlan = buildPlan(ROOT, { runtime: 'own' });
+  for (const item of ['第 2 回合按条件发', `\`max_tokens\` | ${ownPlan.probeMaxTokens}`, `$${ownPlan.priceCeiling.inputPerM}`, `$${ownPlan.priceCeiling.outputPerM}`, '`provider.max_price`', '**不加**', 'Fast Mode', 'CLO_TEST_API_KEY', 'docs/cost-options.md']) {
+    assert.ok(user.includes(item), `the user section has ${item}`);
+  }
+  for (const item of ['1.05', '+ 64', '`input_cache_write_1h`', '`completion_above_bound`', '`prompt_above_bound`', '`price_above_bound`', '1024', '用户还没有确认']) {
+    assert.ok(dev.includes(item), `the developer section has ${item}`);
+  }
+  // The probe max_tokens has one owner: the user. The developer section may give the
+  // floor reasoning, but must not list the value itself as an open developer choice.
+  const maxTokens = ownPlan.probeMaxTokens;
+  const userRow = user.split('\n').find((l) => l.startsWith('| 探测的 `max_tokens`'));
+  assert.ok(userRow && userRow.includes(`| ${maxTokens}`), 'positive control: the user section owns the probe max_tokens value');
+  const devRows = dev.split('\n').filter((l) => l.startsWith('| ') && !l.startsWith('| 项目'));
+  assert.ok(devRows.length >= 4, 'positive control: the developer rows were found');
+  for (const row of devRows) {
+    const [label, value] = row.split('|').slice(1, 3).map((c) => c.trim());
+    assert.ok(!label.includes(String(maxTokens)), `developer row label does not claim ${maxTokens}: ${label}`);
+    assert.ok(!/`max_tokens` 取/.test(value), `developer row does not set max_tokens as its own value: ${label}`);
+  }
+  const floorRow = devRows.find((l) => l.includes('1024'));
+  assert.ok(floorRow, 'the floor reasoning stays in the developer section');
+  assert.match(floorRow, new RegExp(`${maxTokens} 这个值是用户定的`), 'the floor row says the value is the user\'s');
+  assert.match(floorRow, /`models\.js`/, 'the unreconciled models.js floor stays noted');
+  const capRow = DECISIONS.split('\n').find((l) => l.startsWith('| 真实验收的花费'));
+  assert.match(capRow, /Q5 付费探测上限约 \$0\.10/);
+  assert.match(capRow, /用户定的（2026-11-06，Q5 和费用）/, 'the cap row points at the new plan');
+});
+
+test('cost-options says plainly that nothing in it is implemented, and keeps Fast Mode and the rejected compression', () => {
+  const doc = read('docs/cost-options.md');
+  const head = doc.slice(0, 400);
+  assert.match(head, /\*\*这里列的办法都没有实现。\*\*/);
+  assert.match(head, /这一轮正式运行不做省钱改动/);
+  for (const line of doc.split('\n')) {
+    if (/已实现|已经实现|已完成|已上线/.test(line)) assert.match(line, /没有|未|不/, `cost-options: ${line.slice(0, 80)}`);
+  }
+  // Every listed lever carries the fields the plan asked for.
+  const levers = doc.slice(doc.indexOf('## 列入的办法'), doc.indexOf('## 排除的办法')).split(/\n### /).slice(1);
+  assert.equal(levers.length, 10, 'the ten listed levers');
+  for (const lever of levers) {
+    for (const field of ['**做法：**', '**要不要你同意：**', '**风险：**', '**文件和测试：**', '**什么时候再决定：**']) assert.ok(lever.includes(field), `${lever.split('\n')[0]}: ${field}`);
+    assert.match(lever, /\*\*估计(省|多花)多少：\*\*/, lever.split('\n')[0]);
+  }
+  const fast = levers.find((l) => l.startsWith('9. Fast Mode'));
+  assert.ok(fast, 'Fast Mode is listed');
+  for (const item of ['你提的', '$8/$40', '2 倍', '新的价格锁', '预留跟着翻倍', 'Q5 的价格界限要重写', '基础型号不会被路由到 fast 端点']) assert.ok(fast.includes(item), `Fast Mode: ${item}`);
+  const rejected = doc.slice(doc.indexOf('## 排除的办法'));
+  const compression = rejected.split('\n').find((l) => l.startsWith('| 落盘或跨重启的摘要'));
+  assert.ok(compression, 'the rejected compression idea is listed');
+  assert.match(compression, /正文不落盘/, 'with its reason');
+  assert.match(compression, /没有长期记忆/);
+  const rolling = rejected.split('\n').find((l) => l.startsWith('| 只放内存的滚动摘要'));
+  assert.match(rolling, /和第 4 项缩小窗口一样多/);
+  assert.match(doc, /估计/);
+  assert.match(OWN_DOC, /\[cost-options\.md\]\(cost-options\.md\)/, 'own-runtime.md links it');
+  assert.match(README, /\| \[docs\/cost-options\.md\]\(docs\/cost-options\.md\) \|/, 'the README docs table lists it');
+});
 
 test('the design contract marks its host sections as openclaw only, and records the own deltas as offline', () => {
   assert.match(DESIGN_DOC, /## 8\. Host wiring\n\nApplies to `runtime: 'openclaw'` only/);

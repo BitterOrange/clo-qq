@@ -12,7 +12,9 @@
 // - The Gateway gets a temp root, a fake QQ identity and a loopback mock QQ. A preloaded guard refuses other hosts.
 // - With --runtime own there is no Gateway and no QQ at all: the project's own turn runner and OpenRouter client run in
 //   this process, with a fetch that reaches the model host only, one request per turn, and no retry. The reply goes to
-//   an exit stand-in that only keeps it in memory, for the second turn's recent lines.
+//   an exit stand-in that only keeps it in memory, for the second turn's recent lines. That mode makes no direct call,
+//   sends turn 2 only if its bound still fits the cap, checks every request body before it leaves, and reads a Key of
+//   its own, CLO_TEST_API_KEY, instead of the chat Key.
 // - The key is read at run time, and goes only to fetch headers and the Gateway's environment.
 // - Results hold numbers and classifications only. The temp root holds the host's session store, with the prompts and
 //   the model's answers, until it is removed at the end, or by the next start after a hard kill.
@@ -27,6 +29,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { isLoopback } from '../cli/common.mjs';
 import { GATEWAY_NODE_FLAGS, gatewayEnv, openclawEntry, parseEnvFile, privateNode } from '../cli/lifecycle.mjs';
 import { registerTools } from '../clo-plugin/lib/channels/qq/tools.js';
@@ -39,7 +42,7 @@ import { DECISION_INPUT_TOKENS, replyHoldMicros } from '../clo-plugin/lib/core/l
 import { fetchCatalog, lockFromCatalog, priceFor, resolveSelector, validateModels } from '../clo-plugin/lib/core/models.js';
 import { createOpenRouterClient } from '../clo-plugin/lib/core/openrouterChat.js';
 import { renderOpenclaw, renderWorkspace, writeAtomic } from '../clo-plugin/lib/core/render.js';
-import { createTurnRunner, OWN_LABEL, renderUserMessage } from '../clo-plugin/lib/core/turn.js';
+import { buildTurnRequest, createTurnRunner, OWN_LABEL, renderUserMessage } from '../clo-plugin/lib/core/turn.js';
 
 const SELF = fileURLToPath(import.meta.url);
 const GUARD = fileURLToPath(new URL('./q5-net-guard.mjs', import.meta.url));
@@ -55,11 +58,33 @@ export const PRICE_CEILING = Object.freeze({
 });
 // A token is at least about one byte of UTF-8, so bytes bound the prompt. This covers schema and message framing.
 const PROMPT_OVERHEAD_TOKENS = 500;
+// --runtime own has its own bounds, apart from the production config. Input is max(prompt, cache write) of the locked
+// price plus 10%, which also covers the regional endpoints that cost 1.1 times as much; output is the locked price
+// plus 10%. A catalog price above them refuses the run.
+export const OWN_PRICE_CEILING = Object.freeze({ inputPerM: 5.5, outputPerM: 22 });
+// The same 10% over the locked price, field by field. A reported cost above the tokens at these prices means the turn
+// was served somewhere dearer than planned (a priority endpoint, say), and the run stops before the next turn.
+export const OWN_FIELD_PRICE_BOUND = Object.freeze({ inputPerM: 4.4, outputPerM: 22, cacheReadPerM: 0.22, cacheWritePerM: 5.5 });
+// OpenRouter documents the reasoning budget at effort low as max(min(max_tokens x 0.2, 128000), 1024) tokens, and
+// max_tokens must be strictly above that budget. So this is the lowest max_tokens a request with reasoning can carry.
+export const OPENROUTER_REASONING_FLOOR_TOKENS = 1024;
+// The own probe's max_tokens. Probe only: production keeps claudeModel.maxTokens. Higher than about 1300 does not fit
+// a $0.10 cap at the ceilings above.
+export const PROBE_MAX_TOKENS = 1200;
+if (!(PROBE_MAX_TOKENS > OPENROUTER_REASONING_FLOOR_TOKENS)) throw new Error('q5: the probe max_tokens must be above the reasoning floor');
+// Turn 2 of --runtime own is bounded from turn 1's reported prompt, since the system text is byte for byte the same:
+// ceil(margin x P1) + the bytes of turn 2's user message + slack, all at the input ceiling. Chosen in development.
+const TURN2_PROMPT_MARGIN = 1.05;
+const TURN2_SLACK_TOKENS = 64;
+// The only top-level fields an own probe request may carry.
+const OWN_BODY_KEYS = Object.freeze(['max_tokens', 'messages', 'model', 'provider', 'reasoning', 'stream', 'usage']);
 // Requests one Gateway turn may make. The host made up to 10 on mocks when calls failed, so this is enforced, not assumed.
 export const TURN_CALL_LIMIT = 2;
 // The own runner makes one request per turn. Its one connect retry is refused here, so one is the limit.
 export const OWN_TURN_CALL_LIMIT = 1;
 export const RUNTIMES = Object.freeze(['openclaw', 'own']);
+// The .env name each runtime's probe reads. The own probe has a separate Key, so its spend is not mixed with the bot's.
+export const PROBE_KEY_NAME = Object.freeze({ openclaw: 'CLO_CHAT_API_KEY', own: 'CLO_TEST_API_KEY' });
 // The same passive window the gate gives a turn.
 const OWN_PASSIVE_WINDOW_MS = 285000;
 // A stand-in label, as the gate would give one. No ID reaches the model.
@@ -181,6 +206,7 @@ export function buildPlan(repoRoot, { runtime = 'openclaw' } = {}) {
     files,
     texts: { policy: read('CONTENT-POLICY.md'), decisionPrompt: read('decision-prompt.zh.md'), systemPrompt },
   };
+  if (runtime === 'own') return buildOwnPlan(plan);
   const direct = [
     { id: 'decision_with_prompt', role: 'decision', body: decisionBody(plan, { withPrompt: true }), sends: 'decision-prompt.zh.md + decision input' },
     { id: 'decision_baseline', role: 'decision', body: decisionBody(plan, { withPrompt: false }), sends: 'decision input only' },
@@ -189,16 +215,58 @@ export function buildPlan(repoRoot, { runtime = 'openclaw' } = {}) {
     { id: 'primary_full_prompt', role: 'primary', body: primaryBody(systemPrompt, plan), sends: 'full system prompt (policy, AGENTS, SOUL, IDENTITY) + question' },
   ];
   plan.calls = direct.map((c) => ({ ...c, worstMicros: worstCall(c.body, PRICE_CEILING[c.role]) }));
-  // The guard (Gateway) or the stage's own fetch (own) enforces the limit, so this figure is a bound and not a guess.
-  // The input ceiling is at least every input-side catalog rate, the cache write included (priceAboveCeiling).
-  const own = runtime === 'own';
-  plan.turnCallLimit = own ? OWN_TURN_CALL_LIMIT : TURN_CALL_LIMIT;
+  // The guard enforces the limit, so this figure is a bound and not a guess. The input ceiling is at least every
+  // input-side catalog rate, the cache write included (priceAboveCeiling).
+  plan.turnCallLimit = TURN_CALL_LIMIT;
   plan.turnCallWorstMicros = Math.ceil(plan.contextTokens * PRICE_CEILING.primary.inputPerM + plan.primaryMaxTokens * PRICE_CEILING.primary.outputPerM);
-  plan.turns = FIXED.turns.map((text, i) => ({ id: `${own ? 'own' : 'gateway'}_turn_${i + 1}`, text, worstMicros: plan.turnCallLimit * plan.turnCallWorstMicros }));
+  plan.turns = FIXED.turns.map((text, i) => ({ id: `gateway_turn_${i + 1}`, text, worstMicros: plan.turnCallLimit * plan.turnCallWorstMicros }));
   plan.totalWorstMicros = plan.calls.reduce((a, c) => a + c.worstMicros, 0) + plan.turns.reduce((a, t) => a + t.worstMicros, 0);
   plan.maxModelCalls = plan.calls.length + plan.turns.length * plan.turnCallLimit;
-  if (own) plan.userPreview = ownUserPreview();
-  else plan.tool = toolDefinition();
+  plan.tool = toolDefinition();
+  return plan;
+}
+
+// The body the own runner builds for a turn, with the probe's max_tokens. Only the time in the user message differs in
+// the run, and it has a fixed length, so the bytes are exact.
+const ownProbeEffective = (plan) => ({ models: { primary: { id: plan.primaryId, effort: plan.primaryEffort, maxTokens: plan.probeMaxTokens } } });
+
+// A turn's bound at the own ceilings. With no earlier figure it is the byte bound of the exact body. After a turn with
+// the same system text, turn 1's reported prompt bounds the system part, so the bound is the smaller of the two:
+// (ceil(margin x P1) + the bytes of this user message + slack) at the input ceiling, plus max_tokens at the output one.
+export function ownTurnBound(body, priorUsage = null) {
+  const byBytes = worstCall(body, OWN_PRICE_CEILING);
+  const prompt = num(priorUsage?.prompt_tokens);
+  const stored = (num(priorUsage?.prompt_tokens_details?.cached_tokens) ?? 0) + (num(priorUsage?.prompt_tokens_details?.cache_write_tokens) ?? 0);
+  if (prompt === null && stored === 0) return byBytes;
+  const p1 = Math.max(prompt ?? 0, stored);
+  const userBytes = utf8Bytes(JSON.stringify(body.messages[1]));
+  const byPrior = Math.ceil((Math.ceil(TURN2_PROMPT_MARGIN * p1) + userBytes + TURN2_SLACK_TOKENS) * OWN_PRICE_CEILING.inputPerM + body.max_tokens * OWN_PRICE_CEILING.outputPerM);
+  return Math.min(byBytes, byPrior);
+}
+
+// Two turns and no direct call. The direct calls of the Gateway plan measure inputs that are hash-pinned or unchanged,
+// and turn 1 is itself a direct call with the whole system prompt. Turn 1 has a static bound; turn 2 is sent only if
+// its bound, computed from turn 1's figures and its exact body, still fits the cap.
+function buildOwnPlan(plan) {
+  plan.probeMaxTokens = PROBE_MAX_TOKENS;
+  plan.priceCeiling = OWN_PRICE_CEILING;
+  // The pre-send check refuses a cache_control with a ttl, so the 1h cache-write price cannot be incurred. Only while
+  // that holds is that price left out of the own ceiling (checkCatalog).
+  plan.refuseCacheTtl = true;
+  plan.calls = [];
+  plan.turnCallLimit = OWN_TURN_CALL_LIMIT;
+  const first = buildTurnRequest(ownProbeEffective(plan), plan.texts.systemPrompt, ownTurn(FIXED.turns[0], { at: PREVIEW_AT, i: 0 }));
+  const firstBound = ownTurnBound(first);
+  const second = buildTurnRequest(ownProbeEffective(plan), plan.texts.systemPrompt, ownTurn(FIXED.turns[1], { at: PREVIEW_AT, i: 1, history: ownHistory(FIXED.turns[0], PREVIEW_AT, '') }));
+  plan.turns = [
+    { id: 'own_turn_1', text: FIXED.turns[0], boundMicros: firstBound, worstMicros: firstBound, messageBytes: utf8Bytes(JSON.stringify(first.messages)), gated: false },
+    { id: 'own_turn_2', text: FIXED.turns[1], boundMicros: null, worstMicros: null, gated: true },
+  ];
+  // Turn 2's user message with an empty answer. Each byte of the real answer, after JSON escaping, adds to it.
+  plan.turn2BaseUserBytes = utf8Bytes(JSON.stringify(second.messages[1]));
+  plan.totalWorstMicros = firstBound;
+  plan.maxModelCalls = plan.turns.length * plan.turnCallLimit;
+  plan.userPreview = ownUserPreview();
   return plan;
 }
 
@@ -271,29 +339,35 @@ function ownUserPreview() {
 }
 
 function printOwnPlan(plan, say) {
+  const [t1, t2] = plan.turns;
+  const ceil = plan.priceCeiling;
+  const perByte = `$${(ceil.inputPerM / 1e6).toFixed(7)}`;
   say('Q5 paid probe: plan (runtime own)');
-  say(`Models: primary ${plan.primaryId} (selector opus-latest; if the catalog resolves it to anything else the run refuses), decision ${plan.decisionId}.`);
+  say(`Models: primary ${plan.primaryId} (selector opus-latest; if the catalog resolves it to anything else the run refuses). The decision model ${plan.decisionId} is only checked in the catalog: no decision call is made.`);
   say(`Planned calls: ${plan.calls.length} direct, then ${plan.turns.length} turns through the project's own turn runner, each limited to ${plan.turnCallLimit} model request. At most ${plan.maxModelCalls} model calls. No retries: the runner's one connect retry is refused here.`);
   say('There is no Gateway, no QQ and no mock QQ in this mode. The runner and its OpenRouter client run in this process, with a fetch that reaches the model host only and refuses a second request in a turn before it leaves.');
-  say(`Worst case: ${usdText(plan.totalWorstMicros)}, at price ceilings of $${PRICE_CEILING.primary.inputPerM}/$${PRICE_CEILING.primary.outputPerM} per million (primary) and $${PRICE_CEILING.decision.inputPerM}/$${PRICE_CEILING.decision.outputPerM} (decision). Real prices come from the catalog and are expected to be lower. The runner refuses an input above the context limit before sending it.`);
-  say("The hard ceiling is the Key's daily limit on OpenRouter, because only OpenRouter can refuse a request. It must not be above --max-usd, or the run refuses to start. It covers the whole UTC day, including other use of the Key.");
-  for (const c of plan.calls) say(`  ${c.id}: ${c.role}, max_tokens ${c.body.max_tokens}, worst ${usdText(c.worstMicros)}. Sends: ${c.sends}.`);
-  for (const t of plan.turns) say(`  ${t.id}: own turn runner, worst ${usdText(t.worstMicros)}. Sends: full system prompt with one cache marker at its end, and the user message below. No tools.`);
+  say(`Probe bounds, apart from production: max_tokens ${plan.probeMaxTokens} (claudeModel.maxTokens stays ${plan.primaryMaxTokens} in production; OpenRouter documents a reasoning budget of at least ${OPENROUTER_REASONING_FLOOR_TOKENS} tokens, and max_tokens must be above it), and price ceilings of $${ceil.inputPerM}/$${ceil.outputPerM} per million, the locked price plus 10%. A catalog price above them refuses the run.`);
+  say(`  ${t1.id}: own turn runner, bound ${usdText(t1.boundMicros)} = (${t1.messageBytes} bytes of messages + ${PROMPT_OVERHEAD_TOKENS}) x $${ceil.inputPerM}/M + ${plan.probeMaxTokens} x $${ceil.outputPerM}/M. Sends: full system prompt with one cache marker at its end, and the user message below. No tools.`);
+  say(`  ${t2.id}: sent only if it fits. Right before it would be sent, its bound B2 is computed from its exact body: the smaller of its byte bound and (ceil(${TURN2_PROMPT_MARGIN} x P1) + the bytes of its user message + ${TURN2_SLACK_TOKENS}) x $${ceil.inputPerM}/M + ${plan.probeMaxTokens} x $${ceil.outputPerM}/M, where P1 is turn 1's reported prompt tokens, or its cached plus cache-write tokens if more. If the spend counted so far plus B2 would pass --max-usd, it is recorded as skipped_cap and nothing is sent.`);
+  say(`Turn 2's threshold depends on how long turn 1's answer is: its user message is ${plan.turn2BaseUserBytes} bytes plus the answer's bytes after JSON escaping (about 3 per Chinese character), and each byte adds ${perByte} to B2. A long answer can make turn 2 skip.`);
+  say(`Worst case before the run: ${usdText(plan.totalWorstMicros)}, turn 1 only. Turn 2 is sent only if its bound B2 fits in what is left under --max-usd.`);
+  say(`What is guaranteed, and what it rests on: turn 1 stays within ${usdText(t1.boundMicros)} provided its completion tokens are at most max_tokens (${plan.probeMaxTokens}), its prompt tokens are at most the message bytes plus ${PROMPT_OVERHEAD_TOKENS}, and the price charged is at or below the ceiling above. None of these can be checked before the request leaves: each is checked after turn 1, so a breach stops the run only after turn 1 was charged. The total stays within --max-usd provided the usage OpenRouter reports is accurate, because B2 and the counted spend rest on it, and provided turn 2 costs no more than B2: its price charged at or below the ceiling above, its completion tokens at most max_tokens, and its prompt tokens within the estimate B2 used (the margin ${TURN2_PROMPT_MARGIN} and the slack ${TURN2_SLACK_TOKENS} are allowances, not derived from data). Turn 2 is the last turn, so the checks after it only report a breach; they prevent nothing. The Key's daily limit, which must not be above --max-usd, is the unconditional backstop.`);
+  say("No max_price is sent. That the base model ID is not routed to the fast endpoint is an inference from OpenRouter's routing docs, not something this tool can check. After turn 1 the run stops if the reported cost is above its tokens at the locked price plus 10% (price_above_bound), if completion tokens are above max_tokens, or if prompt tokens are above the message bytes plus the overhead.");
+  say(`Each request is checked before it leaves, and refused if any of this differs: exactly the fields ${OWN_BODY_KEYS.join(', ')}; model ${plan.primaryId}; max_tokens ${plan.probeMaxTokens}; stream false; reasoning {effort:'low'}; usage {include:true}; provider {require_parameters:true} only; no tools; two messages; one cache_control in the whole body, {type:'ephemeral'} with no ttl, on the system part; the same system text in both turns; no more bytes than the bound was computed from.`);
+  say('No data in this mode: content_policy_block, decision_prompt and the ledger.decisionHoldInputTokens suggestion. No direct or decision call is made, so those lines print no data. They are not measurements.');
+  say("The hard ceiling is the Key's daily limit on OpenRouter, because only OpenRouter can refuse a request. It must not be above --max-usd, or the run refuses to start. It covers the whole UTC day, including other use of the Key. This mode reads CLO_TEST_API_KEY, a separate Key for this probe, not the chat Key.");
   say('The second turn comes right after the first, so it should read the system prompt from the cache. The cache read is recorded.');
   say('After the calls it reads the Key endpoint (no charge) until the spend shows up, to measure the reconciliation lag.');
   say('');
   say('Exact fixed texts:');
-  say(`  baseline system: ${FIXED.baselineSystem}`);
-  say(`  question: ${FIXED.question}`);
-  say(`  decision input: ${JSON.stringify(FIXED.decisionInput)}`);
   FIXED.turns.forEach((t, i) => say(`  turn ${i + 1}: ${t}`));
   say('');
   say('The user message of each turn, as the runner builds it. Only the time differs in the run:');
   plan.userPreview.forEach((u, i) => say(`  turn ${i + 1}:\n${u}`));
   say(`  In turn 2, ${ANSWER_PLACEHOLDER} stands for the model's real answer to turn 1, which is kept in memory only.`);
   say('');
-  say('Exact persona files sent:');
-  for (const f of plan.files) {
+  say('Exact persona files sent, as one system prompt:');
+  for (const f of plan.files.filter((x) => x.name !== 'decision-prompt.zh.md')) {
     say(`--- persona/${f.name} (${f.bytes} bytes, sha256 ${f.sha256}) ---`);
     say(f.text.trimEnd());
   }
@@ -914,6 +988,8 @@ export function assertOwnNoQqRoute(effective) {
 export function ownEffective({ repoRoot, catalog, baseUrl, testMode }) {
   const cfg = probeConfig({ repoRoot, qqBase: 'http://127.0.0.1:9', port: 1, modelBase: testMode ? baseUrl : null });
   cfg.runtime = 'own';
+  // The probe's own output cap. Nothing outside this process reads this config.
+  cfg.claudeModel.maxTokens = PROBE_MAX_TOKENS;
   // Paths are only named, never created. buildEffective needs them for the policy files, which come from the project.
   const paths = resolvePaths({ CLO_TEST_ROOT: join(tmpdir(), 'clo-q5-own-unused') });
   const effective = buildEffective(cfg, { paths, modelsLock: lockFromCatalog(cfg, catalog), env: { CLO_TEST_ROOT: paths.root } });
@@ -923,6 +999,40 @@ export function ownEffective({ repoRoot, catalog, baseUrl, testMode }) {
 }
 
 const isChatPost = (url, init) => String(init?.method ?? 'GET').toUpperCase() === 'POST' && /\/chat\/completions$/.test(url.pathname);
+
+const countKey = (v, key) => (v && typeof v === 'object'
+  ? Object.entries(v).reduce((n, [k, x]) => n + (k === key ? 1 : 0) + countKey(x, key), 0)
+  : 0);
+const sameKeys = (obj, keys) => {
+  const have = Object.keys(obj).sort();
+  return have.length === keys.length && have.every((k, i) => k === keys[i]);
+};
+
+// The checks on an own request before it may leave. Each has its own reason, which becomes the run's stop reason.
+// messageBytes is what the turn's bound was computed from; firstSystem is the system text turn 1 sent, if any.
+export function ownPresendRefusal(body, { plan, messageBytes, firstSystem = null }) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'presend_unreadable';
+  if ('tools' in body || 'tool_choice' in body) return 'presend_tools';
+  if (!sameKeys(body, OWN_BODY_KEYS)) return 'presend_fields';
+  if (body.model !== plan.primaryId || String(body.model).includes(':')) return 'presend_model';
+  if (body.max_tokens !== plan.probeMaxTokens) return 'presend_max_tokens';
+  if (body.stream !== false) return 'presend_stream';
+  if (!isDeepStrictEqual(body.reasoning, { effort: 'low' })) return 'presend_reasoning';
+  if (!isDeepStrictEqual(body.usage, { include: true })) return 'presend_usage';
+  if (!isDeepStrictEqual(body.provider, { require_parameters: true })) return 'presend_provider';
+  const msgs = body.messages;
+  if (!Array.isArray(msgs) || msgs.length !== 2 || msgs[0]?.role !== 'system' || msgs[1]?.role !== 'user' || typeof msgs[1].content !== 'string') return 'presend_messages';
+  const sys = msgs[0].content;
+  const block = Array.isArray(sys) && sys.length === 1 && sys[0] && typeof sys[0] === 'object' ? sys[0] : null;
+  // With a ttl the 1h cache-write price applies, which the own ceiling leaves out only while this refuses it.
+  const markerOk = plan.refuseCacheTtl
+    ? isDeepStrictEqual(block?.cache_control, { type: 'ephemeral' })
+    : block?.cache_control?.type === 'ephemeral';
+  if (countKey(body, 'cache_control') !== 1 || !block || block.type !== 'text' || !sameKeys(block, ['cache_control', 'text', 'type']) || !markerOk) return 'presend_cache_control';
+  if (typeof block.text !== 'string' || block.text !== plan.texts.systemPrompt || (firstSystem !== null && block.text !== firstSystem)) return 'presend_system_changed';
+  if (!(utf8Bytes(JSON.stringify(msgs)) <= messageBytes)) return 'presend_bytes';
+  return null;
+}
 
 // The turns go through the same runner and client the bot uses. The probe owns three things around them: a fetch that
 // reaches the model host only and lets one request leave per turn, an exit stand-in that only keeps the text in memory,
@@ -964,8 +1074,14 @@ export async function runOwnStage({ plan, catalog, baseUrl, key, tracker, record
         if (slot) slot.refused += 1;
         throw new Error('q5: a request over the turn limit was refused before it left');
       }
+      const body = parseJson(String(init?.body ?? ''));
+      const refusal = ownPresendRefusal(body, { plan, messageBytes: slot.messageBytes, firstSystem: slot.firstSystem });
+      if (refusal) {
+        slot.refusedReason ??= refusal;
+        throw new Error('q5: a request unlike the planned one was refused before it left');
+      }
       slot.requests += 1;
-      slot.bodies.push(parseJson(String(init?.body ?? '')));
+      slot.bodies.push(body);
       const res = await http(url, init);
       slot.status = res.status;
       try {
@@ -997,13 +1113,31 @@ export async function runOwnStage({ plan, catalog, baseUrl, key, tracker, record
         stopReason = 'interrupted';
         break;
       }
-      if (!tracker.canAfford(planned.worstMicros)) {
-        stopReason = 'cap';
-        break;
-      }
       const at = now();
       const turn = ownTurn(planned.text, { at, i, history: prev ? ownHistory(prev.text, prev.at, prev.answer) : [] });
-      const slot = { requests: 0, refused: 0, bodies: [], observed: null, status: null };
+      // The body the runner will build from the same turn, so the bound and the pre-send check use the bytes that leave.
+      const expected = buildTurnRequest(effective, plan.texts.systemPrompt, turn);
+      const messageBytes = utf8Bytes(JSON.stringify(expected.messages));
+      const bound = ownTurnBound(expected, prev?.usage ?? null);
+      if (planned.boundMicros !== null && !(bound <= planned.boundMicros)) {
+        stopReason = 'bound_above_plan';
+        say(`${planned.id}: its bound ${usdText(bound)} is above the planned ${usdText(planned.boundMicros)}, so nothing was sent.`);
+        break;
+      }
+      if (!tracker.canAfford(bound)) {
+        if (!planned.gated) {
+          stopReason = 'cap';
+          break;
+        }
+        // The planned way for turn 2 not to run: nothing is sent, and the run goes on to the Key reads.
+        const { totalMicros, capMicros } = tracker.totals();
+        const line = { kind: 'own_turn', id: planned.id, runtime: 'own', state: 'skipped_cap', started: false, guardRequests: 0, modelCalls: 0, countedUsd: 0, worstUsd: round6(bound), totalUsd: round6(totalMicros), capUsd: round6(capMicros) };
+        lines.push(line);
+        record(line);
+        say(`${planned.id}: skipped_cap. Its bound ${usdText(bound)} plus the ${usdText(totalMicros)} counted so far would pass the cap ${usdText(capMicros)}, so nothing was sent.`);
+        break;
+      }
+      const slot = { requests: 0, refused: 0, bodies: [], observed: null, status: null, messageBytes, firstSystem, refusedReason: null };
       const seenEvents = events.length;
       active = slot;
       let result;
@@ -1027,18 +1161,27 @@ export async function runOwnStage({ plan, catalog, baseUrl, key, tracker, record
       // Spend comes from the response itself, as in a direct call. A request that left with no figure is never free.
       const obs = slot.observed;
       const usage = obs && typeof obs === 'object' ? obs.usage ?? null : null;
+      // One request at most, so a turn with no figure counts at its own bound, or at its tokens if those say more.
       const sent = slot.requests;
-      const worst = Math.max(planned.worstMicros, sent * plan.turnCallWorstMicros);
       const cost = reportedCostMicros(usage);
       const byTokens = tokenCostMicros(usage, prices);
       let counted = 0;
       if (sent > 0 && cost === null) {
-        counted = worst;
-        tracker.addMissing(worst);
+        counted = Math.max(bound, byTokens ?? 0);
+        tracker.addMissing(counted);
       } else if (sent > 0) {
         counted = Math.max(cost, byTokens ?? 0);
         tracker.addReported(counted);
       }
+      // The two bounds rest on these: output within max_tokens, a prompt no larger than its bytes, and the price the
+      // ceilings assume. Any of them failing stops the run before another turn.
+      const promptTokens = num(usage?.prompt_tokens);
+      const completionTokens = num(usage?.completion_tokens);
+      let boundStop = null;
+      if (sent > 0 && completionTokens !== null && completionTokens > plan.probeMaxTokens) boundStop = 'completion_above_bound';
+      else if (sent > 0 && promptTokens !== null && promptTokens > slot.messageBytes + PROMPT_OVERHEAD_TOKENS) boundStop = 'prompt_above_bound';
+      else if (sent > 0 && cost !== null && (promptTokens === null || completionTokens === null)) boundStop = 'usage_tokens_missing';
+      else if (sent > 0 && cost !== null && cost > tokenCostMicros(usage, OWN_FIELD_PRICE_BOUND) + KEY_TOLERANCE_MICROS) boundStop = 'price_above_bound';
       const status = slot.status;
       const httpError = status !== null && (status < 200 || status >= 300 || Boolean(obs?.error));
       const c = httpError ? classifyError(status, obs?.error ?? null) : null;
@@ -1056,7 +1199,7 @@ export async function runOwnStage({ plan, catalog, baseUrl, key, tracker, record
         runtime: 'own',
         state,
         started: result.started === true,
-        reason: result.started ? (turnModel?.reason ?? null) : (result.reason ?? null),
+        reason: slot.refusedReason ?? (result.started ? (turnModel?.reason ?? null) : (result.reason ?? null)),
         class: c?.class ?? turnModel?.kind ?? null,
         httpStatus: status,
         errorCode: c?.errorCode ?? null,
@@ -1067,8 +1210,8 @@ export async function runOwnStage({ plan, catalog, baseUrl, key, tracker, record
         providerName: c?.providerName ?? providerSlug(obs?.provider),
         finishReason: FINISH.has(choice?.finish_reason) ? choice.finish_reason : (choice?.finish_reason ? 'other' : null),
         nativeFinish: NATIVE_FINISH.has(choice?.native_finish_reason) ? choice.native_finish_reason : (choice?.native_finish_reason ? 'other' : null),
-        promptTokens: num(usage?.prompt_tokens),
-        completionTokens: num(usage?.completion_tokens),
+        promptTokens,
+        completionTokens,
         reasoningTokens: num(usage?.completion_tokens_details?.reasoning_tokens),
         cachedTokens,
         cacheWriteTokens: num(usage?.prompt_tokens_details?.cache_write_tokens),
@@ -1084,7 +1227,7 @@ export async function runOwnStage({ plan, catalog, baseUrl, key, tracker, record
         tokenCostUsd: byTokens === null ? null : round6(byTokens),
         actualUsd: sent > 0 && cost !== null ? round6(counted) : null,
         countedUsd: round6(counted),
-        worstUsd: round6(planned.worstMicros),
+        worstUsd: round6(bound),
         durationMs: now() - at,
         guardRequests: sent,
         refusedRequests: slot.refused,
@@ -1098,23 +1241,32 @@ export async function runOwnStage({ plan, catalog, baseUrl, key, tracker, record
       };
       lines.push(line);
       record(line);
-      say(`${planned.id}: state ${state}, ${sent} model request(s), counted ${usdText(counted)}${line.usageMissing ? ' (no usage, counted at worst case)' : ''}${i > 0 ? `, cache read ${cachedTokens ?? 0} tokens` : ''}.`);
+      say(`${planned.id}: state ${state}, ${sent} model request(s), counted ${usdText(counted)}${line.usageMissing ? ' (no usage, counted at its bound)' : ''}${i > 0 ? `, cache read ${cachedTokens ?? 0} tokens` : ''}.`);
 
       if (signal?.aborted || result.aborted) stopReason = 'interrupted';
-      else if (slot.refused > 0) {
+      else if (slot.refusedReason) {
+        stopReason = slot.refusedReason;
+        say(`The request was refused before it left: ${slot.refusedReason}. Nothing was sent, so nothing is counted.`);
+      } else if (slot.refused > 0) {
         stopReason = 'turn_call_limit';
         say(`The runner tried more than ${plan.turnCallLimit} model request in one turn. The extra one was refused before it left.`);
       } else if (c?.stop) stopReason = c.class;
-      else if (sent > 0 && (!cacheMarker || !sameSystem)) stopReason = 'cache_marker_missing';
+      else if (boundStop) {
+        stopReason = boundStop;
+        say(`Stopped after ${planned.id}: ${boundStop}. The figures it reported break an assumption the bounds rest on, so no further turn is sent.`);
+      } else if (sent > 0 && (!cacheMarker || !sameSystem)) stopReason = 'cache_marker_missing';
       else if (!result.started) stopReason = 'own_turn_not_started';
       else if (state !== 'completed' || mine.length !== 1) stopReason = 'own_turn_failed';
       else if (line.usageMissing) stopReason = 'usage_missing';
       if (stopReason) break;
-      prev = { text: planned.text, at, answer };
+      prev = { text: planned.text, at, answer, usage };
     }
     // The point of the second turn: the prefix written by the first should now be read from the cache.
     const warm = lines[1];
-    if (warm && warm.guardRequests > 0) {
+    if (warm?.state === 'skipped_cap') {
+      record({ kind: 'measure', name: 'warm_cache_read', tokens: null, cacheHit: null, state: 'skipped_cap' });
+      say('The warm turn was skipped, so the cache read was not measured in this run.');
+    } else if (warm && warm.guardRequests > 0) {
       record({ kind: 'measure', name: 'warm_cache_read', tokens: warm.cachedTokens, cacheHit: warm.cacheHit });
       say(warm.cacheHit
         ? `Warm turn read ${warm.cachedTokens} tokens from the cache.`
@@ -1214,7 +1366,10 @@ export function suggestConfig({ plan, calls, turns, lag, prices }) {
 
   const primaryObserved = maxOf([...ok('primary').map((c) => c.completionTokens), ...turns.map((t) => t.outputTokens)]);
   const primaryCut = ok('primary').some((c) => c.finishReason === 'length') || turns.some((t) => t.hostNotices > 0 || t.finishReason === 'length');
+  // A cut at the probe's own lower max_tokens says nothing about the production one.
+  const probeCut = plan.probeMaxTokens !== undefined && turns.some((t) => t.finishReason === 'length');
   if (primaryObserved === null) add('claudeModel.maxTokens', plan.primaryMaxTokens, plan.primaryMaxTokens, 'no_data');
+  else if (probeCut) add('claudeModel.maxTokens', plan.primaryMaxTokens, plan.primaryMaxTokens, 'probe_cap_not_production', primaryObserved);
   else if (primaryCut) add('claudeModel.maxTokens', plan.primaryMaxTokens, plan.primaryMaxTokens * 2, 'truncated_in_probe', primaryObserved);
   else if (primaryObserved * 2 > plan.primaryMaxTokens) add('claudeModel.maxTokens', plan.primaryMaxTokens, primaryObserved * 2, 'observed_above_half', primaryObserved);
   else add('claudeModel.maxTokens', plan.primaryMaxTokens, plan.primaryMaxTokens, 'keep_small_sample', primaryObserved);
@@ -1280,15 +1435,27 @@ export function extraPriceFields(row) {
 
 // Every tier and every input-side rate has to fit the ceilings, or the printed worst case is not a worst case.
 // Rounds to whole micro-dollars per million, because 0.000008 * 1e6 is not reliably 8 in floating point.
-export function priceAboveCeiling(row, ceiling) {
+export function priceAboveCeiling(row, ceiling, inputFields = PRICE_INPUT_FIELDS) {
   const perM = (v) => Math.round(Number(v) * 1e12) / 1e6;
   const pricing = row?.pricing ?? {};
   const tiers = [pricing, ...(Array.isArray(pricing.overrides) ? pricing.overrides : [])];
-  return tiers.some((tier) => PRICE_INPUT_FIELDS.some((k) => tier[k] !== undefined && perM(tier[k]) > ceiling.inputPerM)
+  return tiers.some((tier) => inputFields.some((k) => tier[k] !== undefined && perM(tier[k]) > ceiling.inputPerM)
     || (tier.completion !== undefined && perM(tier.completion) > ceiling.outputPerM));
 }
 
-function checkCatalog(plan, catalog, cfg) {
+// The own plan's primary rates. The 1h cache write is left out only while the pre-send check refuses a ttl, since
+// only a ttl incurs it; it then stays under the general primary ceiling.
+const TTL_ONLY_FIELDS = new Set(['input_cache_write_1h']);
+
+function primaryCeilingProblems(plan, row) {
+  if (!plan.priceCeiling) return priceAboveCeiling(row, PRICE_CEILING.primary) ? ['primary_price_above_ceiling'] : [];
+  const fields = plan.refuseCacheTtl ? PRICE_INPUT_FIELDS.filter((k) => !TTL_ONLY_FIELDS.has(k)) : PRICE_INPUT_FIELDS;
+  if (priceAboveCeiling(row, plan.priceCeiling, fields)) return ['primary_price_above_ceiling'];
+  if (plan.refuseCacheTtl && priceAboveCeiling(row, PRICE_CEILING.primary, [...TTL_ONLY_FIELDS])) return ['primary_price_above_ceiling'];
+  return [];
+}
+
+export function checkCatalog(plan, catalog, cfg) {
   const problems = [];
   const unused = new Set();
   let primary = null;
@@ -1310,7 +1477,8 @@ function checkCatalog(plan, catalog, cfg) {
       const extra = extraPriceFields(row);
       if (extra.refused.length) problems.push(`${role}_price_outside_estimate`);
       for (const k of extra.unused) unused.add(k);
-      if (priceAboveCeiling(row, PRICE_CEILING[role])) problems.push(`${role}_price_above_ceiling`);
+      if (role === 'primary') problems.push(...primaryCeilingProblems(plan, row));
+      else if (priceAboveCeiling(row, PRICE_CEILING[role])) problems.push(`${role}_price_above_ceiling`);
     }
   } catch {
     problems.push('price_missing');
@@ -1453,7 +1621,8 @@ export async function runProbe({ plan, baseUrl, key, maxUsd, resultPath, say, fe
   for (const s of suggestions) say(`  SUGGESTION ${s.name}: current ${s.current ?? 'n/a'}, suggested ${s.suggested ?? 'n/a'} (${s.basis}${s.observed === null ? '' : `, observed ${s.observed}`}).`);
   const policyTokens = tokenDelta(calls.find((c) => c.id === 'primary_policy')?.promptTokens, calls.find((c) => c.id === 'primary_baseline')?.promptTokens);
   const promptTokens = tokenDelta(calls.find((c) => c.id === 'decision_with_prompt')?.promptTokens, calls.find((c) => c.id === 'decision_baseline')?.promptTokens);
-  say(`Content-policy block: ${policyTokens ?? 'no data'} tokens above baseline. Decision prompt: ${promptTokens ?? 'no data'} tokens above baseline.`);
+  if (own) say('Content-policy block, decision prompt and the decision hold: no data. --runtime own makes no direct or decision call, so these are not measured here.');
+  else say(`Content-policy block: ${policyTokens ?? 'no data'} tokens above baseline. Decision prompt: ${promptTokens ?? 'no data'} tokens above baseline.`);
   record({ kind: 'measure', name: 'content_policy_block', tokens: policyTokens });
   record({ kind: 'measure', name: 'decision_prompt', tokens: promptTokens });
   return { stopReason, totals, suggestions, calls, turns, lag, keyCheck };
@@ -1463,7 +1632,8 @@ export async function runProbe({ plan, baseUrl, key, maxUsd, resultPath, say, fe
 
 const USAGE = `Usage: q5-probe [--runtime openclaw|own] [--approve --max-usd <dollars>] [--lag-minutes <1-30>]
 Without --approve it prints the plan and exits. No request is made and .env is not read.
---runtime own runs the turns through the project's own turn runner instead of a Gateway. The default is openclaw.`;
+--runtime own runs the turns through the project's own turn runner instead of a Gateway, and reads CLO_TEST_API_KEY
+from .env instead of CLO_CHAT_API_KEY. The default is openclaw.`;
 
 export function parseCli(argv) {
   const out = { approve: false, maxUsd: null, lagMinutes: DEFAULT_LAG_MINUTES, runtime: 'openclaw' };
@@ -1550,10 +1720,12 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
     fail(e.message);
     return 2;
   }
-  // The one read of .env, and only this name comes back.
-  const key = parseEnvFile(paths.envFile, ['CLO_CHAT_API_KEY']).CLO_CHAT_API_KEY;
+  // The one read of .env, and only this name comes back. --runtime own spends on a Key of its own.
+  const keyName = PROBE_KEY_NAME[cli.runtime];
+  const key = parseEnvFile(paths.envFile, [keyName])[keyName];
   if (!key) {
-    fail('CLO_CHAT_API_KEY is empty in .env. The old name OPENROUTER_API_KEY is no longer read.');
+    if (cli.runtime === 'own') fail(`CLO_TEST_API_KEY is empty in .env. --runtime own does not use the chat Key. Create a separate OpenRouter Key for this probe, with a daily limit at or below --max-usd ($${cli.maxUsd}), and put it in .env as CLO_TEST_API_KEY.`);
+    else fail('CLO_CHAT_API_KEY is empty in .env. The old name OPENROUTER_API_KEY is no longer read.');
     return 2;
   }
   secrets = [key];

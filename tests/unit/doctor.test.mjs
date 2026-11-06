@@ -184,7 +184,7 @@ test('proxy variables in the shell only warn, because the Gateway env is an allo
   assert.deepEqual(ensureGatewayEnvClean(child), []);
   for (const k of ['OPENROUTER_API_KEY', 'CLO_CHAT_API_KEY', 'CLO_SEARCH_API_KEY']) assert.equal(child[k], undefined, k);
   assert.deepEqual(ensureGatewayEnvClean({ HTTP_PROXY: 'x', https_proxy: 'x', PERPLEXITY_API_KEY: 'x', PATH: 'x' }).sort(), ['HTTP_PROXY', 'PERPLEXITY_API_KEY', 'https_proxy'], 'the detector works (control)');
-  assert.deepEqual(ensureGatewayEnvClean({ CLO_CHAT_API_KEY: 'x', CLO_SEARCH_API_KEY: 'x', CLO_SEARCH_OPENROUTER_KEY: 'x', OPENROUTER_API_KEY: 'x' }).sort(), ['CLO_CHAT_API_KEY', 'CLO_SEARCH_API_KEY', 'CLO_SEARCH_OPENROUTER_KEY'], 'the file names are forbidden, the host name is not');
+  assert.deepEqual(ensureGatewayEnvClean({ CLO_CHAT_API_KEY: 'x', CLO_SEARCH_API_KEY: 'x', CLO_SEARCH_OPENROUTER_KEY: 'x', CLO_TEST_API_KEY: 'x', OPENROUTER_API_KEY: 'x' }).sort(), ['CLO_CHAT_API_KEY', 'CLO_SEARCH_API_KEY', 'CLO_SEARCH_OPENROUTER_KEY', 'CLO_TEST_API_KEY'], 'the file names are forbidden, the host name is not');
   const checked = gatewayEnvForCheck(ctx.paths, ctx.env);
   assert.equal(checked.OPENROUTER_API_KEY, 'check-only', 'the check sees the key under the name start would give it, with no real value');
   assert.deepEqual(ensureGatewayEnvClean(checked), [], 'and that name is clean');
