@@ -27,7 +27,7 @@ test('A8: WAL, full sync and user_version on a real file under the private Node'
   assert.equal(store.db.prepare('PRAGMA synchronous').get().synchronous, 2);
   assert.equal(store.db.prepare('PRAGMA busy_timeout').get().timeout, 5000);
   assert.equal(store.db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 1);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 2);
   store.close();
 });
 
@@ -44,7 +44,7 @@ test('the HMAC salt survives a reopen, and keys are case-sensitive', () => {
 
 test('a newer schema is refused', () => {
   const { store, file } = fresh();
-  store.db.exec('PRAGMA user_version=2');
+  store.db.exec('PRAGMA user_version=3');
   store.close();
   assert.throws(() => openStore(file), /newer than this build/);
 });

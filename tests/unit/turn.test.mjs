@@ -5,10 +5,14 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { sha256Hex } from '../../src/clo-plugin/lib/core/contentPolicy.js';
 import { createOpenRouterClient } from '../../src/clo-plugin/lib/core/openrouterChat.js';
+import { adapterFor } from '../../src/clo-plugin/lib/core/providers/index.js';
+import { createChatClient } from '../../src/clo-plugin/lib/core/providers/modelChat.js';
 import { renderWorkspace } from '../../src/clo-plugin/lib/core/render.js';
 import { buildTurnRequest, createTurnRunner, renderUserMessage } from '../../src/clo-plugin/lib/core/turn.js';
 import { join } from 'node:path';
-import { atEvent, fakeExit, GROUP_A, makeEffective, makeHarness, MEMBER, ROOT, seamStack } from '../fixtures/inbound.mjs';
+import { anthropicEffective, atEvent, fakeExit, GROUP_A, makeEffective, makeHarness, MEMBER, ROOT, seamStack } from '../fixtures/inbound.mjs';
+import { createFakeAdapter, createFakeClient, okResult } from '../fixtures/fake-adapter.mjs';
+import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
 
 const SECRET = 'PROVIDER-SECRET-TEXT';
 const RAW_GROUP = 'RAWGROUPID0000111122223333';
@@ -402,4 +406,256 @@ test('through the real gate: 200s with no answer count toward the failure streak
   }
   assert.equal(h.store.getControl('paid_paused'), 'provider_fail');
   await h.close();
+});
+
+// ---- both adapters ----
+// The same runner over the real transport with each provider's adapter. The wire shapes of the Anthropic replies are the
+// contract's (docs/provider-contract.md section 3.2); the parts marked unverified there are assumptions of the mock.
+
+const KINDS = ['openrouter', 'anthropic'];
+
+function kindEffective(kind, over = {}) {
+  const eff = kind === 'anthropic' ? anthropicEffective(over) : makeEffective(over);
+  eff.contentPolicy.sha256 = sha256Hex(readFileSync(eff.contentPolicy.policyFile));
+  return eff;
+}
+
+const anthropicMessage = (text = '我在。', { stop = 'end_turn', model = 'claude-opus-5-5', usage, content } = {}) => ({
+  id: 'msg_fake', type: 'message', role: 'assistant', model,
+  content: content ?? [{ type: 'thinking', thinking: `THINKING ${SECRET}`, signature: SECRET }, { type: 'text', text }],
+  stop_reason: stop, stop_details: { explanation: SECRET },
+  usage: usage === undefined ? {
+    input_tokens: 900, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 4000,
+    cache_creation: { ephemeral_5m_input_tokens: 4000, ephemeral_1h_input_tokens: 0 }, inference_geo: 'global', speed: 'standard',
+  } : usage,
+});
+const anthropicError = (type, message = SECRET) => ({ type: 'error', error: { type, message }, request_id: `req_${SECRET}` });
+
+// One reply of each shape, per kind.
+const WIRE = {
+  openrouter: {
+    ok: (text) => json(completion(text)),
+    refusal: () => json(completion(`拒绝 ${SECRET}`, { message: { refusal: SECRET } })),
+    server: () => json(providerError(500), 500),
+    forbidden: () => json(providerError(403), 403),
+    path: '/chat/completions',
+    retryEvent: 'openrouter_retry',
+    otherModel: 'claude-opus-5-5',
+  },
+  anthropic: {
+    ok: (text) => json(anthropicMessage(text)),
+    refusal: () => json(anthropicMessage('', { stop: 'refusal', content: [] })),
+    server: () => json(anthropicError('api_error'), 500),
+    forbidden: () => json(anthropicError('permission_error'), 403),
+    path: '/v1/messages',
+    retryEvent: 'anthropic_retry',
+    otherModel: 'anthropic/fake-opus',
+  },
+};
+
+function kindRunner(kind, { respond, system = () => SYSTEM, eff = kindEffective(kind) } = {}) {
+  const calls = [];
+  const logs = [];
+  const collected = [];
+  const ledgerCalls = [];
+  const alerts = [];
+  const log = (event, data) => logs.push({ event, ...data });
+  const key = kind === 'anthropic' ? FAKE_ANTHROPIC_KEY : 'FAKE-KEY';
+  const base = kind === 'anthropic' ? eff.apiProvider.baseUrl : eff.openrouter.baseUrl;
+  const client = createChatClient({
+    adapter: adapterFor(kind),
+    fetch: async (url, init) => {
+      calls.push({ url, init, body: JSON.parse(init.body) });
+      return (respond ?? (() => WIRE[kind].ok('我在。')))(url, init, calls.length);
+    },
+    getKey: () => key,
+    getBaseUrl: () => base,
+    log,
+    retryDelayMs: 0,
+  });
+  const exit = { collect: (...args) => { collected.push(args); return { visibleReplySent: true }; } };
+  const ledger = { noteProviderOk: () => ledgerCalls.push(['ok']), noteProviderError: (data) => ledgerCalls.push(['error', data]) };
+  const dispatchTurn = createTurnRunner({ client, getEffective: () => eff, readSystemPrompt: system, getExit: () => exit, log, ledger, addAlert: (k, d) => alerts.push({ kind: k, ...d }) });
+  return { dispatchTurn, calls, logs, collected, ledgerCalls, alerts, key };
+}
+
+// No Key, provider text or thinking anywhere a test can see.
+function assertClean(r, out, label) {
+  for (const [what, v] of [['logs', r.logs], ['result', out], ['collected', r.collected], ['alerts', r.alerts]]) {
+    const s = JSON.stringify(v);
+    assert.equal(s.includes(SECRET), false, `${label}: no provider text in ${what}`);
+    assert.equal(s.includes(r.key), false, `${label}: no Key in ${what}`);
+  }
+}
+
+for (const kind of KINDS) {
+  test(`${kind}: the request goes to the kind's path with the Key in a header only; the system string is sent unchanged with one cache marker`, async () => {
+    const r = kindRunner(kind);
+    const out = await r.dispatchTurn(turnOf());
+    assert.equal(out.started, true);
+    assert.equal(r.calls.length, 1);
+    const { url, init, body } = r.calls[0];
+    assert.ok(url.endsWith(WIRE[kind].path), 'the kind path');
+    assert.equal(url.includes(r.key), false, 'the Key is never in the URL');
+    assert.equal(Object.values(init.headers).some((v) => String(v).includes(r.key)), true, 'positive control: the Key is in a header');
+    assert.equal(init.body.includes(r.key), false, 'nor in the body');
+    assert.equal(init.body.split('cache_control').length - 1, 1, 'exactly one cache marker');
+    assert.equal(adapterFor(kind).systemTextOf(body), SYSTEM, 'the system string as read');
+    for (const banned of ['tools', 'tool_choice', 'fallbacks', 'models', 'temperature', 'top_p', 'top_k', 'metadata', 'inference_geo', 'speed', 'service_tier']) {
+      assert.equal(banned in body, false, banned);
+    }
+    assert.notEqual(body.stream, true, 'never streamed');
+    if (kind === 'anthropic') {
+      assert.deepEqual(Object.keys(init.headers).sort(), ['anthropic-version', 'content-type', 'x-api-key']);
+      assert.deepEqual(Object.keys(body).sort(), ['max_tokens', 'messages', 'model', 'output_config', 'system']);
+      assert.deepEqual(body.output_config, { effort: 'low' });
+      assert.equal(body.model, 'claude-opus-5-5');
+    } else {
+      assert.deepEqual(body, buildTurnRequest(kindEffective(kind), SYSTEM, turnOf()), 'the OpenRouter body is the golden builder output');
+    }
+  });
+
+  test(`${kind}: the content-policy markers are read on the string sent; a missing marker sends nothing (control: the whole prompt sends)`, async () => {
+    const r = kindRunner(kind, { system: () => SYSTEM.replace('<!-- clo-policy-end:1 -->', '') });
+    assert.deepEqual(await r.dispatchTurn(turnOf()), { started: false, reason: 'policy_sentinel' });
+    assert.equal(r.calls.length, 0);
+    assert.equal(r.alerts[0]?.kind, 'policy_sentinel');
+    const good = kindRunner(kind);
+    assert.equal((await good.dispatchTurn(turnOf())).started, true);
+    assert.equal(good.calls.length, 1);
+  });
+
+  test(`${kind}: a clean reply is collected once as final, with its usage; thinking and provider text go nowhere`, async () => {
+    const r = kindRunner(kind);
+    const out = await r.dispatchTurn(turnOf());
+    assert.equal(out.hostError, false);
+    assert.deepEqual(r.collected, [['turn-1', { text: '我在。', isError: false }, { kind: 'final' }]]);
+    assert.deepEqual(r.ledgerCalls, [['ok']]);
+    if (kind === 'anthropic') {
+      assert.deepEqual(out.usage, { input: 900, output: 30, cacheRead: 0, cacheWrite: 4000, cacheWrite1h: 0, costUsd: null, model: 'claude-opus-5-5', geo: 'global', speed: 'standard' });
+    } else {
+      assert.equal(out.usage.costUsd, 0.021);
+    }
+    assertClean(r, out, kind);
+  });
+
+  test(`${kind}: a refusal is a failed turn the provider answered, never posted and never a provider failure`, async () => {
+    const r = kindRunner(kind, { respond: () => WIRE[kind].refusal() });
+    const out = await r.dispatchTurn(turnOf());
+    assert.deepEqual({ s: out.started, h: out.hostError }, { s: true, h: true });
+    assert.equal(r.collected.length, 0);
+    assert.deepEqual(r.ledgerCalls, [['ok']]);
+    assert.ok(r.logs.some((l) => l.event === 'turn_model' && l.kind === 'refusal' && l.reason === 'refusal'));
+    assertClean(r, out, kind);
+  });
+
+  test(`${kind}: an HTTP error is a provider failure with its status, never retried; a 403 is a refusal only on OpenRouter`, async () => {
+    const r = kindRunner(kind, { respond: () => WIRE[kind].server() });
+    const out = await r.dispatchTurn(turnOf());
+    assert.equal(out.hostError, true);
+    assert.equal(r.calls.length, 1, 'never retried');
+    assert.deepEqual(r.ledgerCalls, [['error', { httpStatus: 500, limitSource: null }]]);
+    assertClean(r, out, kind);
+
+    const f = kindRunner(kind, { respond: () => WIRE[kind].forbidden() });
+    const fout = await f.dispatchTurn(turnOf());
+    assert.equal(fout.hostError, true);
+    assert.equal(f.collected.length, 0);
+    const line = f.logs.find((l) => l.event === 'turn_model');
+    if (kind === 'anthropic') {
+      // Region or access: a pause the owner clears, never a refusal (decision D10).
+      assert.deepEqual({ k: line.kind, r: line.reason }, { k: 'error', r: 'http' });
+      assert.deepEqual(f.ledgerCalls, [['error', { httpStatus: 403, limitSource: 'anthropic_permission' }]]);
+    } else {
+      assert.deepEqual({ k: line.kind, r: line.reason }, { k: 'refusal', r: 'moderation' });
+      assert.deepEqual(f.ledgerCalls, [['error', { httpStatus: 403, limitSource: null }]]);
+    }
+    assertClean(f, fout, kind);
+  });
+
+  test(`${kind}: the gate's signal ends the turn as aborted, and says nothing about the provider`, async () => {
+    const ctl = new AbortController();
+    const r = kindRunner(kind, { respond: hanging });
+    const pending = r.dispatchTurn(turnOf(), { signal: ctl.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    ctl.abort();
+    assert.deepEqual(await pending, { started: true, hostError: false, aborted: true, usage: null });
+    assert.deepEqual(r.ledgerCalls, []);
+    assert.equal(r.collected.length, 0);
+  });
+
+  test(`${kind}: a connection that never opened is retried once under the kind's own event, then not sent`, async () => {
+    const refused = () => new TypeError('fetch failed', { cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED', syscall: 'connect' }) });
+    const r = kindRunner(kind, { respond: async () => { throw refused(); } });
+    assert.deepEqual(await r.dispatchTurn(turnOf()), { started: false, reason: 'not_sent' });
+    assert.equal(r.calls.length, 2);
+    assert.deepEqual(r.logs.filter((l) => l.event.endsWith('_retry')).map((l) => l.event), [WIRE[kind].retryEvent]);
+    const recovers = kindRunner(kind, { respond: async (_u, _i, n) => { if (n === 1) throw refused(); return WIRE[kind].ok('好。'); } });
+    assert.equal((await recovers.dispatchTurn(turnOf())).hostError, false);
+    assert.equal(recovers.collected.length, 1);
+  });
+
+  test(`${kind}: a model id of the other kind's shape is refused before any request (control: its own id sends)`, async () => {
+    const eff = kindEffective(kind);
+    eff.models.primary.id = WIRE[kind].otherModel;
+    const r = kindRunner(kind, { eff });
+    assert.deepEqual(await r.dispatchTurn(turnOf()), { started: false, reason: 'model' });
+    assert.equal(r.calls.length, 0);
+    const good = kindRunner(kind);
+    assert.equal((await good.dispatchTurn(turnOf())).started, true);
+  });
+
+  test(`${kind}: the input bound reads the system and user text of the kind's body`, async () => {
+    const r = kindRunner(kind);
+    assert.deepEqual(await r.dispatchTurn(turnOf({ text: '长'.repeat(20000) })), { started: false, reason: 'input_bound' });
+    assert.equal(r.calls.length, 0);
+    const small = kindRunner(kind);
+    assert.equal((await small.dispatchTurn(turnOf())).started, true);
+  });
+}
+
+test('anthropic: an effort the primary cannot take is a configuration refusal before any request, not a missing marker (control: low sends)', async () => {
+  const eff = kindEffective('anthropic');
+  eff.models.primary.effort = 'none';
+  const r = kindRunner('anthropic', { eff });
+  assert.deepEqual(await r.dispatchTurn(turnOf()), { started: false, reason: 'model' });
+  assert.equal(r.calls.length, 0);
+  assert.deepEqual(r.alerts, [], 'no policy_sentinel alert');
+  assert.ok(r.logs.some((l) => l.event === 'turn_refused' && l.reason === 'request'));
+  const good = kindRunner('anthropic');
+  assert.equal((await good.dispatchTurn(turnOf())).started, true);
+  assert.equal(good.calls.length, 1);
+});
+
+test('anthropic: a reply cut at max_tokens is collected and logged as length; a tool_use ending is the model\'s, not posted', async () => {
+  const cut = kindRunner('anthropic', { respond: () => json(anthropicMessage('说到一半', { stop: 'max_tokens' })) });
+  assert.equal((await cut.dispatchTurn(turnOf())).hostError, false);
+  assert.equal(cut.collected.length, 1);
+  assert.ok(cut.logs.some((l) => l.event === 'turn_length'));
+  const tool = kindRunner('anthropic', { respond: () => json(anthropicMessage('x', { stop: 'tool_use', content: [{ type: 'tool_use', id: 't', name: 'f', input: { q: SECRET } }] })) });
+  const out = await tool.dispatchTurn(turnOf());
+  assert.equal(out.hostError, true);
+  assert.equal(tool.collected.length, 0);
+  assert.deepEqual(tool.ledgerCalls, [['ok']]);
+  assertClean(tool, out, 'tool_use');
+});
+
+test('the markers are checked on the body the adapter built, not on the prompt read: a body that lost one sends nothing (control: the same adapter unchanged sends)', async () => {
+  const run = async (alter) => {
+    const adapter = createFakeAdapter({ kind: 'openrouter' });
+    const build = adapter.turnBody;
+    if (alter) adapter.turnBody = (args) => ({ ...build(args), system: args.system.replace('<!-- clo-policy-end:1 -->', '') });
+    const client = createFakeClient({ adapter, script: [okResult('我在。')] });
+    const collected = [];
+    const dispatchTurn = createTurnRunner({ client, getEffective: () => effective(), readSystemPrompt: () => SYSTEM, getExit: () => ({ collect: (...a) => collected.push(a) }) });
+    return { out: await dispatchTurn(turnOf()), client, collected };
+  };
+  const lost = await run(true);
+  assert.deepEqual(lost.out, { started: false, reason: 'policy_sentinel' });
+  assert.equal(lost.client.posts.length, 0);
+  const kept = await run(false);
+  assert.equal(kept.out.started, true);
+  assert.equal(kept.client.posts.length, 1);
+  assert.equal(kept.client.unscripted, 0);
+  assert.equal(kept.collected.length, 1);
 });

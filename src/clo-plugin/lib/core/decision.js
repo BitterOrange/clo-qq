@@ -3,6 +3,9 @@
 import { readFileSync } from 'node:fs';
 import { mappedCopy, normalizeCopy } from './contentPolicy.js';
 import { createOpenRouterClient } from './openrouterChat.js';
+import { settleMicros } from './providers/cost.js';
+import { openrouterAdapter } from './providers/openrouterAdapter.js';
+import { CAPABILITIES } from './providers/registry.js';
 
 const SKIP_CLASSES = ['political', 'violence_crime', 'sexual', 'harm_person', 'none'];
 const FIELDS = ['action', 'crisis', 'need_search', 'skip_class'];
@@ -119,7 +122,10 @@ export function shapeCurrentText(eff, text, crisisSpan = null) {
   return merged.map(([from, to]) => points.slice(from, to).join('')).join('…');
 }
 
-export function buildRequest(eff, prompt, { trigger, lines, current }) {
+// The answer's schema, as every adapter takes it.
+const DECISION_SCHEMA = { name: RESPONSE_FORMAT.json_schema.name, schema: RESPONSE_FORMAT.json_schema.schema };
+
+function requestOf(adapter, eff, prompt, { trigger, lines, current }) {
   const { decision } = eff.models;
   const { decisionLines, decisionLineChars } = eff.retention;
   const payload = {
@@ -127,19 +133,14 @@ export function buildRequest(eff, prompt, { trigger, lines, current }) {
     lines: (lines ?? []).slice(-decisionLines).map((l) => ({ sender: l.sender, text: clamp(l.text, decisionLineChars) })),
     current: { sender: current.sender, text: clamp(current.text, currentChars(eff)) },
   };
-  return {
-    model: decision.id,
-    stream: false,
-    reasoning: { effort: decision.effort },
-    max_tokens: decision.maxTokens,
-    response_format: RESPONSE_FORMAT,
-    provider: { require_parameters: true },
-    usage: { include: true },
-    messages: [
-      { role: 'system', content: prompt },
-      { role: 'user', content: JSON.stringify(payload) },
-    ],
-  };
+  return adapter.decisionBody({
+    model: decision.id, effort: decision.effort, maxTokens: decision.maxTokens, system: prompt, user: JSON.stringify(payload), schema: DECISION_SCHEMA,
+  });
+}
+
+// The OpenRouter request, as the goldens and the Q5 probe build it.
+export function buildRequest(eff, prompt, args) {
+  return requestOf(openrouterAdapter, eff, prompt, args);
 }
 
 const costMicros = (usage) => {
@@ -147,15 +148,25 @@ const costMicros = (usage) => {
   return typeof cost === 'number' && Number.isFinite(cost) && cost > 0 ? Math.ceil(cost * 1e6) : null;
 };
 
+// What the call cost. A provider that reports a cost settles from it, as before. One that does not is priced from its
+// tokens at the locked price ('computed'), with flags for anything the price could not take at the standard rate;
+// usage that cannot be priced gives null, so the hold stays counted. An unknown kind prices nothing.
+function costOf(kind, usage, price) {
+  if (CAPABILITIES[kind]?.reportsCost === true) return { actualMicros: costMicros(usage) };
+  const s = settleMicros(usage, price, { kind });
+  return { actualMicros: s?.micros ?? null, costSource: 'computed', costFlags: s?.flags ?? [] };
+}
+
 const skip = (invalid, over = {}) => ({
   action: 'skip', skipClass: 'none', crisis: false, invalid, paid: true,
   actualMicros: null, model: null, httpStatus: null, limitSource: null, ...over,
 });
 
-// client: the shared OpenRouter client. Without one, a client of its own is made over fetch.
+// client: the shared chat client of the provider in use. Without one, an OpenRouter client of its own is made over fetch.
 export function createDecider({ client = null, fetch = globalThis.fetch, getKey, getEffective, promptFile, log = () => {}, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
   // No deadline is passed to it, so it never retries: a decision is cheap to skip.
   const chat = client ?? createOpenRouterClient({ fetch, getKey, getBaseUrl: () => getEffective()?.openrouter?.baseUrl, log, now });
+  const adapter = chat.adapter ?? openrouterAdapter;
   let prompt = null;
   const loadPrompt = (eff) => {
     prompt ??= readFileSync(promptFile ?? eff.paths.decisionPromptFile, 'utf8');
@@ -191,17 +202,30 @@ export function createDecider({ client = null, fetch = globalThis.fetch, getKey,
       return out;
     };
 
+    // A provider that reports a cost keeps a request it never sent as it always did: unsettled, until its Key reads
+    // settle it. One that reports none has no Key read to settle it, so what never left this machine is released
+    // (decision D4) instead of staying counted until the owner accepts it.
+    const reportsCost = CAPABILITIES[adapter.kind]?.reportsCost === true;
     let r;
     try {
-      r = await chat.post(buildRequest(eff, text, { trigger, lines, current }), { signal: ctl.signal });
+      let body;
+      try {
+        body = requestOf(adapter, eff, text, { trigger, lines, current });
+      } catch (err) {
+        // A body the adapter will not build, before anything is sent. With a cost report the gate keeps the hold.
+        if (reportsCost) throw err;
+        return finish(skip('http', { model, paid: false }));
+      }
+      r = await chat.post(body, { signal: ctl.signal });
     } finally {
       clearTimer(timer);
       signal?.removeEventListener('abort', onOuterAbort);
     }
 
     if (r.kind === 'aborted') return finish(skip('timeout', { model, httpStatus: r.status }));
-    if (r.kind === 'not_sent' || r.reason === 'network') return finish(skip('http', { model, httpStatus: r.status }));
-    const base = { model, actualMicros: costMicros(r.usage), httpStatus: r.status };
+    if (r.kind === 'not_sent') return finish(skip('http', { model, httpStatus: r.status, ...(reportsCost ? {} : { paid: false }) }));
+    if (r.reason === 'network') return finish(skip('http', { model, httpStatus: r.status }));
+    const base = { model, ...costOf(adapter.kind, r.usage, eff.models.decision.price), httpStatus: r.status };
     if (r.reason === 'http' || r.reason === 'moderation' || r.reason === 'provider_error') {
       return finish(skip('http', {
         ...base,

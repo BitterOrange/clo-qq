@@ -1,15 +1,20 @@
 // TQ12, TQ21 and the required-turn rows of the test map on the own runtime: QQ events through the real bot process,
-// one direct model request per turn, and back through the exit. Mock QQ and a mock model only.
+// one direct model request per turn, and back through the exit. Mock QQ and a mock model only, of either provider kind:
+// the body is read through the model view, and the Key and request checks are each kind's own.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { after, before, describe, test } from 'node:test';
 import { atAll, atBotAndAll, atImage, atOther, dm, fullAt, groupAtOff, imageOnly, nextId, push, quoted } from '../fixtures/qq-events.mjs';
 import { assertAgentRequest } from '../harness/gateway.mjs';
-import { assertEveryPostLegal, BOT_MEMBER, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, GROUP_B, MEMBER, netAttempts, sleep, startOwnStack, until } from '../harness/own.mjs';
+import { NEVER_SENT } from '../harness/model-view.mjs';
+import {
+  assertEveryPostLegal, BOT_MEMBER, FAKE_ANTHROPIC_KEY, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, GROUP_B, MEMBER, netAttempts, PROVIDER, sleep, startOwnStack, TEST_IDS, until, view,
+} from '../harness/own.mjs';
 
+const PRIMARY_ID = TEST_IDS.primary;
 const LINES = JSON.parse(readFileSync(new URL('../../persona/policy-lines.zh.json', import.meta.url), 'utf8'));
 const QUIET_MS = 1500;
-const userContent = (rec) => rec.body.messages.find((m) => m.role === 'user').content;
+const userContent = (rec) => view(rec).user;
 // Line 1 is the frame; the rest is one JSON object.
 const payloadOf = (rec) => {
   const c = userContent(rec);
@@ -28,7 +33,7 @@ async function askAndReply(text) {
 }
 
 before(async () => {
-  s = await startOwnStack({ label: 'group', groups: { [GROUP_A]: {} } });
+  s = await startOwnStack({ provider: PROVIDER, label: 'group', groups: { [GROUP_A]: {} } });
 });
 
 after(async () => {
@@ -47,9 +52,18 @@ describe('real @', () => {
 
     assert.equal(s.model.agentRequests().length, 1, 'one model request');
     const req = s.model.agentRequests()[0];
-    assertAgentRequest(req);
-    assert.equal(req.body.stream, false, 'the own runtime sends one non-streaming request');
-    assert.equal(req.headers.authorization, `Bearer ${FAKE_MODEL_KEY}`);
+    if (s.kind === 'openrouter') {
+      assertAgentRequest(req);
+      assert.equal(req.body.stream, false, 'the own runtime sends one non-streaming request');
+      assert.equal(req.headers.authorization, `Bearer ${FAKE_MODEL_KEY}`);
+    } else {
+      assert.equal(req.body.model, PRIMARY_ID);
+      assert.equal(req.body.max_tokens, 3000);
+      assert.deepEqual(req.body.output_config, { effort: 'low' });
+      for (const k of NEVER_SENT.anthropic) assert.equal(req.body[k], undefined, `no ${k}: one non-streaming request, nothing to fall back to`);
+      assert.ok(s.keySent(req, FAKE_ANTHROPIC_KEY), 'the Anthropic Key, in x-api-key only');
+      assert.ok(!JSON.stringify(req.headers).includes(FAKE_MODEL_KEY), 'the inactive Key is not sent');
+    }
     assert.equal(payloadOf(req).text, '今天怎么样');
     const prompt = JSON.stringify(req.body.messages);
     assert.ok(!prompt.includes(BOT_MEMBER), 'the mention tag never reaches the model');
@@ -70,7 +84,8 @@ describe('real @', () => {
     // Replaces the host test of an exact one-tool list: the own runtime sends no tool surface.
     const req = s.model.agentRequests()[0];
     for (const k of ['tools', 'tool_choice', 'functions']) assert.equal(req.body[k], undefined, `no ${k}`);
-    assert.ok(Array.isArray(req.body.messages) && req.body.messages.length === 2, 'positive control: the body was read');
+    // Anthropic carries the system text beside one user message.
+    assert.ok(Array.isArray(req.body.messages) && req.body.messages.length === (s.kind === 'anthropic' ? 1 : 2), 'positive control: the body was read');
   });
 
   test('GROUP_AT mode (full-message off): leading space, no mentions, still a real @', async () => {
@@ -252,7 +267,7 @@ describe('at rest', () => {
     const botLog = s.logs();
     const dbText = readFileSync(s.paths.db).toString('latin1') + readWal(s.paths.db);
     assert.ok(logText.includes(s.key(id)), 'positive control: the event log names this event by its key');
-    for (const c of [canary, 'CANARYBODY7731', 'CANARYREPLY7731', 'CANARYMESSAGEID7731', GROUP_A, MEMBER, BOT_MEMBER, 'SENDER-DISPLAY-NAME', FAKE_QQ_SECRET, FAKE_MODEL_KEY]) {
+    for (const c of [canary, 'CANARYBODY7731', 'CANARYREPLY7731', 'CANARYMESSAGEID7731', GROUP_A, MEMBER, BOT_MEMBER, 'SENDER-DISPLAY-NAME', FAKE_QQ_SECRET, FAKE_MODEL_KEY, FAKE_ANTHROPIC_KEY]) {
       assert.ok(!logText.includes(c), `${c} in the event log`);
       assert.ok(!botLog.includes(c), `${c} in the bot log`);
       assert.ok(!dbText.includes(c), `${c} in the database`);

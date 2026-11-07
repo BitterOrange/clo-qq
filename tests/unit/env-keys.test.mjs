@@ -201,12 +201,16 @@ test('every key in .env.example is in the README .env table and the CLAUDE.md ke
   const ROOT = join(import.meta.dirname, '..', '..');
   const read = (f) => readFileSync(join(ROOT, f), 'utf8');
   const template = [...read('.env.example').matchAll(/^([A-Z0-9_]+)=/gm)].map((m) => m[1]);
-  assert.ok(template.includes(TEST_KEY) && template.includes('CLO_CHAT_API_KEY'), 'positive control: the template was parsed');
+  assert.ok(template.includes(TEST_KEY) && template.includes('CLO_CHAT_API_KEY') && template.includes('CLO_ANTHROPIC_API_KEY'), 'positive control: the template was parsed');
   const readme = read('README.md');
   const section = readme.slice(readme.indexOf('### 2. 填 `.env`'), readme.indexOf('### 3. 改 `config.json`'));
   const readmeKeys = [...section.matchAll(/^\| `([A-Z0-9_]+)` \|/gm)].map((m) => m[1]);
   const guide = read('CLAUDE.md');
-  const keyTable = guide.slice(guide.indexOf('**密钥**只放'), guide.indexOf('**目前只适用于 OpenRouter。**'));
+  // The table ends at the paragraph on the two model providers that follows it.
+  const start = guide.indexOf('**密钥**只放');
+  const end = guide.indexOf('**模型接口只有两种：OpenRouter 和 Anthropic。**');
+  assert.ok(start >= 0 && end > start, 'positive control: both anchors are in CLAUDE.md, in order');
+  const keyTable = guide.slice(start, end);
   const guideKeys = [...keyTable.matchAll(/`([A-Z0-9_]+)`/g)].map((m) => m[1]);
   assert.ok(readmeKeys.includes('CLO_CHAT_API_KEY'), 'positive control: the README table was found');
   assert.ok(guideKeys.includes('CLO_CHAT_API_KEY'), 'positive control: the CLAUDE.md table was found');

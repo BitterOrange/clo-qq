@@ -85,6 +85,23 @@ export function makeEffective(over = {}) {
   return deepMerge(eff, over);
 }
 
+// The Anthropic book prices of versions.lock.json, by hand: these tests must not move when the lock does.
+export const OPUS_PRICE = Object.freeze({ inputPerM: 4, outputPerM: 20, cacheReadPerM: 0.2, cacheWritePerM: 5, cacheWrite1hPerM: 8 });
+export const HAIKU_PRICE = Object.freeze({ inputPerM: 0.1, outputPerM: 0.5, cacheReadPerM: 0.01, cacheWritePerM: 0.125, cacheWrite1hPerM: 0.2 });
+export const ANTHROPIC_BASE = 'http://127.0.0.1:9';
+
+// An effective file of the own runtime on the Anthropic kind, as config.js writes it: apiProvider, and the entry's ids
+// with their locked prices. hardCap is the copied ack, null when there is none.
+// The prices are fresh copies set after the merge: merging into the shared default price objects would change them for
+// every later test.
+export function anthropicEffective(over = {}, { hardCap = null } = {}) {
+  const { models, ...rest } = over;
+  const eff = makeEffective({ runtime: 'own', apiProvider: { name: 'anthropic', kind: 'anthropic', baseUrl: ANTHROPIC_BASE, hardCap }, ...rest });
+  eff.models.primary = { ...eff.models.primary, id: 'claude-opus-5-5', selector: 'claude-opus-5-5', price: { ...OPUS_PRICE } };
+  eff.models.decision = { ...eff.models.decision, id: 'claude-haiku-5-5', effort: 'none', price: { ...HAIKU_PRICE } };
+  return models ? deepMerge(eff, { models }) : eff;
+}
+
 function deepMerge(base, over) {
   for (const [k, v] of Object.entries(over)) {
     if (v && typeof v === 'object' && !Array.isArray(v) && base[k] && typeof base[k] === 'object') deepMerge(base[k], v);
@@ -177,7 +194,8 @@ export function fakeExit(over = {}) {
   return exit;
 }
 
-export function makeHarness({ effective, decide, dispatch, exit, dbFile, start = T0, attach = true, runGen = 'gen-1', log } = {}) {
+// runtime: the process's own runtime for the gate and the ledger; left out, their default (openclaw), as before.
+export function makeHarness({ effective, decide, dispatch, exit, dbFile, start = T0, attach = true, runGen = 'gen-1', log, runtime } = {}) {
   const clock = { t: start };
   const now = () => clock.t;
   const eff = { current: effective === undefined ? makeEffective() : effective };
@@ -201,7 +219,8 @@ export function makeHarness({ effective, decide, dispatch, exit, dbFile, start =
   openStores.add(store);
   const logs = [];
   const logFn = log ?? ((event, data) => logs.push({ event, ...data }));
-  const ledger = createLedger({ store, getEffective, fetch: async () => { throw new Error('no network in this test'); }, getKey: () => 'FAKE-KEY', now, log: logFn });
+  const pinned = runtime === undefined ? {} : { runtime };
+  const ledger = createLedger({ store, getEffective, fetch: async () => { throw new Error('no network in this test'); }, getKey: () => 'FAKE-KEY', now, log: logFn, ...pinned });
   const policy = loadRealPolicy();
 
   const decideCalls = [];
@@ -226,6 +245,7 @@ export function makeHarness({ effective, decide, dispatch, exit, dbFile, start =
     log: logFn,
     now,
     timers,
+    ...pinned,
   });
   if (attach) gate.attachExit(exitObj);
 

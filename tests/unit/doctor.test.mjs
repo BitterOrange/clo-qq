@@ -1,13 +1,14 @@
 // Doctor: each check must fail on its own bad state, with the clean state as the control in the same run.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { makeContext } from '../../src/cli/common.mjs';
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, inspectHooks, runDoctor } from '../../src/cli/doctor.mjs';
 import { ensureGatewayEnvClean, gatewayEnv, gatewayEnvForCheck } from '../../src/cli/lifecycle.mjs';
-import { APP_ID, baseConfig, clo, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, NET_GUARD, openclawOf, OWNER_ID, ROOT, testEnv } from './_cli-helper.mjs';
+import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
+import { APP_ID, baseConfig, clo, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, NET_GUARD, openclawOf, OWNER_ID, ROOT, testEnv, withProviders, writePriceBook } from './_cli-helper.mjs';
 
 const roots = [];
 async function prepared(label, cfg = enabledConfig()) {
@@ -426,4 +427,80 @@ test('own: the full level never asks a host, and still checks .env', async () =>
   assert.equal((await clo(root, ['apply'])).code, 0);
   runDoctor(ctxOf(root, env), { level: FULL_LEVEL, run });
   assert.equal(asked, 1, 'positive control: under openclaw the host is asked');
+});
+
+// --- The model API provider: by kind, with no network. ---
+
+async function preparedAnthropic(label) {
+  const { root, env } = await preparedOwn(label);
+  appendFileSync(join(root, '.env'), `CLO_ANTHROPIC_API_KEY=${FAKE_ANTHROPIC_KEY}\n`);
+  writePriceBook(root);
+  const cfgFile = join(root, 'config.json');
+  writeFileSync(cfgFile, JSON.stringify(withProviders(JSON.parse(readFileSync(cfgFile, 'utf8')), { active: 'openrouter', anthropicBaseUrl: 'http://127.0.0.1:9' }), null, 2));
+  assert.equal((await clo(root, ['model', 'lock', '--provider', 'anthropic', '--confirm-price'])).code, 0);
+  assert.equal((await clo(root, ['provider', 'use', 'anthropic', '--confirm', '--qq-platform-notified'])).code, 0);
+  return { root, env, cfgFile };
+}
+const checkOf = (report, id) => report.checks.find((c) => c.id === id);
+
+test('provider: bot_env asks for the active kind\'s Key name only, and the provider check says what that kind cannot do', async () => {
+  const { root, env } = await preparedAnthropic('prov-an');
+  const report = doctor(root, {}, env);
+  assert.deepEqual(report.failed, [], formatDoctor(report));
+  assert.equal(checkOf(report, 'bot_env').ok, true);
+  assert.match(checkOf(report, 'provider').detail, /anthropic（anthropic）：已锁定价格；读不到 Key，对账不可用/);
+  assert.match(checkOf(report, 'provider').detail, /clo ack hard-cap/);
+  // Positive control: the same install on OpenRouter has the OpenRouter name, and says nothing about reconciliation.
+  const { root: orRoot, env: orEnv } = await preparedOwn('prov-or');
+  const or = doctor(orRoot, {}, orEnv);
+  assert.equal(checkOf(or, 'bot_env').ok, true);
+  assert.equal(checkOf(or, 'provider').detail, 'OpenRouter（默认）');
+});
+
+test('provider: a lock that no longer matches the entry fails, and a relock passes (control); the OpenClaw runtime on Anthropic fails', async () => {
+  const { root, env, cfgFile } = await preparedAnthropic('prov-lock');
+  const lockFile = join(root, 'versions.lock.json');
+  const good = readFileSync(lockFile, 'utf8');
+  const off = JSON.parse(good);
+  off.models.locks.anthropic.decision.id = 'claude-sonnet-5-5';
+  writeFileSync(lockFile, JSON.stringify(off));
+  const stale = doctor(root, {}, env);
+  assert.ok(failedIds(stale).includes('provider'), formatDoctor(stale));
+  assert.match(checkOf(stale, 'provider').detail, /clo model lock --provider anthropic/);
+  writeFileSync(lockFile, good);
+  assert.ok(!failedIds(doctor(root, {}, env)).includes('provider'), 'control: the matching lock passes');
+
+  writeFileSync(cfgFile, JSON.stringify({ ...JSON.parse(readFileSync(cfgFile, 'utf8')), runtime: 'openclaw' }));
+  const host = doctor(root, {}, env);
+  assert.ok(failedIds(host).includes('config_valid'), formatDoctor(host));
+  assert.ok(failedIds(host).includes('provider'));
+  assert.match(checkOf(host, 'provider').detail, /OpenClaw 运行时只能用 OpenRouter/);
+});
+
+test('provider_key: the full level names the active kind\'s Key, warns in dry-run when it is missing, and prints no value', async () => {
+  const { root, env } = await preparedAnthropic('prov-key');
+  const full = () => runDoctor(ctxOf(root, env), { level: FULL_LEVEL, run: () => ({ status: 1, stdout: '' }) });
+  const present = full();
+  assert.equal(checkOf(present, 'provider_key').ok, true);
+  assert.equal(checkOf(present, 'provider_key').detail, 'CLO_ANTHROPIC_API_KEY');
+  const envFile = join(root, '.env');
+  writeFileSync(envFile, readFileSync(envFile, 'utf8').replace(/^CLO_ANTHROPIC_API_KEY=.*$/m, ''));
+  const missing = full();
+  const check = checkOf(missing, 'provider_key');
+  assert.equal(check.ok, false);
+  assert.equal(check.severity, 'warn', 'dry-run calls no model');
+  assert.deepEqual(missing.failed, [], 'a warning does not stop a start');
+  assert.match(check.detail, /CLO_ANTHROPIC_API_KEY/);
+  for (const raw of [FAKE_KEY, FAKE_SECRET, FAKE_ANTHROPIC_KEY]) assert.ok(!formatDoctor(present).includes(raw) && !formatDoctor(missing).includes(raw), 'a value printed');
+});
+
+test('bot_env fails when the bot would hold a model Key it should not (the check works: control)', async () => {
+  const { modelKeyNames: names, ownEnvForCheck } = await import('../../src/cli/lifecycle.mjs');
+  const r = makeRoot('prov-botenv', null);
+  roots.push(r);
+  const ctx = ctxOf(r.root);
+  assert.deepEqual(names(ownEnvForCheck(ctx.paths, ctx.env, { kind: 'anthropic' })), ['CLO_PROVIDER_API_KEY']);
+  assert.deepEqual(names(ownEnvForCheck(ctx.paths, ctx.env, { kind: 'openrouter' })), ['OPENROUTER_API_KEY']);
+  assert.deepEqual(names({ OPENROUTER_API_KEY: 'x', CLO_PROVIDER_API_KEY: 'x' }), ['OPENROUTER_API_KEY', 'CLO_PROVIDER_API_KEY'], 'positive control: two would be seen');
+  assert.deepEqual(ensureGatewayEnvClean(gatewayEnvForCheck(ctx.paths, ctx.env)), [], 'the Gateway check env is clean with the new names');
 });

@@ -6,6 +6,8 @@ import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { DOWN_ALERT_AFTER_MS, PROBE_FAILS_TO_SUSPECT } from '../../src/clo-plugin/lib/channels/qq/connection.js';
 import { buildPlan } from '../../src/tools/q5-probe.mjs';
+import { buildPlan as buildAnthropicPlan } from '../../src/tools/q5-anthropic.mjs';
+import { KEY_ENV, PROBE_KEY_ENV, providerRulesRecorded } from '../../src/clo-plugin/lib/core/providers/registry.js';
 import { makeRoot, ROOT } from './_cli-helper.mjs';
 
 const read = (name) => readFileSync(join(ROOT, name), 'utf8');
@@ -52,15 +54,16 @@ test('the figures the user agrees to are the ones the plan prints', () => {
   }
   // Each example is checked against the plan of the runtime its line names.
   const ownPlan = buildPlan(ROOT, { runtime: 'own' });
+  const anthropicPlan = buildAnthropicPlan(ROOT);
   let examples = 0;
   for (const line of DEPLOYMENT.split('\n')) {
     for (const m of line.matchAll(/-MaxUsd (\d+\.\d+)/g)) {
-      const bound = /-Runtime own\b/.test(line) ? ownPlan.totalWorstMicros : plan.totalWorstMicros;
+      const bound = /q5-anthropic/.test(line) ? anthropicPlan.totalWorstMicros : /-Runtime own\b/.test(line) ? ownPlan.totalWorstMicros : plan.totalWorstMicros;
       assert.ok(Number(m[1]) * 1e6 >= bound, `the example ${m[0]} would be refused: ${line.slice(0, 80)}`);
       examples += 1;
     }
   }
-  assert.ok(examples >= 3, 'positive control: the examples of both runtimes were found');
+  assert.ok(examples >= 4, 'positive control: the examples of both runtimes and of the Anthropic probe were found');
   const turnRow = `$${(plan.turns.reduce((a, t) => a + t.worstMicros, 0) / 1e6).toFixed(4)}`;
   assert.ok(DEPLOYMENT.includes(turnRow), 'the Gateway row of the table, which moved with the probe text');
 });
@@ -148,7 +151,7 @@ test('the temp-root text says what happens when it cannot be deleted', () => {
 });
 
 // The repo is public. These hold what was decided for the public text.
-const PUBLIC_DOCS = ['README.md', 'DEPLOYMENT.md', 'DECISIONS.md', 'docs/group-chat-design.md', 'docs/q0a-guide.zh.md', 'docs/wiring-trial.md', 'docs/own-runtime.md', 'docs/cost-options.md'];
+const PUBLIC_DOCS = ['README.md', 'DEPLOYMENT.md', 'DECISIONS.md', 'docs/group-chat-design.md', 'docs/q0a-guide.zh.md', 'docs/wiring-trial.md', 'docs/own-runtime.md', 'docs/cost-options.md', 'docs/provider-contract.md'];
 
 test('public docs do not send a reader to files that are not in the repo, or name private things', () => {
   const documentation = /^(?:127\.0\.0\.1|0\.0\.0\.0|192\.0\.2\.\d+|198\.51\.100\.\d+|203\.0\.113\.\d+)$/;
@@ -526,7 +529,7 @@ test('the own probe figures are the ones its plan prints, and its one real run i
   for (const [name, text] of [['own-runtime', OWN_DOC], ['DEPLOYMENT', DEPLOYMENT]]) {
     assertGone(text, ['还没有传 `--runtime` 的参数', '还不能选运行时', '不能选运行时', '照这个计划跑不了', '照现在的计划跑不了', '最多 7 次模型调用'], name);
   }
-  // The printed figure is rounded up and is enough; the rounded-down one is refused, and no doc offers it as the threshold.
+  // The printed figure is rounded up and, for this plan, enough; the rounded-down one is refused, and no doc offers it as the threshold.
   for (const [name, text] of [['own-runtime', OWN_DOC], ['DEPLOYMENT', DEPLOYMENT], ['DECISIONS', DECISIONS_TEXT()]]) {
     assert.ok(text.includes(ownPrinted), `${name} names the printed, rounded-up figure`);
     assert.ok(text.includes(`低于 ${ownWorst} 就拒绝`) || text.includes(`低于 ${ownPlan.totalWorstMicros} 微美元就拒绝`), `${name} states the exact threshold`);
@@ -575,8 +578,9 @@ const DECISIONS_TEXT = () => read('DECISIONS.md');
 test('the user decisions of 2026-11-06 on Q5 and cost are recorded, and the unconfirmed probe values apart from them', () => {
   const DECISIONS = DECISIONS_TEXT();
   const user = DECISIONS.slice(DECISIONS.indexOf('## 用户定的（2026-11-06，Q5 和费用）'), DECISIONS.indexOf('## 开发时定的，用户还没有确认（2026-11-06，Q5 探测）'));
-  const dev = DECISIONS.slice(DECISIONS.indexOf('## 开发时定的，用户还没有确认（2026-11-06，Q5 探测）'), DECISIONS.indexOf('## 待定（决策点 D）'));
+  const dev = DECISIONS.slice(DECISIONS.indexOf('## 开发时定的，用户还没有确认（2026-11-06，Q5 探测）'), DECISIONS.indexOf('## 用户定的（2026-11-07，Provider）'));
   assert.ok(user.length > 200 && dev.length > 200, 'positive control: both sections were found, in order');
+  assert.ok(!dev.includes('## 用户定的（2026-11-07') && !dev.includes('## 待定'), 'the Q5 developer section holds only its own rows');
   const ownPlan = buildPlan(ROOT, { runtime: 'own' });
   for (const item of ['第 2 回合按条件发', `\`max_tokens\` | ${ownPlan.probeMaxTokens}`, `$${ownPlan.priceCeiling.inputPerM}`, `$${ownPlan.priceCeiling.outputPerM}`, '`provider.max_price`', '**不加**', 'Fast Mode', 'CLO_TEST_API_KEY', 'docs/cost-options.md']) {
     assert.ok(user.includes(item), `the user section has ${item}`);
@@ -699,6 +703,267 @@ test('the design contract marks its host sections as openclaw only, and records 
   assert.match(own, /same second as `\/stop` is skipped/);
 });
 
+// The provider layer (user decisions of 2026-11-07). Nothing has run on real Anthropic, so every doc says so, and the
+// rule text, the notice and the retention table describe both providers as the code has them.
+const PROVIDER_USER = '## 用户定的（2026-11-07，Provider）';
+const PROVIDER_DEV = '## 开发时定的，用户还没有确认（2026-11-07，Provider）';
+const OPEN = '## 待定（决策点 D）';
+const CONTRACT_DOC = read('docs/provider-contract.md');
+const sectionOf = (text, start, end) => {
+  const a = text.indexOf(start);
+  const b = text.indexOf(end, a + 1);
+  assert.ok(a >= 0 && b > a, `positive control: found ${start} before ${end}`);
+  return text.slice(a, b);
+};
+
+test('DECISIONS records the provider decisions: the user section, the unconfirmed developer section, the superseded row, the open retry item', () => {
+  const DECISIONS = DECISIONS_TEXT();
+  const user = sectionOf(DECISIONS, PROVIDER_USER, PROVIDER_DEV);
+  const dev = sectionOf(DECISIONS, PROVIDER_DEV, OPEN);
+  for (const item of ['按你来', '规划 D2', '规划 D3', '规划 D4', '规划 D5', '规划 D7', '规划 D8', '约 $20', '自动充值', '`clo ack hard-cap`', '指纹', '`hard_cap_unverified`',
+    '对账：不可用（本地估算）', 'Admin Key', '`clo budget accept-unsettled`', '`clo budget clear-pause`', '不用 Anthropic SDK', '不加新依赖', '`--qq-platform-notified`',
+    '“已告知”', '其他 OpenAI 兼容接口仍然不能用', '`LIVE_RULES_RECORDED`', '真实 Anthropic 上一次都没有跑过', '要用户本人看过']) {
+    assert.ok(user.includes(item), `the user section has ${item}`);
+  }
+  for (const item of ['规划 D6', '1.10 倍', '规划 D9', '`thinking: disabled`', '规划 D10', '`anthropic_permission`', '规划 D11', '`enforced_spend_limit_reached`', '规划 D12',
+    '`clo.db.v1.bak`', '`retention.eventDays`', '类型', '用户不同意的话', '`provider_rules`', '401 和 404']) {
+    assert.ok(dev.includes(item), `the developer section has ${item}`);
+  }
+  assert.ok(!user.includes('开发时定的'), 'no developer choice sits in the user section');
+  // The row that said no abstraction stays as history, with a pointer to what replaced it.
+  const old = DECISIONS.split('\n').find((l) => l.startsWith('| 换 Claude API'));
+  assert.ok(old, 'positive control: the old row is still there');
+  assert.match(old, /现在不做接口抽象/, 'its words are kept');
+  assert.match(old, /已被下面“用户定的（2026-11-07，Provider）”的共用接口层取代/, 'and it points at the new decision');
+  // The retry departure stays open for the user, under the open items, and keeps the user's words.
+  const open = DECISIONS.slice(DECISIONS.indexOf(OPEN), DECISIONS.indexOf('## 已废弃的结论'));
+  assert.ok(open.length > 0, 'positive control: the open section was found');
+  assert.match(open, /连接重试不另外预留.*“在期限内重试一次，并单独预留”.*还没有定/);
+  assert.match(open, /自己的运行时里和上一节不一致的地方/);
+  // Positive control: a planted line that reports the open item as settled is caught.
+  const settled = ['连接重试的预留已经确认', '用户已同意不另外预留'];
+  assert.throws(() => assertGone(`${open}\n用户已同意不另外预留。`, settled, 'planted'), /still says/);
+  assertGone(DECISIONS, settled, 'DECISIONS');
+});
+
+test('CLAUDE.md describes both providers in sections 4, 6 and 8.2, and still excludes other OpenAI-compatible endpoints', () => {
+  const CLAUDE = read('CLAUDE.md');
+  const s4 = sectionOf(CLAUDE, '## 4. 配置与接入体验', '## 5. ');
+  const s6 = sectionOf(CLAUDE, '## 6. 模型接口与联网搜索', '### 默认搜索方案');
+  const s82 = sectionOf(CLAUDE, '### 8.2 预算', '### 8.3 ');
+  for (const key of [KEY_ENV.openrouter, KEY_ENV.anthropic, PROBE_KEY_ENV.anthropic]) assert.ok(s4.includes(`\`${key}\``), `section 4 lists ${key}`);
+  assert.match(s4, /\*\*模型接口只有两种：OpenRouter 和 Anthropic。\*\*/);
+  assert.match(s4, /其他 OpenAI 兼容接口未来可能加，现在不能用，文档也不要写成能用/);
+  assert.match(s4, /真实 Anthropic 上还没有跑过/);
+  assert.match(s4, /`hard_cap`.*`key_valid`.*`provider_rules`/);
+  for (const item of ['**OpenRouter**', '**Anthropic**', '`claude-opus-5-5`', '`claude-haiku-5-5`', '不用 SDK', '`clo model lock --provider anthropic`', '`clo provider use`', '`--qq-platform-notified`', '不流式']) {
+    assert.ok(s6.includes(item), `section 6 has ${item}`);
+  }
+  for (const item of ['工作区月度上限（Anthropic）', '`clo ack hard-cap`', '`hard_cap_unverified`', '对账：不可用（本地估算）', 'Admin Key', '`clo budget accept-unsettled`', '`clo budget clear-pause`', '出错的一天最多可能花到它']) {
+    assert.ok(s82.includes(item), `section 8.2 has ${item}`);
+  }
+  assertGone(CLAUDE, ['- 目前只走 OpenRouter。', '**目前只适用于 OpenRouter。**'], 'CLAUDE.md');
+  // The status text the rule quotes is the console's.
+  assert.match(read('src/cli/status.mjs'), /对账：不可用（本地估算）/, 'positive control: status prints it');
+});
+
+test('no doc says the Anthropic path ran for real, and each says how to configure, switch, attest and read it', () => {
+  const ran = ['在真实 Anthropic 上跑过', '真实 Anthropic 上跑通', 'Anthropic 已验收', 'Anthropic 探测已运行', 'ran against real Anthropic', 'ran on real Anthropic'];
+  assert.throws(() => assertGone(`${README}\n直连 Anthropic 在真实 Anthropic 上跑过一次。`, ran, 'README with a planted claim'), /still says/);
+  const docs = [['README', README], ['DEPLOYMENT', DEPLOYMENT], ['DECISIONS', DECISIONS_TEXT()], ['own-runtime', OWN_DOC], ['design', DESIGN_DOC], ['contract', CONTRACT_DOC], ['cost-options', read('docs/cost-options.md')]];
+  for (const [name, text] of docs) assertGone(text, ran, name);
+  for (const [name, text] of [['README', README], ['own-runtime', OWN_DOC], ['DECISIONS', DECISIONS_TEXT()]]) assert.match(text, /真实 Anthropic 上一次都没有跑过/, name);
+  assert.match(DEPLOYMENT, /\| own 上直连 Anthropic \| \*\*未做\*\*/);
+  assert.match(DEPLOYMENT, /\*\*Anthropic 版本（`scripts\\q5-anthropic\.ps1`）：没有跑过。\*\*/);
+  assert.match(DESIGN_DOC, /12\. \*\*Model providers\*\*.*nothing has run on real Anthropic/);
+  assert.match(CONTRACT_DOC, /Nothing here has run on the real Anthropic API/);
+  // README: the steps, in order, with the commands the console has.
+  const block = README.slice(README.indexOf('### 模型接口（只在新运行时）'), README.indexOf('### 在线条件和重启'));
+  const steps = ['mode dry-run', 'stop.ps1', 'provider add anthropic', 'CLO_ANTHROPIC_API_KEY', 'model lock --provider anthropic', 'provider use anthropic --confirm', 'ack hard-cap anthropic --kind workspace_monthly', 'notice-done', 'ack d3', 'start.ps1', 'mode live'].map((x) => block.indexOf(x));
+  assert.ok(steps.every((i) => i >= 0), 'every step is there');
+  assert.deepEqual([...steps].sort((a, b) => a - b), steps, 'in the order the console needs');
+  for (const item of ['对账：不可用（本地估算）', '硬上限未核实', '出错的一天最多可能花到这个月度上限', '`clo budget accept-unsettled`', '`clo budget clear-pause`', '`hard_cap`', '`key_valid`', '`provider_rules`']) {
+    assert.ok(block.includes(item), `README provider section has ${item}`);
+  }
+  const status = read('src/cli/status.mjs');
+  for (const line of ['对账：不可用（本地估算）', '硬上限未核实', '模型接口：']) assert.ok(status.includes(line), `positive control: status prints ${line}`);
+  assert.match(OWN_DOC, /## 模型接口[\s\S]*clo provider use anthropic --confirm[\s\S]*对账：不可用（本地估算）/);
+  assert.match(OWN_DOC, /\[provider-contract\.md\]\(provider-contract\.md\)/);
+  assert.match(README, /\| \[docs\/provider-contract\.md\]\(docs\/provider-contract\.md\) \|/, 'the README docs table lists the contract');
+  // The data path per provider.
+  assert.match(README, /直连 Anthropic 时，这些消息直接发给 Anthropic，不经过 OpenRouter/);
+  assert.ok(README.split('\n').some((l) => l.startsWith('| Anthropic（新运行时直连时） |')), 'the retention table has the Anthropic row');
+});
+
+test('the Anthropic probe figures in DEPLOYMENT are the ones its plan prints, with the US-only factor in the bound', () => {
+  const p = buildAnthropicPlan(ROOT);
+  assert.equal(p.calls.length, 3);
+  assert.ok(p.totalWorstMicros <= 100000 && p.totalWorstMicros > p.totalPreGeoMicros, 'positive control: the bound is under the agreed cap and includes the 1.1 factor');
+  assert.ok(DEPLOYMENT.includes(`$${(p.totalWorstMicros / 1e6).toFixed(6)}（${p.totalWorstMicros} 微美元）`), 'DEPLOYMENT has the printed bound');
+  assert.ok(DEPLOYMENT.includes('三次模型调用') && DEPLOYMENT.includes('1.1 倍'));
+  assert.ok(DEPLOYMENT.includes(PROBE_KEY_ENV.anthropic) && DEPLOYMENT.includes('-HardCapAttested'));
+});
+
+test('the retention table lists the clo.db backup and its temp copy with the janitor rule the store applies', () => {
+  const rows = README.split('\n');
+  const bak = rows.find((l) => l.startsWith('| `.runtime/clo/clo.db.v1.bak` |'));
+  const tmp = rows.find((l) => l.startsWith('| `.runtime/clo/clo.db.v1.bak.<进程号>.tmp` |'));
+  assert.ok(bak && tmp, 'both rows exist');
+  assert.match(bak, /`retention\.eventDays` 天（默认 14 天）/);
+  assert.match(bak, /进程不运行时一直留着/);
+  assert.match(tmp, /一小时后/);
+  // Positive control: the rule is the store's.
+  const store = read('src/clo-plugin/lib/core/store.js');
+  assert.match(store, /\$\{dbFile\}\.v1\.bak/);
+  assert.match(store, /at - migratedAt > retention\.eventDays \* DAY/);
+  assert.equal(JSON.parse(read('config.example.json')).retention.eventDays, 14);
+  // The way back to a v1 build is written out, with all three files moved together.
+  const restore = rows.find((l) => l.startsWith('| 要回退到只认第 1 版'));
+  assert.ok(restore, 'the restore row exists');
+  for (const step of ['clo stop', '`clo.db`、`clo.db-wal`、`clo.db-shm`', '`clo.db.v1.bak` 移成（改名为）`clo.db`', '保持 dry-run']) assert.ok(restore.includes(step), step);
+});
+
+test('the way back to a v1 build says it loses every latch written after the migration, not only spend, and who deletes the leftovers', () => {
+  const rows = README.split('\n');
+  const restore = rows.find((l) => l.startsWith('| 要回退到只认第 1 版'));
+  assert.ok(restore, 'positive control: the restore row exists');
+  // The latches it names are clo.db controls the code reads, so a snapshot taken before them holds none of them.
+  const code = ['src/clo-plugin/lib/channels/qq/exit.js', 'src/clo-plugin/lib/core/gate.js', 'src/clo-plugin/lib/core/ledger.js', 'src/clo-plugin/lib/core/store.js', 'src/clo-plugin/lib/core/commands.js', 'src/cli/clo.mjs'].map(read).join('\n');
+  for (const control of ["getControl('terminal_close')", "getControl('global_paused')", "getControl('interject_paused')", "getControl('paid_paused')", 'group_paused:']) {
+    assert.ok(code.includes(control), `positive control: ${control} is a clo.db control`);
+  }
+  for (const item of ['丢的不只是花费', '终止关闭（4914、4915）', '全局和分群暂停（包括平台错误码引起的）', '插话的自动暂停', '付费暂停', '没确认的告警', '照常重连、照常发送', 'dry-run 也会连 QQ',
+    '有终止关闭、付费暂停、插话的自动暂停或没确认的告警时不要回退', '用 `clo pause` 重新暂停', '`clo provider use openrouter --confirm`', '移出去的三个文件由你自己删除']) {
+    assert.ok(restore.includes(item), `the restore row has ${item}`);
+  }
+  // The losses come before the steps, so a reader who follows the steps has read them.
+  assert.ok(restore.indexOf('终止关闭（4914、4915）') < restore.indexOf('步骤：'), 'the losses are named before the steps');
+  const lossOnly = ['备份里没有升级之后写的记录，本地账本会少算这段时间的花费', '`clo.db.v1.bak` 复制成 `clo.db`'];
+  assert.throws(() => assertGone(`${restore} 再把 \`clo.db.v1.bak\` 复制成 \`clo.db\`。`, lossOnly, 'planted'), /still says/, 'positive control: the old wording is caught');
+  assertGone(README, lossOnly, 'README');
+  const bak = rows.find((l) => l.startsWith('| `.runtime/clo/clo.db.v1.bak` |'));
+  assert.match(bak, /回退到旧版本时它被移成 `clo\.db`，移出去的第 2 版文件旧版本不清理，由你自己删除/);
+  // The contract says the same.
+  const contract = CONTRACT_DOC.slice(CONTRACT_DOC.indexOf('**Restore**'), CONTRACT_DOC.indexOf('Tests (K3)'));
+  assert.ok(contract.length > 0, 'positive control: the contract restore section was found');
+  for (const item of ['`terminal_close`', '`global_paused`', '`group_paused:<g>`', '`interject_paused`', '`paid_paused`', 'unacknowledged alerts', 'Dry-run still connects to QQ', 'do not restore', 'Move (rename) `clo.db.v1.bak` to `clo.db`', 'the deployer deletes them']) {
+    assert.ok(contract.includes(item), `the contract restore has ${item}`);
+  }
+  assertGone(contract, ['Copy `clo.db.v1.bak` to `clo.db`'], 'the contract restore');
+});
+
+// The paid pauses a switch away from OpenRouter lifts, read from the console itself.
+const switchLifts = () => {
+  const m = read('src/cli/clo.mjs').match(/const SWITCH_LIFTS = new Set\(\[([^\]]+)\]\)/);
+  assert.ok(m, 'positive control: the console has SWITCH_LIFTS');
+  return [...m[1].matchAll(/'([a-z_]+)'/g)].map((x) => x[1]);
+};
+
+test('provider switch: the docs say which paid pauses a switch away from OpenRouter lifts, as the console does, and that every other one refuses', () => {
+  const lifts = switchLifts();
+  assert.deepEqual(lifts, ['key_read_failed', 'residual', 'openrouter_key_limit', 'provider_fail'], 'positive control: the four reasons');
+  const clo = read('src/cli/clo.mjs');
+  assert.match(clo, /换接口时已一并解除/, 'positive control: the console prints the lift');
+  assert.match(clo, /ctx\.log\('paid_resumed', \{ reason: reset\.lifted, source: 'provider_switch' \}\)/, 'positive control: and logs it');
+  const lines = README.split('\n');
+  const refuse = lines.find((l) => l.startsWith('- **什么时候拒绝换：**'));
+  const lifted = lines.find((l) => l.startsWith('- **从 OpenRouter 换走时一并解除的付费暂停：**'));
+  assert.ok(refuse && lifted, 'both README bullets exist');
+  assert.match(refuse, /有付费暂停，下一条那四种除外/);
+  const blanket = ['有付费暂停或判定熔断；'];
+  assert.throws(() => assertGone(`${refuse}有付费暂停或判定熔断；`, blanket, 'planted'), /still says/, 'positive control: the blanket wording is caught');
+  assertGone(README, blanket, 'README');
+  for (const reason of lifts) assert.ok(lifted.includes(`\`${reason}\``), `README names ${reason}`);
+  for (const item of ['`clo budget clear-pause` 也不管它们', '换接口时已一并解除', '`paid_resumed`', '可能是 Key 泄露了', '换之前先去 OpenRouter 上看这个 Key 的用量', '照样拒绝换', '只用模拟环境验证过']) {
+    assert.ok(lifted.includes(item), `the README bullet has ${item}`);
+  }
+  // status says no command lifts residual early; while it says so, README names the switch as the exception.
+  const statusSays = read('src/cli/status.mjs').includes('没有命令能提前解除');
+  assert.equal(lifted.includes('“没有命令能提前解除”，从 OpenRouter 换走是这句话的例外'), statusSays, 'README and status agree on residual');
+  // DECISIONS: the review row points at the exception, and the exception is its own unconfirmed developer row.
+  const dev = sectionOf(DECISIONS_TEXT(), PROVIDER_DEV, OPEN);
+  const review = dev.split('\n').find((l) => l.startsWith('| 规划之后审查加的几条 |'));
+  assert.ok(review, 'positive control: the review row');
+  assert.match(review, /有付费暂停时也拒绝（从 OpenRouter 换走时有四种例外，见下一行）/);
+  assertGone(review, ['`clo provider use` 在付费暂停、判定熔断、有预留或未结算的行时拒绝'], 'the review row');
+  const row = dev.split('\n').find((l) => l.startsWith('| 从 OpenRouter 换走时解除的付费暂停 |'));
+  assert.ok(row, 'the exception has its own row');
+  for (const reason of lifts) assert.ok(row.includes(`\`${reason}\``), `DECISIONS names ${reason}`);
+  for (const item of ['“有付费暂停就拒绝换”', '可能是 Key 泄露了', '没有提这个例外', '恢复原样']) assert.ok(row.includes(item), `the DECISIONS row has ${item}`);
+  // The contract lists the same reasons, under the command.
+  const commands = CONTRACT_DOC.slice(CONTRACT_DOC.indexOf('**Commands**'), CONTRACT_DOC.indexOf('- `clo ack hard-cap <name>'));
+  assert.ok(commands.includes('`SWITCH_LIFTS`') && commands.includes('Any other `paid_paused` still refuses the switch'), 'the contract states the exception');
+  for (const reason of lifts) assert.ok(commands.includes(`\`${reason}\``), `the contract names ${reason}`);
+});
+
+test('D6 is recorded as built: own on OpenRouter settles at the reported cost, the 1.10x alert is an alert row that never pauses, and the planned max is history', () => {
+  const dev = sectionOf(DECISIONS_TEXT(), PROVIDER_DEV, OPEN);
+  const row = dev.split('\n').find((l) => l.startsWith('| OpenRouter 在 own 上怎么结算（规划 D6） |'));
+  assert.ok(row, 'positive control: the D6 row');
+  for (const item of ['有上报的费用（`usage.cost`）就按上报的结算', '没有上报时才按 token 乘锁定价', '1.10 倍', '`cost_above_computed`', '它不暂停付费', '规划写的是取两者中较大的', '由 Key 的每日限额兜住', 'openclaw 路线不变']) {
+    assert.ok(row.includes(item), `the D6 row has ${item}`);
+  }
+  const stale = ['取算出来的和上报的较大者', '那项改动还没有并进来', '两种运行时都先用上报的', 'settles at max(computed, reported) and raises'];
+  assert.throws(() => assertGone(`${row}取算出来的和上报的较大者`, stale, 'planted'), /still says/, 'positive control: the planned wording is caught');
+  assertGone(DECISIONS_TEXT(), stale, 'DECISIONS');
+  assertGone(CONTRACT_DOC, stale, 'the contract');
+  assert.match(CONTRACT_DOC, /the reported cost settles whenever there is one, above or below the tokens at the locked price/);
+  assert.match(CONTRACT_DOC, /The plan said max\(computed, reported\)/);
+});
+
+test('the notice names the recipient by a placeholder the deployer fills, and DECISIONS says the user must review it', () => {
+  const notice = read('persona/group-notice.zh.md');
+  const [head, body] = notice.split('\n---\n');
+  assert.ok(body, 'positive control: the draft has its preamble and its text');
+  assert.match(head, /把 <OpenRouter 和模型服务方 \/ Anthropic> 换成其中一个/);
+  const line = body.split('\n').find((l) => l.startsWith('- **消息发给谁'));
+  assert.ok(line, 'the recipient line exists');
+  assert.match(line, /<OpenRouter 和模型服务方 \/ Anthropic>/);
+  assert.match(line, /用 OpenRouter 时，文字由 OpenRouter 转给运行 Claude 模型的服务方，这个服务方不一定是 Anthropic 本身/);
+  assert.match(line, /直连 Anthropic 时，文字直接发给 Anthropic/);
+  assertGone(notice, ['- **消息发给谁：** 文字由 OpenRouter 转给'], 'the notice');
+  // The two recipients are the ones the console names on a switch.
+  assert.match(read('src/cli/clo.mjs'), /openrouter: 'OpenRouter 及实际模型提供方', anthropic: 'Anthropic'/, 'positive control: the console names both');
+  assert.match(sectionOf(DECISIONS_TEXT(), PROVIDER_USER, PROVIDER_DEV), /\| 告知草稿 \|.*\*\*改过的草稿要用户本人看过\*\*/);
+});
+
+test('.env.example has the Anthropic keys as empty placeholders under the registry names', () => {
+  const template = read('.env.example');
+  for (const key of [KEY_ENV.anthropic, PROBE_KEY_ENV.anthropic]) assert.match(template, new RegExp(`^${key}=$`, 'm'), key);
+  assert.equal(KEY_ENV.anthropic, 'CLO_ANTHROPIC_API_KEY', 'positive control: the name the docs use is the code\'s');
+  assert.equal(PROBE_KEY_ENV.anthropic, 'CLO_TEST_ANTHROPIC_API_KEY');
+  assert.doesNotMatch(template, /^[A-Z_]+=.+$/m, 'no value in the template');
+  assert.match(template, /other OpenAI-compatible endpoints are not\s+(# )?supported yet/);
+});
+
+test('the low findings stay fixed: the probe bound wording, the reload timing, M4 in the design, one prior estimate', () => {
+  // The printed bound is not always enough, and no text says it is. Positive control: a bound where it falls short exists.
+  const printed = (m) => (Math.ceil(m / 100) / 1e4).toFixed(4);
+  const readBack = (t) => Math.floor(Number(t) * 1e6);
+  assert.ok([15700, 31400, 62800].some((m) => readBack(printed(m)) < m), 'positive control: some bounds read back one micro short');
+  const ownBound = buildPlan(ROOT, { runtime: 'own' }).totalWorstMicros;
+  assert.ok(readBack(printed(ownBound)) >= ownBound, 'for the current own plan the printed figure is enough');
+  assertGone(DEPLOYMENT, ['照打印的数填就够'], 'DEPLOYMENT');
+  assert.match(DEPLOYMENT, /但不是每个数都够/);
+  const probe = read('src/tools/q5-probe.mjs');
+  assert.ok(!probe.includes('always enough for the run to start'), 'the q5-probe comment');
+  assert.match(probe, /Not always enough/);
+  // The plugin reload figure says how it was measured.
+  assert.match(README, /离线测试里、机器负载高时量过一次：4 个文件并发时，插件换代/);
+  // M4: the own runtime's shutdown alert for a danger turn, as the gate has it.
+  const m4 = DESIGN_DOC.split('\n').find((l) => l.startsWith('11. **A danger turn cut off at shutdown.**'));
+  assert.ok(m4, 'the design has the item');
+  assert.match(m4, /`crisis_dropped_on_stop` if it is stopped, and `crisis_refused` with reason `aborted` otherwise/);
+  assert.match(read('src/clo-plugin/lib/core/gate.js'), /if \(!ownerAborted && runtime === 'own'\) \{\s*alertMissed\(rec, why\);/, 'positive control: the gate does this on own');
+  // One prior estimate of the system block, wherever it is quoted.
+  const ranges = [];
+  for (const name of ['DECISIONS.md', 'DEPLOYMENT.md', 'docs/cost-options.md', 'docs/own-runtime.md', 'README.md']) {
+    for (const m of read(name).matchAll(/之前估 (4350–\d+)/g)) ranges.push(m[1]);
+  }
+  assert.ok(ranges.length >= 3, 'positive control: the estimate was found in several docs');
+  assert.deepEqual([...new Set(ranges)], ['4350–4400']);
+});
+
 // These cross into files other copies own. They fail until the docs are merged with the code and templates they
 // describe, on purpose: the docs must not ship without them.
 test('merged tree: every key the README tells you to fill in is in the template and is read', async () => {
@@ -721,4 +986,33 @@ test('merged tree: every key the README tells you to fill in is in the template 
 test('merged tree: the template has the example Key limit and .private is ignored', () => {
   assert.equal(JSON.parse(read('config.example.json')).budget.keyDailyLimitUsd, 1.6);
   assert.match(read('.gitignore'), /^\.private\/?$/m);
+});
+
+// The rule rows that record the user's consent and the registry flag that opens live on Anthropic land in one commit.
+// This fails while they disagree: the rows are in DECISIONS.md and CLAUDE.md, the flag is in providers/registry.js.
+test('merged tree: the provider rule rows and the provider_rules flag agree', () => {
+  assert.equal(providerRulesRecorded('openrouter'), true, 'positive control: the reader works');
+  const row = DECISIONS_TEXT().split('\n').find((l) => l.startsWith('| 改写的规则 |'));
+  assert.ok(row && row.includes('LIVE_RULES_RECORDED'), 'the consent rows are recorded');
+  assert.match(read('CLAUDE.md'), /\| 工作区月度上限（Anthropic） \|/, 'and the rule text');
+  assert.equal(providerRulesRecorded('anthropic'), true, 'the consent rows are recorded, so LIVE_RULES_RECORDED.anthropic must be true in the same commit');
+});
+
+// D6 is built in another copy (providers/cost.js and gate.js). Once merged, the D6 row must describe that code: on own,
+// the reported cost settles above or below the computed one, and the alert shows only once gate.js records it.
+test('merged tree: the D6 row matches the own-runtime OpenRouter settlement and whether its alert is recorded', async () => {
+  const { settleMicros } = await import('../../src/clo-plugin/lib/core/providers/cost.js');
+  const price = { inputPerM: 1, outputPerM: 1 };
+  const usage = (costUsd) => ({ input: 1000, output: 1000, cacheRead: 0, cacheWrite: 0, costUsd });
+  const own = (u) => settleMicros(u, price, { kind: 'openrouter', runtime: 'own' });
+  // Tokens at the lock: 2000 micros. Without a reported cost they settle.
+  assert.equal(own(usage(0))?.micros, 2000, 'positive control: the computed figure');
+  assert.equal(own(usage(0.001))?.micros, 1000, 'a reported cost below the computed one settles, not the max');
+  assert.equal(own(usage(0.0021))?.alerts, undefined, 'no alert at or under 1.10x');
+  const above = own(usage(0.003));
+  assert.equal(above?.micros, 3000, 'a reported cost above it settles');
+  assert.deepEqual(above?.alerts, ['cost_above_computed'], 'and raises the alert the row names');
+  const recorded = /COST_ABOVE_COMPUTED_ALERT|cost_above_computed/.test(read('src/clo-plugin/lib/core/gate.js'));
+  const row = DECISIONS_TEXT().split('\n').find((l) => l.startsWith('| OpenRouter 在 own 上怎么结算（规划 D6） |'));
+  assert.equal(row.includes('结算的地方还没有把它记下来'), !recorded, 'the row says the alert is unrecorded exactly while gate.js does not record it');
 });

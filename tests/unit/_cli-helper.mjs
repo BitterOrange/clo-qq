@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { main } from '../../src/cli/clo.mjs';
+import { providerOfConfig } from '../../src/clo-plugin/lib/core/config.js';
+import { ACTIVE_PROVIDER_CONTROL, providerRecord } from '../../src/clo-plugin/lib/core/providers/registry.js';
 import { openStore } from '../../src/clo-plugin/lib/core/store.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -36,14 +38,57 @@ export function enabledConfig() {
 }
 
 // A real `clo model refresh` writes the project's lock file. Tests start from the state before that, so what the
-// project has locked cannot change their result.
+// project has locked cannot change their result. The per-kind locks and the hand-entered price books go too: a test
+// that needs a book writes its own (writePriceBook).
 export function pristineVersionsLock() {
   const lock = JSON.parse(readFileSync(join(ROOT, 'versions.lock.json'), 'utf8').replace(/^\uFEFF/, ''));
   if (lock.models) {
-    const { lock: _lock, changes: _changes, ...rest } = lock.models;
+    const { lock: _lock, changes: _changes, locks: _locks, priceBooks: _books, ...rest } = lock.models;
     lock.models = rest;
   }
   return lock;
+}
+
+// A fixed Anthropic price book for tests, apart from the project's, which can be re-read and changed.
+export const TEST_ANTHROPIC_BOOK = () => ({
+  checkedOn: '2000-01-01',
+  source: 'test fixture',
+  unverified: [],
+  models: {
+    'claude-opus-5-5': { inputPerM: 4, outputPerM: 20, cacheReadPerM: 0.2, cacheWritePerM: 5, cacheWrite1hPerM: 8 },
+    'claude-haiku-5-5': {
+      inputPerM: 0.1, outputPerM: 0.5, cacheReadPerM: 0.01, cacheWritePerM: 0.125, cacheWrite1hPerM: 0.2,
+      long: { aboveTokens: 100000, inputPerM: 0.5, outputPerM: 2.5, cacheReadPerM: 0.05, cacheWritePerM: 0.625, cacheWrite1hPerM: 1 },
+    },
+  },
+});
+
+export function writePriceBook(root, book = TEST_ANTHROPIC_BOOK(), kind = 'anthropic') {
+  const file = join(root, 'versions.lock.json');
+  const lock = readJson(file);
+  lock.models = { ...lock.models, priceBooks: { ...lock.models?.priceBooks, [kind]: book } };
+  writeFileSync(file, `${JSON.stringify(lock, null, 2)}\n`);
+}
+
+// A config with the providers block that `clo provider add anthropic` writes, active on the given entry. Anthropic can
+// be active only on the own runtime, so that entry also sets it.
+export function withProviders(cfg, { active = 'openrouter', anthropicBaseUrl } = {}) {
+  cfg.providers = {
+    openrouter: { kind: 'openrouter', keyEnv: 'CLO_CHAT_API_KEY' },
+    anthropic: { kind: 'anthropic', keyEnv: 'CLO_ANTHROPIC_API_KEY', models: { primary: 'claude-opus-5-5', decision: 'claude-haiku-5-5' } },
+  };
+  if (anthropicBaseUrl) cfg.providers.anthropic.baseUrl = anthropicBaseUrl;
+  cfg.activeProvider = active;
+  cfg.acks = { ...cfg.acks, provider: { name: active, at: '2000-01-01T00:00:00.000Z' } };
+  if (active === 'anthropic') cfg.runtime = 'own';
+  return cfg;
+}
+
+// What `clo provider use` records in clo.db, for a test that starts from an install already switched to the provider
+// its config names. Without it, apply refuses a config whose provider differs from the one the install runs on.
+export function recordProvider(root, cfg = configOf(root)) {
+  mkdirSync(dirname(dbOf(root)), { recursive: true });
+  withDb(root, (store) => store.setControl(ACTIVE_PROVIDER_CONTROL, providerRecord(providerOfConfig(cfg)), 'test'));
 }
 
 // The path has a space on purpose. Scripts and the console must cope.

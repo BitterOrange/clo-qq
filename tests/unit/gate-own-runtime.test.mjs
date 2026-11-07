@@ -14,7 +14,8 @@ import { OWN_IDLE_MS } from '../../src/clo-plugin/lib/core/context.js';
 import { createGate } from '../../src/clo-plugin/lib/core/gate.js';
 import { createLedger } from '../../src/clo-plugin/lib/core/ledger.js';
 import { openStore } from '../../src/clo-plugin/lib/core/store.js';
-import { atEvent, decisionOf, deferred, inbound, loadRealPolicy, makeEffective, MEMBER, MEMBER2, OWNER, ROOT, T0, USAGE } from '../fixtures/inbound.mjs';
+import { anthropicEffective, atEvent, decisionOf, deferred, inbound, loadRealPolicy, makeEffective, MEMBER, MEMBER2, OWNER, ROOT, T0, USAGE } from '../fixtures/inbound.mjs';
+import { hardCapPauseKey } from '../../src/clo-plugin/lib/core/providers/registry.js';
 
 const LINES = JSON.parse(readFileSync(join(ROOT, 'persona', 'policy-lines.zh.json'), 'utf8'));
 const REPLY = '这是一条普通的回复。';
@@ -38,11 +39,13 @@ after(async () => {
 // h.run(turn, signal, h) stands in for a model run: the default hands over REPLY and reports USAGE.
 // runtime is what the process is built as (null: nothing passed, so the default). fileRuntime is what effective.json
 // says, the same unless a test sets it (null: the file names none).
-function stack({ runtime = 'own', fileRuntime = runtime, effective = {}, run } = {}) {
+// kind: 'anthropic' builds the effective file of the own runtime on the Anthropic kind.
+function stack({ runtime = 'own', fileRuntime = runtime, effective = {}, run, kind = 'openrouter' } = {}) {
   const clock = { t: T0 };
   const now = () => clock.t;
   const pinned = runtime === null ? {} : { runtime };
-  const eff = { current: makeEffective({ ...(fileRuntime === null ? {} : { runtime: fileRuntime }), ...effective }) };
+  const build = kind === 'anthropic' ? anthropicEffective : makeEffective;
+  const eff = { current: build({ ...(fileRuntime === null ? {} : { runtime: fileRuntime }), ...effective }) };
   if (fileRuntime === null) delete eff.current.runtime;
   const getEffective = () => eff.current;
   let timerId = 0;
@@ -791,4 +794,74 @@ test('own: a turn in between moves the deadline; the early timer sets itself aga
   assert.deepEqual(expired(h), []);
   h.advance(1);
   assert.deepEqual(expired(h).map((l) => l.count), [1]);
+});
+
+// ---- the provider the bot spends on ----
+
+// Anthropic usage as the adapter maps it: no cost figure, the cache-write split and geo and speed always present.
+const ANTHROPIC_USAGE = Object.freeze({ input: 900, output: 40, cacheRead: 0, cacheWrite: 4000, cacheWrite1h: 0, costUsd: null, model: 'claude-opus-5-5', geo: 'global', speed: 'standard' });
+// 900 input at $4/M, 40 output at $20/M, 4000 five-minute writes at $5/M.
+const ANTHROPIC_MICROS = 24400;
+
+test('own on anthropic: a reply settles computed from its tokens at the locked price; on openrouter from the reported cost (control)', async () => {
+  const a = stack({ kind: 'anthropic' });
+  a.usage = { ...ANTHROPIC_USAGE };
+  const e = await a.ask({ text: '一个问题' });
+  assert.deepEqual(a.postedTo(e), [REPLY]);
+  const [row] = a.reservations(e);
+  assert.deepEqual({ s: row.status, m: row.actual_micros, src: row.source, p: row.provider }, { s: 'settled', m: ANTHROPIC_MICROS, src: 'computed', p: 'anthropic' });
+  // A cost figure on Anthropic usage, which the adapter never sets, is not believed.
+  a.usage = { ...ANTHROPIC_USAGE, costUsd: 0.000001 };
+  const e2 = await a.ask({ text: '另一个问题' });
+  assert.deepEqual([a.reservations(e2)[0].actual_micros, a.reservations(e2)[0].source], [ANTHROPIC_MICROS, 'computed']);
+  assert.equal(a.pausedBy(), null);
+
+  const o = stack();
+  const oe = await o.ask({ text: '一个问题' });
+  const [orow] = o.reservations(oe);
+  assert.deepEqual({ m: orow.actual_micros, src: orow.source }, { m: 10000, src: 'model.usage' });
+});
+
+test('own on anthropic: US-only inference settles at 1.1x and pauses paid work until the owner looks (control: global pauses nothing)', async () => {
+  const h = stack({ kind: 'anthropic' });
+  h.usage = { ...ANTHROPIC_USAGE };
+  await h.ask({ text: '一个问题' });
+  assert.equal(h.pausedBy(), null, 'control');
+  assert.equal(h.alertKinds().includes('price_unexpected'), false);
+  h.usage = { ...ANTHROPIC_USAGE, geo: 'us' };
+  const e = await h.ask({ text: '另一个问题' });
+  assert.deepEqual(h.postedTo(e), [REPLY], 'the reply had already gone out');
+  const [row] = h.reservations(e);
+  assert.deepEqual({ s: row.status, m: row.actual_micros, src: row.source }, { s: 'settled', m: 26840, src: 'computed' });
+  assert.equal(h.pausedBy(), 'anthropic_price_unexpected');
+  const alert = h.store.listAlerts().find((x) => x.kind === 'price_unexpected');
+  assert.deepEqual(alert?.detail, { reason: 'geo_us' });
+  const after = await h.ask({ text: '第三个问题' });
+  assert.equal(h.runs.length, 2, 'no paid turn while paused');
+  assert.deepEqual(h.postedTo(after), [LINES.modelFailed]);
+});
+
+test('own: a 402 pauses under the spending kind\'s own name, anthropic_credits on Anthropic and openrouter_credits on OpenRouter', async () => {
+  for (const [kind, limitSource, want] of [['anthropic', 'anthropic_credits', 'anthropic_credits'], ['anthropic', null, 'anthropic_credits'], ['openrouter', null, 'openrouter_credits']]) {
+    const h = stack({ kind });
+    h.run = async () => ({ started: true, hostError: true, aborted: false, usage: null, info: { status: 402, limitSource } });
+    await h.ask({ text: '问题一' });
+    assert.equal(h.pausedBy(), want, `${kind} ${limitSource}`);
+  }
+});
+
+test('own: the hard-cap pause of the spending kind refuses paid turns as a paid pause; the other kind\'s blocks nothing (control)', async () => {
+  const h = stack({ kind: 'anthropic' });
+  h.store.setControl(hardCapPauseKey('anthropic'), 'hard_cap', 'start');
+  const e = await h.ask({ text: '一个问题' });
+  assert.equal(h.runs.length, 0, 'no model call');
+  assert.equal(h.state(e), 'skipped:paid_paused');
+  assert.deepEqual(h.postedTo(e), [LINES.modelFailed], 'the asker hears the failure line, as with any paid pause');
+  assert.deepEqual(h.reservations(e), [], 'no hold');
+
+  const o = stack();
+  o.store.setControl(hardCapPauseKey('anthropic'), 'hard_cap', 'start');
+  const oe = await o.ask({ text: '一个问题' });
+  assert.equal(o.runs.length, 1);
+  assert.deepEqual(o.postedTo(oe), [REPLY]);
 });

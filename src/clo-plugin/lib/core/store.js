@@ -1,12 +1,12 @@
 // Durable state on node:sqlite. Identifiers at rest are HMAC keys; only `discovery` holds raw IDs.
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { hmacKey, shanghaiDay, shanghaiDayStart } from './ids.js';
 import { sanitizeData } from './log.js';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const NON_TERMINAL_STATES = ['received', 'queued', 'deciding', 'approved', 'dispatching', 'delivering'];
 export const TERMINAL_STATES = ['ignored', 'stale', 'merged', 'paused', 'dry_run', 'skipped', 'completed', 'silent',
   'policy_dropped', 'failed', 'restart_dropped', 'crash_unknown'];
@@ -26,7 +26,14 @@ const DISCOVERY_MAX_ROWS = 1000;
 const SNAPSHOT_KEEP_MS = 14 * DAY;
 const WAL_WAIT_MS = 5000;
 // The one order for paid_paused. A lower rank never overwrites a higher one; an equal rank overwrites.
-const PAUSE_RANK = { usage_unavailable: 4, openrouter_key_limit: 3, openrouter_credits: 3, crash_unsettled: 2, usage_missing: 2 };
+// The provider pauses (registry PROVIDER_PAUSES) sit beside the OpenRouter limits: no settlement pause may replace them.
+// The hard-cap pause has no rank: it is not a paid_paused reason, it lives in a control of its own per kind.
+const PAUSE_RANK = {
+  usage_unavailable: 4,
+  openrouter_key_limit: 3, openrouter_credits: 3,
+  anthropic_credits: 3, anthropic_spend_limit: 3, anthropic_permission: 3, anthropic_price_unexpected: 3,
+  crash_unsettled: 2, usage_missing: 2,
+};
 export const pauseRank = (reason) => PAUSE_RANK[reason] ?? 1;
 
 const SCHEMA = `
@@ -56,7 +63,8 @@ CREATE TABLE reservations(
   status TEXT NOT NULL,
   source TEXT,
   event_key TEXT, model TEXT, run_gen TEXT NOT NULL,
-  created_at INTEGER NOT NULL, settled_at INTEGER);
+  created_at INTEGER NOT NULL, settled_at INTEGER,
+  provider TEXT);
 CREATE INDEX reservations_day ON reservations(local_day, status);
 CREATE TABLE interject_log(
   id TEXT PRIMARY KEY, group_key TEXT NOT NULL, event_key TEXT NOT NULL,
@@ -91,41 +99,119 @@ function enableWal(db) {
   }
 }
 
-function openDb(dbFile) {
-  mkdirSync(dirname(dbFile), { recursive: true });
-  const db = new DatabaseSync(dbFile);
-  db.exec('PRAGMA busy_timeout=5000');
-  enableWal(db);
-  db.exec('PRAGMA synchronous=FULL');
-  db.exec('PRAGMA foreign_keys=ON');
-  const version = () => db.prepare('PRAGMA user_version').get().user_version;
-  const found = version();
-  if (found > SCHEMA_VERSION) {
-    db.close();
-    throw new Error(`clo.db schema ${found} is newer than this build (${SCHEMA_VERSION})`);
+// The v1 copy kept for going back to a build that reads only v1. It is first written to <backup>.<pid>.tmp.
+export const backupFileOf = (dbFile) => `${dbFile}.v1.bak`;
+const MIGRATE_TRIES = 5;
+const sqlString = (v) => `'${String(v).replaceAll("'", "''")}'`;
+
+function createFresh(db, version) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    // Another process may have created it while this one waited for the lock.
+    if (version() === 0) {
+      db.exec(SCHEMA);
+      db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('hmac_salt', randomBytes(32).toString('hex'));
+      db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema', String(SCHEMA_VERSION));
+      db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
   }
-  if (found < SCHEMA_VERSION) {
+}
+
+// The backup outlives `clo mode live` and `clo targets clear`, which empty `discovery` in clo.db only, so the copy
+// never holds the raw IDs: a capture lasts minutes, and a build going back to v1 can capture again. secure_delete and
+// VACUUM leave no page of the deleted rows in the file. It is rewritten in rollback-journal mode, so closing it leaves
+// no -wal or -shm beside it.
+function scrubBackup(file) {
+  const b = new DatabaseSync(file);
+  try {
+    b.exec('PRAGMA journal_mode=DELETE');
+    b.exec('PRAGMA secure_delete=ON');
+    b.exec('DELETE FROM discovery');
+    b.prepare('DELETE FROM control WHERE key=?').run('discovery_until');
+    b.exec('VACUUM');
+  } finally {
+    b.close();
+  }
+}
+
+// Schema 1 to 2: reservations.provider, the provider kind of a row (NULL is the implicit OpenRouter entry).
+// The db runs in WAL mode, so committed rows can sit in -wal and a copy of the main file alone would miss them.
+// VACUUM INTO writes a consistent snapshot with them, but not inside a transaction, so the step takes the snapshot
+// first and then, under the write lock, checks that no other connection committed since (data_version). The
+// backup is put in place under that lock, so a db at v2 always has the copy of the v1 it came from.
+function migrateV1(db, dbFile, version, at, onSnapshot) {
+  const bak = backupFileOf(dbFile);
+  const tmp = `${bak}.${process.pid}.tmp`;
+  const dataVersion = () => db.prepare('PRAGMA data_version').get().data_version;
+  for (let attempt = 0; attempt < MIGRATE_TRIES; attempt += 1) {
+    const dv = dataVersion();
+    rmSync(tmp, { force: true });
+    db.exec(`VACUUM INTO ${sqlString(tmp)}`);
+    try {
+      scrubBackup(tmp);
+    } catch (err) {
+      rmSync(tmp, { force: true });
+      throw err;
+    }
+    onSnapshot?.(attempt);
     db.exec('BEGIN IMMEDIATE');
     try {
-      // Another process may have created it while this one waited for the lock.
-      if (version() === 0) {
-        db.exec(SCHEMA);
-        db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('hmac_salt', randomBytes(32).toString('hex'));
-        db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('schema', String(SCHEMA_VERSION));
-        db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
+      if (version() !== 1) {
+        // Another process migrated, and made the backup, while this one took its snapshot.
+        db.exec('ROLLBACK');
+        rmSync(tmp, { force: true });
+        return;
       }
+      if (dataVersion() !== dv) {
+        db.exec('ROLLBACK');
+        rmSync(tmp, { force: true });
+        continue;
+      }
+      renameSync(tmp, bak);
+      db.exec('ALTER TABLE reservations ADD COLUMN provider TEXT');
+      db.prepare("UPDATE meta SET value=? WHERE key='schema'").run('2');
+      db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('migrated_v2_at', String(at));
+      db.exec('PRAGMA user_version=2');
       db.exec('COMMIT');
+      return;
     } catch (err) {
-      db.exec('ROLLBACK');
-      db.close();
+      if (db.isTransaction) db.exec('ROLLBACK');
+      rmSync(tmp, { force: true });
       throw err;
     }
   }
-  return db;
+  throw new Error(`clo.db migration to schema 2 kept meeting other writers (${MIGRATE_TRIES} tries); it stays at schema 1`);
 }
 
-export function openStore(dbFile, { runGen = randomUUID(), now = Date.now } = {}) {
-  const db = openDb(dbFile);
+function openDb(dbFile, { now = Date.now, onMigrationSnapshot } = {}) {
+  mkdirSync(dirname(dbFile), { recursive: true });
+  const db = new DatabaseSync(dbFile);
+  try {
+    db.exec('PRAGMA busy_timeout=5000');
+    enableWal(db);
+    db.exec('PRAGMA synchronous=FULL');
+    db.exec('PRAGMA foreign_keys=ON');
+    const version = () => db.prepare('PRAGMA user_version').get().user_version;
+    for (;;) {
+      const found = version();
+      if (found > SCHEMA_VERSION) throw new Error(`clo.db schema ${found} is newer than this build (${SCHEMA_VERSION})`);
+      if (found === SCHEMA_VERSION) return db;
+      if (found === 0) createFresh(db, version);
+      else if (found === 1) migrateV1(db, dbFile, version, now(), onMigrationSnapshot);
+      else throw new Error(`clo.db schema ${found} has no migration in this build`);
+    }
+  } catch (err) {
+    db.close();
+    throw err;
+  }
+}
+
+export function openStore(dbFile, { runGen = randomUUID(), now = Date.now, onMigrationSnapshot } = {}) {
+  const db = openDb(dbFile, { now, onMigrationSnapshot });
   const statements = new Map();
   const q = (sql) => {
     let s = statements.get(sql);
@@ -357,6 +443,42 @@ export function openStore(dbFile, { runGen = randomUUID(), now = Date.now } = {}
     return out;
   }
 
+  // The v1 copy lives for retention.eventDays after the migration; a scratch copy a killed migration left, one hour.
+  function sweepBackups(at, retention) {
+    const out = { backup: 0, backupTmp: 0 };
+    const migratedAt = Number(store.getMeta('migrated_v2_at'));
+    const bak = backupFileOf(dbFile);
+    if (Number.isFinite(migratedAt) && migratedAt > 0 && at - migratedAt > retention.eventDays * DAY) {
+      try {
+        statSync(bak);
+        rmSync(bak, { force: true });
+        out.backup = 1;
+      } catch {
+        // Already gone.
+      }
+    }
+    const prefix = `${basename(bak)}.`;
+    let names = [];
+    try {
+      names = readdirSync(dirname(bak));
+    } catch {
+      return out;
+    }
+    for (const name of names) {
+      if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue;
+      const file = join(dirname(bak), name);
+      try {
+        if (at - statSync(file).mtimeMs > HOUR) {
+          rmSync(file, { force: true });
+          out.backupTmp += 1;
+        }
+      } catch {
+        // Gone, or held by a migration that is running now.
+      }
+    }
+    return out;
+  }
+
   const store = {
     db,
     q,
@@ -495,6 +617,9 @@ export function openStore(dbFile, { runGen = randomUUID(), now = Date.now } = {}
           groups: q("SELECT key FROM control WHERE key LIKE 'group_paused:%'").all().map((r) => r.key.slice('group_paused:'.length)),
         },
         paidPaused: getControl('paid_paused'),
+        // The hard-cap pause of each kind that has one: {kind: code}. Which kind is active is the caller's to know.
+        hardCapPaused: Object.fromEntries(q("SELECT key, value FROM control WHERE key LIKE 'hard_cap_paused:%' ORDER BY key").all()
+          .map((r) => [r.key.slice('hard_cap_paused:'.length), r.value])),
         decisionPausedAt: controlUpdatedAt('decision_paused'),
         terminalClose: getControl('terminal_close'),
         connected: getControl('connected') === 'true',
@@ -541,7 +666,7 @@ export function openStore(dbFile, { runGen = randomUUID(), now = Date.now } = {}
     },
 
     janitor(at, retention) {
-      return tx(() => {
+      const removed = tx(() => {
         const removed = {};
         const count = (name, r) => { removed[name] = Number(r.changes); };
         const terminal = [...TERMINAL];
@@ -556,6 +681,7 @@ export function openStore(dbFile, { runGen = randomUUID(), now = Date.now } = {}
         count('snapshots', q('DELETE FROM key_snapshots WHERE taken_at<?').run(at - SNAPSHOT_KEEP_MS));
         return removed;
       });
+      return Object.assign(removed, sweepBackups(at, retention));
     },
   };
   return store;

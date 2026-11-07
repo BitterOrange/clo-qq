@@ -2,16 +2,17 @@
 // Nothing here can reach QQ or OpenRouter; other Node processes must survive.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { makeContext } from '../../src/cli/common.mjs';
-import { botEntry, forbiddenOwnArgs, gatewayEnv, GATEWAY_NODE_FLAGS, ownArgs, ownEnv, processInfo, readPidRecord, startLockFile } from '../../src/cli/lifecycle.mjs';
+import { botEntry, ensureGatewayEnvClean, ensureOwnEnvClean, forbiddenOwnArgs, gatewayEnv, GATEWAY_NODE_FLAGS, modelKeyNames, ownArgs, ownEnv, processInfo, readPidRecord, startLockFile } from '../../src/cli/lifecycle.mjs';
 import { CONSUMER_LEASE_KEY, STOP_REQUEST_KEY } from '../../src/clo-plugin/lib/channels/qq/lease.js';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
-import { clo, configOf, dbOf, effectiveOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, NODE, readJson, testEnv, withDb } from './_cli-helper.mjs';
+import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
+import { clo, configOf, dbOf, effectiveOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, NODE, readJson, testEnv, withDb, withProviders, writePriceBook } from './_cli-helper.mjs';
 
 const roots = [];
 const cleanups = [];
@@ -391,4 +392,105 @@ test('clo stop drops the consumer lease of the bot it stopped, and leaves a leas
   assert.equal(alive(second.pid), false);
   withDb(s.root, (store) => assert.equal(store.getControl(CONSUMER_LEASE_KEY), null, 'the stopped bot\'s lease is gone'));
   assert.equal(alive(other.pid), true);
+});
+
+// --- The provider kind: exactly one model Key reaches the bot, the active kind's, and the Gateway never gets another. ---
+
+const ANTHROPIC_PARENT = { ANTHROPIC_API_KEY: 'PARENT-KEY-MUST-NOT-PASS', CLO_ANTHROPIC_API_KEY: 'PARENT-KEY-MUST-NOT-PASS', CLO_TEST_ANTHROPIC_API_KEY: 'PARENT-KEY-MUST-NOT-PASS', CLO_PROVIDER_API_KEY: 'PARENT-KEY-MUST-NOT-PASS' };
+
+test('ownEnv by kind: anthropic gets CLO_PROVIDER_API_KEY and no OpenRouter Key; openrouter the reverse; an unknown kind gets none', () => {
+  const r = makeRoot('ownenv-kind', null);
+  roots.push(r);
+  const ctx = makeContext({ env: testEnv(r.root), stdout: { write() {} }, stderr: { write() {} } });
+  const parent = { ...ctx.env, ...ANTHROPIC_PARENT, OPENROUTER_API_KEY: 'PARENT' };
+  const secrets = { CLO_CHAT_API_KEY: FAKE_KEY, CLO_ANTHROPIC_API_KEY: FAKE_ANTHROPIC_KEY, CLO_QQ_APP_ID: 'APP', CLO_QQ_APP_SECRET: 'SECRET' };
+  const an = ownEnv(ctx.paths, parent, { secrets, kind: 'anthropic' });
+  assert.equal(an.CLO_PROVIDER_API_KEY, FAKE_ANTHROPIC_KEY);
+  assert.deepEqual(modelKeyNames(an), ['CLO_PROVIDER_API_KEY'], 'exactly one model Key');
+  for (const k of ['OPENROUTER_API_KEY', 'CLO_CHAT_API_KEY', 'CLO_ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY', 'CLO_TEST_ANTHROPIC_API_KEY']) assert.equal(an[k], undefined, k);
+  const or = ownEnv(ctx.paths, parent, { secrets, kind: 'openrouter' });
+  assert.equal(or.OPENROUTER_API_KEY, FAKE_KEY, 'positive control: the OpenRouter Key arrives on its kind');
+  assert.deepEqual(modelKeyNames(or), ['OPENROUTER_API_KEY']);
+  assert.deepEqual(ownEnv(ctx.paths, parent, { secrets }), or, 'the default kind is openrouter, as before');
+  assert.deepEqual(modelKeyNames(ownEnv(ctx.paths, parent, { secrets, kind: 'nobody' })), [], 'an unknown kind gets no Key');
+  assert.deepEqual(modelKeyNames(ownEnv(ctx.paths, parent, { secrets: { CLO_CHAT_API_KEY: FAKE_KEY }, kind: 'anthropic' })), [], 'nothing stands in for a missing Anthropic Key');
+  // The Gateway: even handed the Anthropic Key as a secret, it gets no Anthropic name.
+  const host = gatewayEnv(ctx.paths, parent, { secrets, token: 'T' });
+  assert.equal(host.OPENROUTER_API_KEY, FAKE_KEY, 'positive control: the Gateway still gets its Key');
+  for (const k of Object.keys(ANTHROPIC_PARENT)) assert.equal(host[k], undefined, k);
+  assert.ok(!Object.values(host).includes(FAKE_ANTHROPIC_KEY), 'the Anthropic Key value is nowhere in the Gateway env');
+  assert.deepEqual(ensureGatewayEnvClean({ CLO_PROVIDER_API_KEY: 'x', OPENROUTER_API_KEY: 'x' }), ['CLO_PROVIDER_API_KEY'], 'the Gateway may not hold the bot-only name');
+  assert.deepEqual(ensureOwnEnvClean({ CLO_PROVIDER_API_KEY: 'x', OPENROUTER_API_KEY: 'x' }), [], 'the bot may');
+  assert.deepEqual(ensureOwnEnvClean(ANTHROPIC_PARENT).sort(), ['ANTHROPIC_API_KEY', 'CLO_ANTHROPIC_API_KEY', 'CLO_TEST_ANTHROPIC_API_KEY'], 'no child may hold the .env names or the SDK name');
+});
+
+async function anthropicStack(label) {
+  const s = await stack(label);
+  appendFileSync(join(s.root, '.env'), `CLO_ANTHROPIC_API_KEY=${FAKE_ANTHROPIC_KEY}\n`);
+  writePriceBook(s.root);
+  writeFileSync(join(s.root, 'config.json'), JSON.stringify(withProviders(configOf(s.root), { active: 'openrouter', anthropicBaseUrl: 'http://127.0.0.1:9' }), null, 2));
+  assert.equal((await s.run(['model', 'lock', '--provider', 'anthropic', '--confirm-price'])).code, 0);
+  const used = await s.run(['provider', 'use', 'anthropic', '--confirm', '--qq-platform-notified']);
+  assert.equal(used.code, 0, `${used.out}${used.err}`);
+  return { ...s, env: { ...s.env, ...ANTHROPIC_PARENT } };
+}
+
+test('start on anthropic: the bot gets the Anthropic Key as CLO_PROVIDER_API_KEY only, from .env and not the parent', { timeout: 120000 }, async () => {
+  const s = await anthropicStack('start-anthropic');
+  const started = await clo(s.root, ['start'], { env: s.env });
+  assert.equal(started.code, 0, `${started.out}${started.err}`);
+  for (const raw of [FAKE_KEY, FAKE_SECRET, FAKE_ANTHROPIC_KEY]) assert.ok(!`${started.out}${started.err}`.includes(raw), 'printed a Key');
+  const info = await fakeBot(s.root);
+  assert.equal(info.env.CLO_PROVIDER_API_KEY, FAKE_ANTHROPIC_KEY, 'from the temp .env');
+  assert.deepEqual(modelKeyNames(info.env), ['CLO_PROVIDER_API_KEY'], 'exactly one model Key');
+  for (const k of ['OPENROUTER_API_KEY', 'CLO_CHAT_API_KEY', 'CLO_ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY', 'CLO_TEST_ANTHROPIC_API_KEY']) assert.equal(info.env[k], undefined, k);
+  assert.equal(info.env.CLO_QQ_APP_SECRET, FAKE_SECRET, 'positive control: the rest of .env still arrives');
+  assert.ok(!processInfo(info.pid).commandLine.includes(FAKE_ANTHROPIC_KEY), 'a Key on the command line');
+  assert.equal(effectiveOf(s.root).apiProvider.kind, 'anthropic');
+  assert.equal((await clo(s.root, ['stop'], { env: s.env })).code, 0);
+});
+
+test('start in live re-checks the hard cap against the Key in .env: an unbound or changed Key is refused, the bound one passes the start check (control)', { timeout: 60000 }, async () => {
+  const s = await anthropicStack('start-hardcap');
+  const run = (argv) => clo(s.root, argv, { env: s.env });
+  const toLive = () => writeFileSync(join(s.root, 'config.json'), JSON.stringify({ ...configOf(s.root), mode: 'live' }, null, 2));
+  const toDry = () => writeFileSync(join(s.root, 'config.json'), JSON.stringify({ ...configOf(s.root), mode: 'dry-run' }, null, 2));
+
+  toLive();
+  const unbound = await run(['start']);
+  assert.equal(unbound.code, 1);
+  assert.match(unbound.err, /硬上限声明不完整，或绑定的不是 \.env 里现在这个 CLO_ANTHROPIC_API_KEY/);
+  assert.equal(existsSync(pidFileOf(s.root)), false, 'nothing was spawned');
+
+  toDry();
+  assert.equal((await run(['ack', 'hard-cap', 'anthropic', '--kind', 'workspace_monthly', '--usd', '20', '--prepaid-no-reload'])).code, 0);
+  toLive();
+  const bound = await run(['start']);
+  assert.equal(bound.code, 1);
+  assert.match(bound.err, /config\.json 写着 live，但当前不是 live/, 'control: past the start check, refused where a hand edit always was');
+  assert.doesNotMatch(bound.err, /项目规则还没有记录/, 'the rules are recorded');
+  assert.doesNotMatch(bound.err, /硬上限/);
+
+  // A weaker ack bound to the right Key is refused as hard_cap too.
+  const cfg = configOf(s.root);
+  writeFileSync(join(s.root, 'config.json'), JSON.stringify({ ...cfg, acks: { ...cfg.acks, hardCap: { anthropic: { ...cfg.acks.hardCap.anthropic, prepaidNoReload: false } } } }, null, 2));
+  assert.match((await run(['start'])).err, /硬上限声明不完整/);
+  writeFileSync(join(s.root, 'config.json'), JSON.stringify(cfg, null, 2));
+
+  const envFile = join(s.root, '.env');
+  writeFileSync(envFile, readFileSync(envFile, 'utf8').replace(FAKE_ANTHROPIC_KEY, 'sk-ant-FAKE-OTHER-KEY-FOR-LOCAL-MOCK-ONLY'));
+  const changed = await run(['start']);
+  assert.equal(changed.code, 1);
+  assert.match(changed.err, /绑定的不是 \.env 里现在这个/);
+  for (const r of [unbound, bound, changed]) assert.doesNotMatch(`${r.out}${r.err}`, /sk-(ant|or-v1)-/);
+  assert.equal(existsSync(join(s.root, 'fake-bot.json')), false, 'no bot started in live on any of these');
+
+  // OpenRouter in live: the start check passes, and the hand-edited live is refused by apply as before.
+  toDry();
+  writeFileSync(envFile, readFileSync(envFile, 'utf8').replace('sk-ant-FAKE-OTHER-KEY-FOR-LOCAL-MOCK-ONLY', FAKE_ANTHROPIC_KEY));
+  assert.equal((await run(['provider', 'use', 'openrouter', '--confirm', '--qq-platform-notified'])).code, 0);
+  toLive();
+  const orLive = await run(['start']);
+  assert.equal(orLive.code, 1);
+  assert.match(orLive.err, /config\.json 写着 live，但当前不是 live/, 'past the start check, refused where a hand edit always was');
 });

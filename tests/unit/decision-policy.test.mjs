@@ -5,7 +5,10 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { buildRequest, createDecider, parseAnswer, routeDecision, shapeCurrentText } from '../../src/clo-plugin/lib/core/decision.js';
 import { classify } from '../../src/clo-plugin/lib/core/gate.js';
-import { decisionOf, GROUP_A, groupEntry, inbound, loadRealPolicy, makeEffective, makeHarness, MEMBER, MEMBER2, ROOT } from '../fixtures/inbound.mjs';
+import { adapterFor } from '../../src/clo-plugin/lib/core/providers/index.js';
+import { createChatClient } from '../../src/clo-plugin/lib/core/providers/modelChat.js';
+import { anthropicEffective, decisionOf, GROUP_A, groupEntry, inbound, loadRealPolicy, makeEffective, makeHarness, MEMBER, MEMBER2, ROOT } from '../fixtures/inbound.mjs';
+import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
 
 const PROMPT = join(ROOT, 'persona', 'decision-prompt.zh.md');
 const answer = (over = {}) => JSON.stringify({ action: 'reply', skip_class: 'none', crisis: false, need_search: false, ...over });
@@ -876,4 +879,257 @@ test('decision input uses pseudonyms and omits the current message from lines', 
   assert.deepEqual(req.current, { sender: 'U2', text: '第二个人说的话' });
   assert.equal(JSON.stringify(req).includes(MEMBER), false);
   await h.close();
+});
+
+// ---- both adapters ----
+// The decider over the real transport with each provider's adapter. Anthropic reports no cost, so a decision there
+// settles from its tokens at the locked Haiku price ('computed'). The Anthropic wire shapes are the contract's.
+
+const SECRET = 'PROVIDER-SECRET-TEXT';
+const haikuUsage = (over = {}) => ({
+  input_tokens: 1000, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+  cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 }, inference_geo: 'global', speed: 'standard', ...over,
+});
+const haikuMessage = (text, { stop = 'end_turn', usage = haikuUsage(), model = 'claude-haiku-5-5' } = {}) => ({
+  id: 'msg_fake', type: 'message', role: 'assistant', model, content: [{ type: 'text', text }], stop_reason: stop,
+  stop_details: { explanation: SECRET }, usage,
+});
+// 1000 input at $0.10/M and 20 output at $0.50/M.
+const HAIKU_MICROS = 110;
+
+const DECISION_WIRE = {
+  openrouter: { ok: (text) => jsonResponse(completion(text)), path: '/chat/completions', micros: 400, source: undefined },
+  anthropic: { ok: (text) => jsonResponse(haikuMessage(text)), path: '/v1/messages', micros: HAIKU_MICROS, source: 'computed' },
+};
+
+function kindDecider(kind, { respond, effective = kind === 'anthropic' ? anthropicEffective() : makeEffective() } = {}) {
+  const calls = [];
+  const logs = [];
+  const log = (event, data) => logs.push({ event, ...data });
+  const key = kind === 'anthropic' ? FAKE_ANTHROPIC_KEY : 'FAKE-KEY';
+  const client = createChatClient({
+    adapter: adapterFor(kind),
+    fetch: async (url, init) => {
+      calls.push({ url, init, body: JSON.parse(init.body) });
+      return (respond ?? (() => DECISION_WIRE[kind].ok(answer())))(url, init);
+    },
+    getKey: () => key,
+    getBaseUrl: () => (kind === 'anthropic' ? effective.apiProvider.baseUrl : effective.openrouter.baseUrl),
+    log,
+  });
+  const decide = createDecider({ client, getKey: () => key, getEffective: () => effective, promptFile: PROMPT, log });
+  return { decide, calls, logs, key };
+}
+
+for (const kind of ['openrouter', 'anthropic']) {
+  test(`${kind}: the decision goes to the kind's path; a clean answer settles from the kind's cost rule`, async () => {
+    const d = kindDecider(kind);
+    const r = await ask(d);
+    assert.equal(d.calls.length, 1);
+    assert.ok(d.calls[0].url.endsWith(DECISION_WIRE[kind].path));
+    assert.equal(r.invalid, null);
+    assert.equal(r.action, 'reply');
+    assert.equal(r.actualMicros, DECISION_WIRE[kind].micros);
+    assert.equal(r.costSource, DECISION_WIRE[kind].source);
+    if (kind === 'openrouter') {
+      // Exactly as before the provider layer: no new field on this path.
+      assert.deepEqual(r, { action: 'reply', skipClass: 'none', crisis: false, invalid: null, paid: true, limitSource: null, model: 'anthropic/fake-haiku', actualMicros: 400, httpStatus: 200 });
+      assert.deepEqual(d.calls[0].body, buildRequest(makeEffective(), readFileSync(PROMPT, 'utf8'), { trigger: 'ordinary', lines: [], current: { sender: 'U1', text: '问题' } }));
+    } else {
+      assert.deepEqual(r.costFlags, []);
+    }
+    for (const s of [JSON.stringify(r), JSON.stringify(d.logs)]) {
+      assert.equal(s.includes(SECRET), false);
+      assert.equal(s.includes(d.key), false);
+    }
+  });
+
+  test(`${kind}: no Key sends nothing and charges nothing (control: a Key sends one)`, async () => {
+    const effective = kind === 'anthropic' ? anthropicEffective() : makeEffective();
+    let fetched = 0;
+    const client = createChatClient({ adapter: adapterFor(kind), fetch: async () => { fetched += 1; return DECISION_WIRE[kind].ok(answer()); }, getKey: () => null, getBaseUrl: () => 'http://127.0.0.1:9' });
+    const none = createDecider({ client, getKey: () => null, getEffective: () => effective, promptFile: PROMPT });
+    const r = await none({ trigger: 'ordinary', lines: [], current: { sender: 'U1', text: 'x' } });
+    assert.deepEqual({ i: r.invalid, p: r.paid, f: fetched }, { i: 'unavailable', p: false, f: 0 });
+    const d = kindDecider(kind);
+    await ask(d);
+    assert.equal(d.calls.length, 1);
+  });
+}
+
+test('anthropic: the decision body is thinking disabled at effort low with the answer schema, and nothing else', async () => {
+  const d = kindDecider('anthropic');
+  await ask(d, { lines: [{ sender: 'U2', text: '上一句' }] });
+  const { init, body } = d.calls[0];
+  assert.deepEqual(Object.keys(init.headers).sort(), ['anthropic-version', 'content-type', 'x-api-key']);
+  assert.deepEqual(Object.keys(body).sort(), ['max_tokens', 'messages', 'model', 'output_config', 'system', 'thinking']);
+  assert.equal(body.model, 'claude-haiku-5-5');
+  assert.equal(body.max_tokens, 200);
+  assert.deepEqual(body.thinking, { type: 'disabled' });
+  assert.equal(body.output_config.effort, 'low');
+  assert.equal(body.output_config.format.type, 'json_schema');
+  assert.deepEqual(body.output_config.format.schema, buildRequest(makeEffective(), 'x', { trigger: 'ordinary', lines: [], current: { sender: 'U1', text: 'x' } }).response_format.json_schema.schema);
+  assert.equal(body.system, readFileSync(PROMPT, 'utf8'), 'the prompt is sent unchanged');
+  assert.deepEqual(JSON.parse(body.messages[0].content), { trigger: 'ordinary', lines: [{ sender: 'U2', text: '上一句' }], current: { sender: 'U1', text: '问题' } });
+  assert.equal(init.body.includes('stream'), false);
+});
+
+test('anthropic: a decision cut at max_tokens with broken JSON is a skip settled from its tokens, never left unsettled', async () => {
+  const d = kindDecider('anthropic', { respond: () => jsonResponse(haikuMessage('{"action":"re', { stop: 'max_tokens' })) });
+  const r = await ask(d);
+  assert.deepEqual({ i: r.invalid, a: r.action, m: r.actualMicros, s: r.costSource }, { i: 'length', a: 'skip', m: HAIKU_MICROS, s: 'computed' });
+  const broken = kindDecider('anthropic', { respond: () => jsonResponse(haikuMessage('不是 JSON')) });
+  const b = await ask(broken);
+  assert.deepEqual({ i: b.invalid, m: b.actualMicros, s: b.costSource }, { i: 'json', m: HAIKU_MICROS, s: 'computed' });
+});
+
+test('anthropic: unreadable usage prices nothing, so the hold stays counted; US-only inference is priced 1.1x and flagged', async () => {
+  for (const usage of [undefined, haikuUsage({ input_tokens: 'x' }), haikuUsage({ output_tokens: null })]) {
+    const body = haikuMessage(answer());
+    if (usage === undefined) delete body.usage;
+    else body.usage = usage;
+    const r = await ask(kindDecider('anthropic', { respond: () => jsonResponse(body) }));
+    assert.equal(r.actualMicros, null, 'never free');
+    assert.equal(r.costSource, 'computed');
+  }
+  const us = await ask(kindDecider('anthropic', { respond: () => jsonResponse(haikuMessage(answer(), { usage: haikuUsage({ inference_geo: 'us' }) })) }));
+  assert.equal(us.actualMicros, 121);
+  assert.deepEqual(us.costFlags, ['geo_us']);
+  const plain = await ask(kindDecider('anthropic'));
+  assert.deepEqual({ m: plain.actualMicros, f: plain.costFlags }, { m: HAIKU_MICROS, f: [] }, 'positive control');
+});
+
+test('anthropic: errors are skips with their limit source, a 403 included; provider text and the Key go nowhere', async () => {
+  const err = (type, message = SECRET) => ({ type: 'error', error: { type, message }, request_id: `req_${SECRET}` });
+  const table = [
+    [402, err('billing_error'), 'anthropic_credits'],
+    [403, err('permission_error'), 'anthropic_permission'],
+    [429, err('rate_limit_error'), null],
+    [529, err('overloaded_error'), null],
+    [500, err('api_error'), null],
+  ];
+  for (const [status, body, limitSource] of table) {
+    const d = kindDecider('anthropic', { respond: () => jsonResponse(body, status) });
+    const r = await ask(d);
+    assert.deepEqual({ i: r.invalid, a: r.action, h: r.httpStatus, l: r.limitSource }, { i: 'http', a: 'skip', h: status, l: limitSource }, String(status));
+    assert.equal(d.calls.length, 1, `${status}: never retried`);
+    for (const s of [JSON.stringify(r), JSON.stringify(d.logs)]) {
+      assert.equal(s.includes(SECRET), false);
+      assert.equal(s.includes(d.key), false);
+    }
+  }
+});
+
+test('anthropic: a decision effort other than none is refused before anything is sent, and charges nothing (on openrouter a body that will not build still throws)', async () => {
+  const effective = anthropicEffective();
+  effective.models.decision.effort = 'low';
+  const d = kindDecider('anthropic', { effective });
+  const r = await ask(d);
+  assert.deepEqual({ i: r.invalid, a: r.action, p: r.paid, m: r.actualMicros }, { i: 'http', a: 'skip', p: false, m: null });
+  assert.equal(d.calls.length, 0);
+  const good = kindDecider('anthropic');
+  const ok = await ask(good);
+  assert.equal(good.calls.length, 1, 'positive control: effort none sends');
+  assert.equal(ok.paid, true);
+  // A cost-reporting kind is as before: a body its adapter will not build throws to the gate, which keeps the hold.
+  let posted = 0;
+  const throwing = (kind) => createDecider({
+    client: { adapter: { kind, decisionBody() { throw new Error('no body'); } }, post: async () => { posted += 1; return { kind: 'not_sent', reason: 'unavailable' }; } },
+    getKey: () => 'FAKE-KEY',
+    getEffective: () => (kind === 'anthropic' ? anthropicEffective() : makeEffective()),
+    promptFile: PROMPT,
+  });
+  await assert.rejects(ask({ decide: throwing('openrouter') }), /no body/);
+  assert.equal((await ask({ decide: throwing('anthropic') })).paid, false);
+  assert.equal(posted, 0);
+});
+
+test('a request that never left: released on a kind that reports no cost, unsettled as before on openrouter', async () => {
+  const refused = () => {
+    const e = new TypeError('fetch failed');
+    e.cause = Object.assign(new Error('connect'), { code: 'ECONNREFUSED', syscall: 'connect' });
+    throw e;
+  };
+  const a = kindDecider('anthropic', { respond: refused });
+  const ra = await ask(a);
+  assert.deepEqual({ i: ra.invalid, p: ra.paid, m: ra.actualMicros, c: a.calls.length }, { i: 'http', p: false, m: null, c: 1 });
+  const o = kindDecider('openrouter', { respond: refused });
+  const ro = await ask(o);
+  assert.deepEqual({ i: ro.invalid, p: ro.paid, m: ro.actualMicros, c: o.calls.length }, { i: 'http', p: true, m: null, c: 1 }, 'openrouter: its Key reads settle it');
+  // A request that may have reached the provider stays paid on every kind.
+  const reset = () => {
+    const e = new TypeError('fetch failed');
+    e.cause = Object.assign(new Error('reset'), { code: 'ECONNRESET' });
+    throw e;
+  };
+  const n = await ask(kindDecider('anthropic', { respond: reset }));
+  assert.deepEqual({ i: n.invalid, p: n.paid }, { i: 'http', p: true }, 'control: not a definite not-sent');
+});
+
+test('through the own gate on anthropic: a decision refused at connect is released, so clearing a pause does not re-pause on it', async () => {
+  const refused = () => {
+    const e = new TypeError('fetch failed');
+    e.cause = Object.assign(new Error('connect'), { code: 'ECONNREFUSED', syscall: 'connect' });
+    throw e;
+  };
+  const { h, box } = anthropicGate(refused);
+  const a = await h.sendAndFlush(h.event({ text: '第一条普通消息' }));
+  assert.equal(h.state(a), 'skipped:decision_invalid');
+  const row = h.reservations(a).find((r) => r.category === 'decision');
+  assert.deepEqual({ s: row.status, p: row.provider }, { s: 'released', p: 'anthropic' });
+  h.ledger.pausePaid('anthropic_credits');
+  assert.equal(h.ledger.clearOwnerPause().cleared, true);
+  assert.equal(h.store.getControl('paid_paused'), null, 'nothing unsettled to pause on');
+
+  // Positive control: a decision that may have been sent and has no usage stays unsettled, and clearing re-pauses.
+  h.advance(9 * 60000);
+  box.respond = () => jsonResponse({ type: 'error', error: { type: 'api_error', message: SECRET } }, 500);
+  const b = await h.sendAndFlush(h.event({ text: '第二条普通消息' }));
+  assert.equal(h.reservations(b).find((r) => r.category === 'decision').status, 'unsettled');
+  h.ledger.pausePaid('anthropic_credits');
+  h.ledger.clearOwnerPause();
+  assert.equal(h.store.getControl('paid_paused'), 'usage_missing');
+  await h.close();
+});
+
+// The real decider and the real ledger through the own runtime's gate.
+function anthropicGate(respond) {
+  const eff = anthropicEffective();
+  const box = { respond };
+  const client = createChatClient({ adapter: adapterFor('anthropic'), fetch: async () => box.respond(), getKey: () => FAKE_ANTHROPIC_KEY, getBaseUrl: () => eff.apiProvider.baseUrl });
+  const real = createDecider({ client, getKey: () => FAKE_ANTHROPIC_KEY, getEffective: () => eff, promptFile: PROMPT });
+  const h = makeHarness({ effective: eff, decide: real, runtime: 'own' });
+  return { h, box };
+}
+
+test('through the own gate on anthropic: a decision settles computed from its tokens, and US-only inference pauses paid work', async () => {
+  const { h, box } = anthropicGate(() => jsonResponse(haikuMessage(answer({ action: 'skip' }))));
+  const a = await h.sendAndFlush(h.event({ text: '第一条普通消息' }));
+  assert.equal(h.state(a), 'skipped:decision_skip');
+  const row = h.reservations(a).find((r) => r.category === 'decision');
+  assert.deepEqual({ s: row.status, m: row.actual_micros, src: row.source, p: row.provider }, { s: 'settled', m: HAIKU_MICROS, src: 'computed', p: 'anthropic' });
+  assert.equal(h.store.getControl('paid_paused'), null, 'control: a standard-priced decision pauses nothing');
+
+  h.advance(9 * 60000);
+  box.respond = () => jsonResponse(haikuMessage(answer({ action: 'skip' }), { usage: haikuUsage({ inference_geo: 'us' }) }));
+  const b = await h.sendAndFlush(h.event({ text: '第二条普通消息' }));
+  const usRow = h.reservations(b).find((r) => r.category === 'decision');
+  assert.deepEqual({ s: usRow.status, m: usRow.actual_micros, src: usRow.source }, { s: 'settled', m: 121, src: 'computed' }, 'still settled, at the dearer figure');
+  assert.equal(h.store.getControl('paid_paused'), 'anthropic_price_unexpected');
+  assert.ok(h.store.listAlerts().some((x) => x.kind === 'price_unexpected'));
+  await h.close();
+});
+
+test('through the own gate on anthropic: a 402 decision pauses anthropic_credits (control: on openrouter it is openrouter_credits)', async () => {
+  const { h } = anthropicGate(() => jsonResponse({ type: 'error', error: { type: 'billing_error', message: SECRET } }, 402));
+  await h.sendAndFlush(h.event({ text: '第一条普通消息' }));
+  assert.equal(h.store.getControl('paid_paused'), 'anthropic_credits');
+  await h.close();
+
+  const eff = makeEffective();
+  const real = createDecider({ fetch: async () => jsonResponse({ error: { code: 402, message: SECRET } }, 402), getKey: () => 'K', getEffective: () => eff, promptFile: PROMPT });
+  const o = makeHarness({ effective: eff, decide: real });
+  await o.sendAndFlush(o.event({ text: '第一条普通消息' }));
+  assert.equal(o.store.getControl('paid_paused'), 'openrouter_credits');
+  await o.close();
 });

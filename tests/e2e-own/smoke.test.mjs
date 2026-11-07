@@ -19,8 +19,11 @@ import {
 
 const suiteStart = Date.now();
 const REPLY = '可洛的冒烟回复。';
-// Usage with a cache write, so settlement has a real figure to take: the provider's cost wins over the token price.
+// Usage with a cache write, so settlement has a real figure to take. The provider's cost ($0.0234) is below the tokens at
+// the locked price (400 input at $5/M, 40 output at $20/M, 3600 five-minute writes at $6.25/M), and it still settles:
+// it is what the Key is charged.
 const USAGE = { prompt_tokens: 4000, completion_tokens: 40, total_tokens: 4040, cost: 0.0234, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 3600 } };
+const USAGE_COMPUTED_MICROS = 400 * 5 + 40 * 20 + 3600 * 6.25;
 
 let s;
 let id;
@@ -114,11 +117,14 @@ test('one model request: no tools, one cache marker at the end of the system blo
   assert.ok(!wire.includes('<@'), 'no mention tag');
 });
 
-test('usage settles the reply hold at the provider cost', () => {
+test('usage settles the reply hold at the provider cost, even below the tokens at the locked price', () => {
   const rows = s.reservations(id);
   assert.ok(rows.length >= 1, 'a hold was taken');
   const reply = rows.find((r) => r.category === 'reply') ?? rows[0];
   assert.equal(reply.status, 'settled');
+  assert.ok(USAGE_COMPUTED_MICROS > Math.ceil(USAGE.cost * 1e6), 'the fixture puts the tokens above the reported cost');
+  const p = s.eff.models.primary.price;
+  assert.deepEqual([p.inputPerM, p.outputPerM, p.cacheWritePerM], [5, 20, 6.25], 'the lock the figure above assumes');
   assert.equal(reply.actual_micros, Math.ceil(USAGE.cost * 1e6));
   assert.equal(reply.source, 'model.usage');
   assert.ok(reply.held_micros >= reply.actual_micros, 'the hold covered the call');

@@ -7,8 +7,14 @@ import { namePattern, routeDecision, shapeCurrentText } from './decision.js';
 import { checkDisplayName, speakerLabel } from './displayName.js';
 import { crashpoint, hourBucket, isQuietHours, shanghaiDay } from './ids.js';
 import { refShape } from './log.js';
+import { settleMicros } from './providers/cost.js';
+import { HARD_CAP_PAUSE, PRICE_ALERT, PRICE_PAUSE, providerOfEffective } from './providers/registry.js';
 import { CRISIS_ELIGIBLE, evaluateOrdinary, extractUrls, pickRepresentative, selectNameRecords } from './rules.js';
 import { createGroupQueues } from './window.js';
+
+// Costs come from the host's figure. Tokens at the locked price are the fallback. Zero is never free. The one
+// definition now lives with the other money arithmetic; hooks.js still imports it from here.
+export { usageMicros } from './providers/cost.js';
 
 const HOUR = 3600000;
 const PASSIVE_WINDOW_MS = 285000;
@@ -31,6 +37,8 @@ const REPLY_PLANS = {
   interject: { tier: 'interject', hold: 'reply_optional', required: false },
 };
 const DECISION_TIERS = { ordinary: 'interject', name: 'named', crisis_route: 'addressed' };
+// The hard-cap pause sits in a control of its own, but a turn it refuses ends as any paid pause does.
+const pausedRefusal = (reason) => reason === 'paid_paused' || reason === HARD_CAP_PAUSE;
 const NO_OUTPUT = new Set(['host_error', 'required_no_text', 'aborted', 'no_reply']);
 // Endings where a running turn's reply is lost to a stop: an abort, a pause, the deadline, or the exit refusing it.
 // Send errors raise alerts of their own, and content refusals keep their own rules.
@@ -122,17 +130,6 @@ function decisionCap(trigger, cap) {
 const hourExpiry = (at) => (hourBucket(at) + 2) * HOUR;
 const dayExpiry = (at) => at + 2 * 24 * HOUR;
 
-// Costs come from the host's figure. Tokens at the locked price are the fallback. Zero is never free.
-export function usageMicros(usage, price) {
-  if (!usage) return null;
-  if (typeof usage.costUsd === 'number' && usage.costUsd > 0) return { micros: Math.ceil(usage.costUsd * 1e6), source: 'model.usage' };
-  const tokens = (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-  if (tokens <= 0 || !price) return null;
-  const micros = (usage.input ?? 0) * price.inputPerM + (usage.output ?? 0) * price.outputPerM
-    + (usage.cacheRead ?? 0) * (price.cacheReadPerM ?? price.inputPerM) + (usage.cacheWrite ?? 0) * (price.cacheWritePerM ?? price.inputPerM);
-  return micros > 0 ? { micros: Math.ceil(micros), source: 'computed' } : null;
-}
-
 export function createGate({ store, ledger, policy, getEffective, decide, dispatchTurn, log = () => {}, now = Date.now, timers = {}, runtime = 'openclaw' }) {
   if (runtime !== 'openclaw' && runtime !== 'own') throw new TypeError('createGate: runtime must be openclaw or own');
   const setTimer = timers.setTimer ?? setTimeout;
@@ -202,6 +199,36 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       return undefined;
     }
   }
+
+  // The kind whose rules price a reply. The host process is always on OpenRouter, whatever a file written under it
+  // names, so its settlement is exactly what it was. The bot prices by the provider its effective file names; none
+  // named prices nothing, which leaves the hold counted.
+  const settleKind = (eff) => (runtime === 'own' ? providerOfEffective(eff)?.kind ?? null : 'openrouter');
+
+  // A figure the price could not take at the standard rate (US-only inference, fast mode, a one-hour or unsplit cache
+  // write) still settles as computed, which only over-counts, and pauses paid work until the owner has looked.
+  function priceUnexpected(flags) {
+    if (!Array.isArray(flags) || flags.length === 0) return;
+    tryQuietly(() => {
+      // The flags are cost.js's own short names. Alert details keep only log keys and scalars, so they travel as one
+      // string under reason.
+      store.addAlert(PRICE_ALERT, { reason: flags.join(' ') });
+      ledger.pausePaid(PRICE_PAUSE, 'gate');
+    });
+  }
+
+  // Alerts a settlement carries apart from its flags: on the own runtime on OpenRouter, `cost_above_computed` for a
+  // reported cost above 1.10x the tokens at the lock. Each is recorded for status; nothing pauses, the figure settled.
+  function costAlerts(known, eventKey) {
+    if (!Array.isArray(known?.alerts) || known.alerts.length === 0) return;
+    tryQuietly(() => {
+      for (const kind of known.alerts) store.addAlert(kind, { eventKey });
+    });
+  }
+
+  // {micros, source, flags} for a reply's usage, or null. The price is the primary's of the effective file given. On
+  // OpenRouter this is usageMicros with no flags.
+  const replyCost = (usage, eff) => settleMicros(usage, eff?.models?.primary?.price, { kind: settleKind(eff), runtime });
 
   function armSweep() {
     if (sweepTimer || stopped) return;
@@ -405,17 +432,23 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
   // An abort after a part went out is not that case: a reply reached the group and its cost is unknown.
   function settleReply(turn, holdId, result, eff, fin) {
     if (!holdId) {
-      const known = usageMicros(result.usage, eff?.models?.primary?.price);
-      if (known) ledger.applyLateUsage(turn.eventKey, { actualMicros: known.micros, source: known.source, model: result.usage.model });
+      const known = replyCost(result.usage, eff);
+      if (known) {
+        ledger.applyLateUsage(turn.eventKey, { actualMicros: known.micros, source: known.source, model: result.usage.model });
+        priceUnexpected(known.flags);
+        costAlerts(known, turn.eventKey);
+      }
       return;
     }
     if (result.started === false) {
       ledger.release(holdId);
       return;
     }
-    const known = usageMicros(result.usage, eff?.models?.primary?.price);
+    const known = replyCost(result.usage, eff);
     if (known) {
       ledger.settle(holdId, { actualMicros: known.micros, source: known.source, model: result.usage.model });
+      priceUnexpected(known.flags);
+      costAlerts(known, turn.eventKey);
       return;
     }
     log('settle_missing', { eventKey: turn.eventKey, tier: turn.tier });
@@ -525,8 +558,12 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       if (outcome !== ABANDONED) return outcome;
       log('turn_abandoned', { eventKey: turn.eventKey, groupKey: turn.groupKey, tier: turn.tier });
       run.then((late) => tryQuietly(() => {
-        const known = usageMicros(late?.usage, getEffective()?.models?.primary?.price);
-        if (known) ledger.applyLateUsage(turn.eventKey, { actualMicros: known.micros, source: known.source, model: late.usage.model });
+        const known = replyCost(late?.usage, getEffective());
+        if (known) {
+          ledger.applyLateUsage(turn.eventKey, { actualMicros: known.micros, source: known.source, model: late.usage.model });
+          priceUnexpected(known.flags);
+          costAlerts(known, turn.eventKey);
+        }
       }), () => {});
       return { started: true, hostError: false, aborted: true, usage: null };
     } finally {
@@ -685,7 +722,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       if (p.global || p.group || p.terminal) throw new Refused('paused');
       if (cls === 'interject' && p.interject) throw new Refused('interject_latch');
       const r = ledger.reserve({ tier: plan.tier, category: 'reply', heldMicros, eventKey: rec.eventKey, model: eff.models.primary.id });
-      if (!r.ok) throw new Refused(r.reason === 'paid_paused' ? 'paid_paused' : 'budget');
+      if (!r.ok) throw new Refused(pausedRefusal(r.reason) ? 'paid_paused' : 'budget');
       if (!store.transition(rec.eventKey, from, 'approved')) throw new Refused('gone');
       // Crisis stays a routing state: its class is not kept on the row.
       if (cls !== 'crisis') store.setClass(rec.eventKey, cls);
@@ -816,7 +853,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       if (!store.bumpCounter(`dec_group:${rec.groupKey}:${hour}`, hourExpiry(at), decisionCap(trigger, limits.decisionsPerGroupPerHour)).ok) throw new Refused('decision_cap');
       if (!store.bumpCounter(`dec_day:${day}`, dayExpiry(at), decisionCap(trigger, limits.decisionsPerDay)).ok) throw new Refused('decision_cap');
       const r = ledger.reserve({ tier: DECISION_TIERS[trigger], category: 'decision', heldMicros, eventKey: rec.eventKey, model: eff.models.decision.id });
-      if (!r.ok) throw new Refused(r.reason === 'paid_paused' ? 'paid_paused' : 'budget');
+      if (!r.ok) throw new Refused(pausedRefusal(r.reason) ? 'paid_paused' : 'budget');
       if (!store.transition(rec.eventKey, 'queued', 'deciding')) throw new Refused('gone');
       return { claimId, holdId: r.id, bypassed };
     });
@@ -829,7 +866,9 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     if (d.paid === false) {
       ledger.release(holdId);
     } else if (d.actualMicros) {
-      ledger.settle(holdId, { actualMicros: d.actualMicros, source: 'usage.cost', model: d.model });
+      // A provider that reports no cost settles from tokens: the decider says so in costSource.
+      ledger.settle(holdId, { actualMicros: d.actualMicros, source: d.costSource ?? 'usage.cost', model: d.model });
+      priceUnexpected(d.costFlags);
     } else {
       ledger.markUnsettled(holdId);
     }

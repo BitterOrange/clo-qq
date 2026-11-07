@@ -383,6 +383,89 @@ test('nothing passes on empty facts, and the shipped defaults are not ready for 
   }
 });
 
+// Anthropic direct: a Key that cannot be read. The hard cap, the model check and the recorded rules replace the Key
+// read, the Key limit and the reconciliation.
+const anthropicCfg = () => {
+  const c = goodCfg();
+  c.runtime = 'own';
+  c.providers = {
+    openrouter: { kind: 'openrouter', keyEnv: 'CLO_CHAT_API_KEY' },
+    anthropic: { kind: 'anthropic', keyEnv: 'CLO_ANTHROPIC_API_KEY', models: { primary: 'claude-opus-5-5', decision: 'claude-haiku-5-5' } },
+  };
+  c.activeProvider = 'anthropic';
+  c.acks.provider = { name: 'anthropic', at: 'x' };
+  c.acks.hardCap = { anthropic: { kind: 'workspace_monthly', usd: 20, prepaidNoReload: true, at: 'x' } };
+  return c;
+};
+const anthropicFacts = () => ({ ...goodFacts(), key: null, reconciled: false, hardCapKeyMatches: true, keyValid: true, providerRulesRecorded: true, requiredHoldMicros: 180000 });
+const flipped = { rulesRecorded: () => true };
+
+test('live on Anthropic: with the attested cap, the model check and recorded rules, no Key read is required', () => {
+  assert.deepEqual(validateBusinessConfig(anthropicCfg(), { env: {} }).errors, []);
+  assert.deepEqual(livePreconditions(anthropicCfg(), anthropicFacts(), flipped), { ok: true, failed: [] });
+  // The same facts on OpenRouter still need the Key read, its limit and the reconciliation.
+  const or = anthropicCfg();
+  or.activeProvider = 'openrouter';
+  or.acks.provider.name = 'openrouter';
+  assert.deepEqual(livePreconditions(or, anthropicFacts(), flipped).failed, ['key_readable', 'reconciled']);
+});
+
+test('live on Anthropic: provider_rules follows the registry record, and needs the fact as well', () => {
+  // The registry as shipped records the rules for Anthropic; a record that says otherwise refuses whatever the facts say.
+  assert.deepEqual(livePreconditions(anthropicCfg(), anthropicFacts()).failed, [], 'as shipped');
+  assert.deepEqual(livePreconditions(anthropicCfg(), anthropicFacts(), { rulesRecorded: () => false }).failed, ['provider_rules']);
+  // Once flipped, the fact is still needed: a caller that did not look refuses.
+  for (const providerRulesRecorded of [false, undefined, 'true']) {
+    assert.deepEqual(livePreconditions(anthropicCfg(), { ...anthropicFacts(), providerRulesRecorded }, flipped).failed, ['provider_rules'], String(providerRulesRecorded));
+  }
+  assert.deepEqual(livePreconditions(anthropicCfg(), anthropicFacts(), flipped).failed, [], 'positive control: flipped and true');
+  // OpenRouter never checks it: its codes are as before.
+  assert.deepEqual(livePreconditions(goodCfg(), goodFacts()).failed, []);
+});
+
+test('live on Anthropic: hard_cap needs the D2 ack, a cap above one hold, and the attested Key', () => {
+  const cases = [
+    (c) => { delete c.acks.hardCap; },
+    (c) => { c.acks.hardCap = { openrouter: c.acks.hardCap.anthropic }; },
+    (c) => { c.acks.hardCap.anthropic.prepaidNoReload = false; },
+    (c) => { delete c.acks.hardCap.anthropic.prepaidNoReload; },
+    (c) => { c.acks.hardCap.anthropic.kind = 'prepaid_no_reload'; },
+    (c) => { c.acks.hardCap.anthropic.usd = 0; },
+    (c) => { c.acks.hardCap.anthropic.usd = '20'; },
+    (c) => { c.acks.hardCap.anthropic.usd = 0.17; },
+  ];
+  for (const mutate of cases) {
+    const c = anthropicCfg();
+    mutate(c);
+    assert.deepEqual(livePreconditions(c, anthropicFacts(), flipped).failed, ['hard_cap'], String(mutate));
+  }
+  for (const hardCapKeyMatches of [false, undefined, 'yes']) {
+    assert.deepEqual(livePreconditions(anthropicCfg(), { ...anthropicFacts(), hardCapKeyMatches }, flipped).failed, ['hard_cap'], String(hardCapKeyMatches));
+  }
+  const exact = anthropicCfg();
+  exact.acks.hardCap.anthropic.usd = 0.18;
+  assert.deepEqual(livePreconditions(exact, anthropicFacts(), flipped).failed, [], 'a cap of exactly one hold');
+  assert.deepEqual(livePreconditions(exact, { ...anthropicFacts(), requiredHoldMicros: 180001 }, flipped).failed, ['hard_cap'], 'one micro above it');
+});
+
+test('live on Anthropic: key_valid needs the model check, and a config naming no provider fails on provider', () => {
+  for (const keyValid of [false, undefined, 1]) {
+    assert.deepEqual(livePreconditions(anthropicCfg(), { ...anthropicFacts(), keyValid }, flipped).failed, ['key_valid'], String(keyValid));
+  }
+  const stray = anthropicCfg();
+  stray.apiProvider = { name: 'anthropic', kind: 'anthropic' };
+  const r = livePreconditions(stray, anthropicFacts(), flipped);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.failed, ['provider']);
+});
+
+test('live: base_urls covers every provider entry', () => {
+  const c = anthropicCfg();
+  c.providers.anthropic.baseUrl = 'http://127.0.0.1:9';
+  assert.deepEqual(livePreconditions(c, anthropicFacts(), flipped).failed, ['base_urls']);
+  assert.deepEqual(livePreconditions(c, { ...anthropicFacts(), env: { CLO_TEST_ROOT: dir } }, flipped).failed, [], 'test mode');
+});
+
 test('runtime: openclaw or own, and left out it means openclaw', () => {
   for (const bad of ['gateway', 'OWN', '', 1, null, true]) {
     const c = sample();

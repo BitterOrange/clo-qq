@@ -4,12 +4,13 @@ import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { runtimeOf } from '../clo-plugin/lib/core/config.js';
+import { providerOfConfig, runtimeOf } from '../clo-plugin/lib/core/config.js';
 import { checkSentinels, sha256Hex } from '../clo-plugin/lib/core/contentPolicy.js';
 import { extractPolicySection } from '../clo-plugin/lib/core/render.js';
+import { CHILD_KEY, MODEL_ID_RULES } from '../clo-plugin/lib/core/providers/registry.js';
 import { SCHEMA_VERSION } from '../clo-plugin/lib/core/store.js';
-import { isTestMode, readConfig, readVersionsLock, renderAll } from './common.mjs';
-import { duplicateLinesHint, ensureGatewayEnvClean, forbiddenOwnArgs, gatewayEnvForCheck, hostCliEnv, inspectArgs, oldLinesHint, ownArgs, ownEntry, ownEnvForCheck, parseEnvFile, privateNode, renamedEnvNames, requireSecrets } from './lifecycle.mjs';
+import { isTestMode, lockMatches, readConfig, readModelsLock, readVersionsLock, renderAll } from './common.mjs';
+import { duplicateLinesHint, ensureGatewayEnvClean, ensureOwnEnvClean, forbiddenOwnArgs, gatewayEnvForCheck, hostCliEnv, inspectArgs, modelKeyNames, oldLinesHint, ownArgs, ownEntry, ownEnvForCheck, parseEnvFile, privateNode, renamedEnvNames, requireSecrets } from './lifecycle.mjs';
 
 const FORBIDDEN = ['@tencent-connect/openclaw-qqbot', '@openclaw/qqbot', '@agent-wechat/agent-wechat', '@tencent-weixin/openclaw-weixin'];
 const FORBIDDEN_DIR = /qqbot|agent-wechat|openclaw-weixin/i;
@@ -117,6 +118,9 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
   // The runtime the next start runs. An unreadable config already fails config_valid; the default is then checked.
   const runtime = runtimeOf(cfg);
   const host = runtime === 'openclaw';
+  // The model API provider config.json runs on. Without a readable config it is the implicit OpenRouter entry.
+  const provider = cfg ? providerOfConfig(cfg) : providerOfConfig({});
+  const kind = provider?.kind ?? null;
   // The own runtime has no host config, so nothing below may need openclaw.json, and none of the host checks run.
   if (host) {
     attempt('openclaw_json', () => {
@@ -278,10 +282,14 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
     attempt('proxy_config', () => bothCfg(() => !hasKeyMatching(onDisk, PROXY_KEY) || 'openclaw.json 含 proxy 设置'));
   } else {
     attempt('bot_env', () => {
-      const child = ownEnvForCheck(paths, env);
-      const bad = [...ensureGatewayEnvClean(child), ...Object.keys(child).filter((k) => k.startsWith('OPENCLAW_'))];
+      if (!kind) return '没有能用的模型接口，不知道该给可洛进程哪个 Key';
+      const child = ownEnvForCheck(paths, env, { kind });
+      const bad = [...ensureOwnEnvClean(child), ...Object.keys(child).filter((k) => k.startsWith('OPENCLAW_'))];
       if (bad.length) return `可洛进程的环境含有不该有的变量：${bad.join('、')}`;
-      if (!child.OPENROUTER_API_KEY) return '可洛进程的环境里没有 OPENROUTER_API_KEY 这个名字，Key 传不过去';
+      // Exactly one model Key, the one of the kind it runs on.
+      const names = modelKeyNames(child);
+      if (!names.includes(CHILD_KEY[kind])) return `可洛进程的环境里没有 ${CHILD_KEY[kind]} 这个名字，Key 传不过去`;
+      if (names.length !== 1) return `可洛进程的环境里有不止一个模型 Key 的名字：${names.join('、')}`;
       return child.CLO_EFFECTIVE_PATH === paths.effectiveJson || '可洛进程的环境里 CLO_EFFECTIVE_PATH 不是这份 effective.json';
     });
     attempt('bot_entry', () => existsSync(ownEntry(paths, env)) || '没有 src/bot/main.mjs，own 运行时没有入口');
@@ -295,6 +303,26 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
       return listening.length ? `这些文件会开监听端口：${listening.join('、')}` : true;
     });
   }
+  // Static, with no network: the provider resolves, fits the runtime, and has what this build needs of its kind.
+  attempt('provider', () => {
+    if (!cfg) return '没有配置';
+    if (!provider) return 'config.json 没有指定能用的模型接口（providers、activeProvider）';
+    // The provider readers give the implicit OpenRouter entry on this runtime whatever the file names, so the file's
+    // own choice is read here.
+    const named = cfg.providers?.[cfg.activeProvider]?.kind;
+    if (host && ((named !== undefined && named !== 'openrouter') || kind !== 'openrouter')) return 'OpenClaw 运行时只能用 OpenRouter';
+    if (kind === 'openrouter') return { ok: true, detail: provider.implicit ? 'OpenRouter（默认）' : `${provider.name}（OpenRouter）` };
+    const models = cfg.providers?.[provider.name]?.models ?? {};
+    const badIds = ['primary', 'decision'].filter((r) => !MODEL_ID_RULES[kind].test(models[r] ?? ''));
+    if (badIds.length) return `${provider.name} 的模型 ID 不符合要求：${badIds.join('、')}`;
+    const lock = readModelsLock(paths, kind);
+    if (lock && !lockMatches(cfg, lock, kind)) return `${provider.name} 锁定的模型和配置不一致，重新锁定（clo model lock --provider ${provider.name}）`;
+    const notes = [lock ? '已锁定价格' : '还没锁定价格'];
+    if (provider.caps.keyReadable !== true) notes.push('读不到 Key，对账不可用，只有本地估算');
+    if (provider.caps.hardCap === 'attested') notes.push('硬上限靠 clo ack hard-cap 声明');
+    return { ok: true, detail: `${provider.name}（${kind}）：${notes.join('；')}` };
+  });
+
   attempt('live_gate', () => {
     if (!cfg) return '没有配置';
     if (cfg.mode !== 'live') return { ok: true, detail: '当前是 dry-run' };
@@ -318,6 +346,12 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
       return true;
     });
     // A leftover old line is ignored, whatever the mode. Say so, because it looks like it still does something.
+    // The active kind's Key by name. live needs it (env_file); dry-run calls no model, so it only reminds.
+    attempt('provider_key', () => {
+      if (!cfg || !provider) return '没有配置';
+      if (parseEnvFile(paths.envFile, [provider.keyEnv])[provider.keyEnv]) return { ok: true, detail: provider.keyEnv };
+      return `.env 里没有 ${provider.keyEnv}，${provider.name} 接口进入 live 前要填`;
+    }, cfg?.mode === 'live' ? 'error' : 'warn');
     attempt('env_old_names', () => oldLinesHint(paths.envFile) || true, 'warn');
     attempt('env_duplicates', () => duplicateLinesHint(paths.envFile) || true, 'warn');
     if (host) {

@@ -48,6 +48,38 @@
         }
       }
     },
-    "changes": []
+    "changes": [],
+    "priceBooks": {
+      "anthropic": {
+        "$comment": "Entered by hand; the Anthropic API returns no prices. USD per million tokens. cacheWritePerM is the five-minute write, cacheWrite1hPerM the one-hour write. Haiku 5.5 bills prompts above 100000 tokens on the long card; its cache rates there are the documented multiples (0.1x read, 1.25x and 2x write) of that card's input rate. Re-read the pricing page before the paid probe. A rate not found in the source goes in unverified, and nothing listed there can be locked. Not a lock: `models.locks.anthropic` is written only by the console.",
+        "checkedOn": "2026-11-07",
+        "source": "Claude API model reference: the Opus 5.5 and Haiku 5.5 pricing notes and the prompt-caching multipliers. Pricing page: https://platform.claude.com/docs/en/about-claude/pricing",
+        "unverified": [],
+        "models": {
+          "claude-opus-5-5": {
+            "inputPerM": 4,
+            "outputPerM": 20,
+            "cacheReadPerM": 0.2,
+            "cacheWritePerM": 5,
+            "cacheWrite1hPerM": 8
+          },
+          "claude-haiku-5-5": {
+            "inputPerM": 0.1,
+            "outputPerM": 0.5,
+            "cacheReadPerM": 0.01,
+            "cacheWritePerM": 0.125,
+            "cacheWrite1hPerM": 0.2,
+            "long": {
+              "aboveTokens": 100000,
+              "inputPerM": 0.5,
+              "outputPerM": 2.5,
+              "cacheReadPerM": 0.05,
+              "cacheWritePerM": 0.625,
+              "cacheWrite1hPerM": 1
+            }
+          }
+        }
+      }
+    }
   }
 }

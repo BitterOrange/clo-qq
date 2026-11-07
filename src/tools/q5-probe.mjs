@@ -144,7 +144,9 @@ function toolDefinition() {
 
 const utf8Bytes = (text) => Buffer.byteLength(text, 'utf8');
 const usdText = (micros) => `$${(micros / 1e6).toFixed(4)}`;
-// A bound the user may pass back as --max-usd: rounded up, so the printed figure is always enough for the run to start.
+// A bound the user may pass back as --max-usd, rounded up to the next 100 micro-USD. Not always enough: when the bound
+// is a whole multiple of 100, the printed figure equals it, and the CLI's floor(usd * 1e6) can read it back one
+// micro-USD short and refuse. The own plan prints the exact micro-USD figure beside it.
 const usdUpText = (micros) => `$${(Math.ceil(micros / 100) / 1e4).toFixed(4)}`;
 const round6 = (micros) => Number((micros / 1e6).toFixed(6));
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);

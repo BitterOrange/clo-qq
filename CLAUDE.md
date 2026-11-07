@@ -104,6 +104,7 @@ OpenClaw Gateway（项目 PID 管理，环境按白名单构造，只绑 loopbac
 | 允许的群 | `qq.allowedGroupIds`、`qq.groups` | 这是群 ID，不是发送者 ID。准入群的普通成员都能聊天 |
 | 允许的私聊 | `qq.allowedDmUserIds` | 这一版必须为空 |
 | 模型 | `claudeModel`、`decisionModel` | 见第 6 节 |
+| 模型接口 | `providers`、`activeProvider` | 只在 own 运行时有用。不写就是 OpenRouter。只能用 `clo provider use` 换，见第 6 节 |
 | 搜索 | `searchProvider` | 这一版必须是 `none` |
 | 预算和超时 | `budget`、`timeouts` | 见第 8 节 |
 | 插话 | `interject`、`groups[id].interject`、`names` | 每群默认关 |
@@ -118,14 +119,16 @@ OpenClaw Gateway（项目 PID 管理，环境按白名单构造，只绑 loopbac
 | `CLO_CHAT_API_KEY` | 对话 Key，给这个项目单独建一个，并设每日限额。启动时映射成宿主要的 `OPENROUTER_API_KEY`。dry-run 不需要 |
 | `CLO_SEARCH_API_KEY` | 搜索 Key，启用搜索时才要。单独一个 Key，否则搜索费用无法核算 |
 | `CLO_TEST_API_KEY` | 探测 Key，只给 own 运行时的付费探测用（`q5-probe.ps1 -Runtime own`），openclaw 模式仍读 `CLO_CHAT_API_KEY`。单独建一个，每日限额不高于这次探测的上限。机器人不用它，`clo start` 也不把它交给 Gateway 或机器人进程 |
+| `CLO_ANTHROPIC_API_KEY` | Anthropic 的对话 Key，只在 own 运行时、在用的接口是 Anthropic 时要。放在专用的非默认工作区里（见第 8.2 节）。启动时只交给可洛进程，名字换成 `CLO_PROVIDER_API_KEY`；那时 `OPENROUTER_API_KEY` 不给。Gateway 永远拿不到它。dry-run 不需要 |
+| `CLO_TEST_ANTHROPIC_API_KEY` | Anthropic 的探测 Key，只给 `q5-anthropic.ps1` 用。放在另一个专用的探测工作区里，月度上限或预付费额度不高于这次探测的上限。机器人不用它，`clo start` 也不把它交给任何进程 |
 
-**目前只适用于 OpenRouter。** 其他 OpenAI 兼容接口未来可能加，现在不能用，文档也不要写成能用。它们没有账户侧限额，也没有 Key 读数可以对账，只剩本地估算管钱，所以这算一项独立功能。
+**模型接口只有两种：OpenRouter 和 Anthropic。** openclaw 运行时只能用 OpenRouter。own 运行时可以用 `clo provider use` 换成直连 Anthropic，这条路只在离线测试里验证过，真实 Anthropic 上还没有跑过。其他 OpenAI 兼容接口未来可能加，现在不能用，文档也不要写成能用。它们没有账户侧限额，也没有 Key 读数可以对账，只剩本地估算管钱，所以这算一项独立功能。Anthropic 同样读不到 Key，它能用，是因为部署者声明了一个服务方执行的工作区月度上限（第 8.2 节），这条规则是用户同意的（`DECISIONS.md` 的“用户定的（2026-11-07，Provider）”）。
 
 **机器人账号**由用户用单独的 QQ 号在 q.qq.com 创建和管理，个人认证、手机确认、群主开关都由用户和群主本人做，不要自动操作。换号不保证隔离风险。启动后 `clo status` 显示脱敏的 AppID 和 READY 用户名，用户核对后 `clo ack identity`。
 
 **取得稳定 ID：** dry-run 下 `clo targets arm`，用户发一条消息，再 `clo targets list`。采集只记 ID，不记正文和昵称，最多 15 分钟，进入 live 时清空。群名可能重复或改变，不能当作目标。
 
-`clo mode live` 逐条检查预算、目标、Key 限额、对账、心跳、身份、告知、Q0、D3、内容策略、doctor，不满足就列出来并拒绝。用户选定目标并启用 live 后，不再为每条正常范围内的回复逐次申请批准。
+`clo mode live` 逐条检查预算、目标、Key 限额、对账、心跳、身份、告知、Q0、D3、内容策略、doctor，不满足就列出来并拒绝。在用的接口是 Anthropic 时，Key 限额和对账两项换成硬上限声明（`hard_cap`）、模型检查（`key_valid`）和项目规则（`provider_rules`）。用户选定目标并启用 live 后，不再为每条正常范围内的回复逐次申请批准。
 
 ## 5. 群聊 @ 回复与自然插话
 
@@ -189,14 +192,27 @@ gate 在自写通道里，模型调用之前运行，不依赖通知型 hook，�
 - 不创建第二个事件消费者或第二套发送逻辑。
 - 宿主的硬性配置：`tools.deny` 逐项列出，不写 `group:*`；`tools.toolSearch:false`；`silentReply.group:'allow'`；`session.dmScope:'per-channel-peer'`；`skipBootstrap:true`。理由见 `DECISIONS.md`。
 
-## 6. OpenRouter 与联网搜索
+## 6. 模型接口与联网搜索
 
 ### 对话模型
 
-- 目前只走 OpenRouter。主模型选择器 `opus-latest` 由 `clo model refresh` 解析成目录里的具体型号并固定，新版上架不会自动切换。判定模型默认 `anthropic/claude-haiku-5.5`，`effort:none`。
+两种接口，同一时间只用一个。不做自动切换、优先级，也不在失败后换另一个接口或另一个型号。不流式，不把流式片段发到 QQ。服务方的文字不进 QQ、日志和错误信息。
+
+**OpenRouter**（openclaw 运行时只能用它，own 运行时默认也是它）：
+
+- 主模型选择器 `opus-latest` 由 `clo model refresh` 解析成目录里的具体型号并固定，新版上架不会自动切换。判定模型默认 `anthropic/claude-haiku-5.5`，`effort:none`。
 - OpenClaw 引用形如 `openrouter/anthropic/<实际模型 ID>`；API 模型 ID 与 OpenClaw 模型引用不要混淆。
 - 只接受 `anthropic/` 下的具体型号。不用 `openrouter/auto`、`:suffix`、`~` 别名，`fallbacks` 为空，不在失败时悄悄改成其他厂商模型。主模型必须支持工具调用。
-- 价格超过每百万 token 输出 $30 或同型号涨价，要 `--confirm-price`。启用 QQ 时任何模型变更都要 `--qq-platform-notified`，表示用户已向平台报告（协议 §4.2）。
+- 价格超过每百万 token 输出 $30 或同型号涨价，要 `--confirm-price`。
+
+**Anthropic**（只在 own 运行时，用项目自己的 `fetch` 直连 Messages API，不用 SDK）：
+
+- 只接受具体型号：主模型 `claude-opus-5-5`，判定模型 `claude-haiku-5-5`。不接受 `-latest`、带日期的快照和别的型号线，也没有选择器，要换型号就改配置。
+- 接口不返回价格。价格是手抄进 `versions.lock.json` 的价格表，`clo model lock --provider anthropic` 从它锁定，第一次和涨价时都要 `--confirm-price`，输出超过每百万 token $30 同样要。费用按 token 乘锁定价在本地算。
+- 主模型的 `effort` 不能是 `none`（Opus 关不掉思考）。判定模型的 `none` 发成关闭思考加 effort low。这两条是开发时定的，还没有在真实 API 上确认。
+- 不发 `stream`、`fallbacks`、beta 请求头、`speed`、`inference_geo`、工具。响应显示走了美国区或快速模式，或者这两项读不到时，按更贵的价格结算，告警并暂停付费（`anthropic_price_unexpected`），owner 解除。
+
+**两种接口都一样：** 启用 QQ 时任何模型变更都要 `--qq-platform-notified`，表示用户已向平台报告（协议 §4.2）。`clo provider use` 也算一次模型变更，而且回复所需的消息换了接收方，所以它清除每个群的“已告知”和 D3 记录，重新告知、重新记录之后才能 live。
 
 ### 默认搜索方案（这一版未启用）
 
@@ -306,15 +322,16 @@ gate 在自写通道里，模型调用之前运行，不依赖通知型 hook，�
 | 限制 | 值 | 谁管 |
 |---|---|---|
 | 本地日预算 | $2.5/上海日，约 $75/30 天 | 本机账本 |
-| 对话 Key 日限额 | 由用户定，要不高于能接受的日花费。示例值 $1.60/UTC 日，每天重置，约 $48/30 天 | 用户在 OpenRouter 上设，只有它能拒绝请求 |
+| 对话 Key 日限额（OpenRouter） | 由用户定，要不高于能接受的日花费。示例值 $1.60/UTC 日，每天重置，约 $48/30 天 | 用户在 OpenRouter 上设，只有它能拒绝请求 |
+| 工作区月度上限（Anthropic） | 专用的非默认工作区，月度花费上限要小（约 $20），再加关闭了自动充值的预付费额度。用 `clo ack hard-cap` 声明，绑定 Key 的指纹 | 用户在 Anthropic 那边设，只有它能拒绝请求。程序读不到，只靠用户的声明 |
 | 分层上限 | 插话 $0.75（当天总花费到 $2.10 也停），搜索 $2.10（启用后才用），点名 $2.25，@ $2.5 | 本机账本，依次先停插话、搜索、点名，最后停 @ |
 
 Key 限额低于本地预算不算错误，只是每天实际花费先碰到它。`budget.keyDailyLimitUsd` 按实际限额写；实际限额和配置不符时 `clo mode live` 拒绝、读 Key 时告警，这条已经实现，只在模拟环境验证过。搜索 Key 的限额到启用搜索时再定。
 
-- 要求 live 前配置非零预算，Key 可读且有每日限额；否则只运行不调用模型的 dry-run。
-- 单次输出、token、工具轮数和并发都有上限。回复前按最坏情况预留。这个预留不是回合费用的上限：宿主在回合内会自己重试，压缩的费用也不进本机账本，真正的硬上限是 Key 的日限额。报告费用时要说清本地估算的精度。
-- 不要把上游没返回 usage 当作免费。回复发出却没有用量数字、Gateway 被杀：暂停新增付费请求。单次模型拒答、`/stop`、回合超时只影响这一个回合，预留额记成未结算，主模型连续 3 次失败才暂停；没有 Key 扣费的未结算行 15 分钟且至少读 3 次 Key 后按 0 结清。这是用户确认的取舍（`DECISIONS.md`）。
-- 对账残差超过阈值或读不到 Key 时暂停付费。
+- 要求 live 前配置非零预算。OpenRouter 上 Key 要可读且有每日限额；Anthropic 上要有绑定在用 Key 的硬上限声明，可洛进程和 `clo start` 每次启动都重新核对，Key 换了就不启动或暂停付费（`hard_cap_unverified`），只有重新声明才解除。否则只运行不调用模型的 dry-run。
+- 单次输出、token、工具轮数和并发都有上限。回复前按最坏情况预留。这个预留不是回合费用的上限：宿主在回合内会自己重试，压缩的费用也不进本机账本。真正的硬上限在 OpenRouter 上是 Key 的日限额，在 Anthropic 上是声明的工作区月度上限，而月度上限意味着出错的一天最多可能花到它。报告费用时要说清本地估算的精度。
+- 不要把上游没返回 usage 当作免费。回复发出却没有用量数字、Gateway 被杀：暂停新增付费请求。单次模型拒答、`/stop`、回合超时只影响这一个回合，预留额记成未结算，主模型连续 3 次失败才暂停。OpenRouter 上没有 Key 扣费的未结算行 15 分钟且至少读 3 次 Key 后按 0 结清。Anthropic 上读不到 Key，未结算行一直按预留额计入，直到 owner 用 `clo budget accept-unsettled` 结清。这是用户确认的取舍（`DECISIONS.md`）。
+- OpenRouter 上，对账残差超过阈值或读不到 Key 时暂停付费。Anthropic 上不对账，也不放 Admin Key，`status` 显示“对账：不可用（本地估算）”；它的付费暂停（`provider_fail`、`anthropic_*`）由 owner 用 `clo budget clear-pause` 解除，原因还在就立刻再暂停。
 
 ### 8.3 发送和 QQ 错误处理
 

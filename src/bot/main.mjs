@@ -9,6 +9,7 @@ import {
   accountMismatch, beginRun, checkStartLatch, claimConsumerLease, connectAccount, holdsConsumerLease, pidAlive, releaseConsumerLease,
   renewConsumerLease, runtimeOf, startControls, stopRun, STOP_REQUEST_KEY,
 } from '../clo-plugin/lib/channels/qq/startup.js';
+import { hardCapControlKey, LIVE_CODES, liveStartCheck } from '../clo-plugin/lib/core/providers/registry.js';
 import { keyOf, openBotServices } from './services.mjs';
 
 const USER_AGENT = `clo-qq/1 (Node/${process.versions.node})`;
@@ -54,6 +55,25 @@ export function installProcessHandlers({ proc = process, exit = (code) => proc.e
   };
   proc.on('uncaughtException', fatal('uncaught_exception'));
   proc.on('unhandledRejection', fatal('unhandled_rejection'));
+}
+
+/**
+ * The start check of docs/provider-contract.md section 7, on the Key this process holds (its own environment, not
+ * .env): in live mode on a provider whose spend rests on an attested cap, the ack must still meet decision D2 and be
+ * bound to this very Key; on every kind, the project's rules must allow live. A failure pauses paid work under the
+ * hard-cap pause, which only a new `clo ack hard-cap` lifts. A pass lifts nothing. No provider named means nothing can
+ * be sent anyway. No file to read fails closed: it is checked as live, with no ack. Returns the check's result.
+ */
+export function startCheck({ store, ledger, eff, provider, key }) {
+  const check = liveStartCheck({
+    provider,
+    mode: eff ? eff.mode : 'live',
+    ack: eff?.apiProvider?.hardCap ?? null,
+    control: provider ? store.getControl(hardCapControlKey(provider.kind)) : null,
+    keyFp: key ? store.key(key) : null,
+  });
+  if (!check.ok && (check.code === LIVE_CODES.hardCap || check.code === LIVE_CODES.providerRules)) ledger.pauseHardCap(provider.kind, 'start', check.code);
+  return check;
 }
 
 /**
@@ -130,8 +150,13 @@ async function runOnce({ env = process.env, signal = null, fetch = globalThis.fe
   }
   if (!lease.ok) return refuse(EXIT.refused, lease.reason, { kind: lease.holder });
 
+  // The Key this process holds, of the kind it opened with.
+  const heldKey = services.provider ? keyOf(env, services.provider.kind) : null;
   try {
-    beginRun({ store, getEffective, log, started, key: keyOf(env) });
+    beginRun({ store, getEffective, log, started, key: heldKey });
+    // The file this run was refused or accepted on, not a second read of it.
+    const check = startCheck({ store, ledger, eff, provider: services.provider, key: heldKey });
+    if (!check.ok) log('start_check', { code: check.code });
   } catch {
     log('status_error', { reason: 'start' });
     close();

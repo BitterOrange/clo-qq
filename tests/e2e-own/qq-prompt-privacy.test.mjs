@@ -2,13 +2,14 @@
 // main turns and the judging calls, is scanned for machine, account and raw ID details and for attribution headers,
 // with positive controls that the policy, the message and her own earlier line did arrive. The host's fallback prompt
 // has no counterpart: with privacy.replaceSystemPrompt off the bot still sends only its own prompt.
+// On either provider kind: the body is read through the model view, and each kind's Key header is checked by name.
 import assert from 'node:assert/strict';
 import { hostname, userInfo } from 'node:os';
 import { describe, test } from 'node:test';
 import { fullAt, nextId, plain } from '../fixtures/qq-events.mjs';
-import { decisionText } from '../harness/mock-openrouter.mjs';
+import { decisionText } from '../harness/model-view.mjs';
 import {
-  APP_ID, BOT_MEMBER, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, MEMBER, netAttempts, OWNER, ROOT, sleep, startOwnStack,
+  APP_ID, BOT_MEMBER, FAKE_ANTHROPIC_KEY, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, MEMBER, netAttempts, OWNER, PROVIDER, ROOT, sleep, startOwnStack,
 } from '../harness/own.mjs';
 
 const CANARY = '隐私测试金丝雀PRIVACYCANARY5521';
@@ -24,6 +25,7 @@ const FORBIDDEN = (s) => [
   ['bot member', BOT_MEMBER],
   ['appId', APP_ID],
   ['model key', FAKE_MODEL_KEY],
+  ['anthropic key', FAKE_ANTHROPIC_KEY],
   ['qq secret', FAKE_QQ_SECRET],
   ['display name', 'SENDER-DISPLAY-NAME'],
   ['bot display name', 'BOT-DISPLAY-NAME'],
@@ -59,6 +61,7 @@ describe('the own runtime prompt', () => {
   test('no machine, account or raw ID detail in any model body or header; policy, canary and her line are present', async () => {
     let n = 0;
     const s = await startOwnStack({
+      provider: PROVIDER,
       label: 'priv',
       groups: { [GROUP_A]: { interject: true, cooldownMinutes: 0 } },
       script: () => {
@@ -77,18 +80,24 @@ describe('the own runtime prompt', () => {
       const joined = bodies.join('\n');
       assert.ok(joined.includes('clo-policy:1') && joined.includes('clo-policy-end:1'), 'positive control: the policy block');
       assert.ok(joined.includes(CANARY), 'positive control: the message');
-      const user = agent[1].body.messages.find((m) => m.role === 'user').content;
+      const user = s.view(agent[1]).user;
       const recent = JSON.parse(user.slice(user.indexOf('\n') + 1)).recent;
       assert.ok(recent.some((h) => h.who === '可洛' && h.text === FIRST_REPLY), 'positive control: her own line is in the history');
       assert.ok(recent.some((h) => h.text === CANARY && h.who !== '可洛'), 'and the member line before it');
       scan(s, bodies);
       for (const r of agent) assert.equal(r.body.user, undefined, 'no user field');
       for (const r of s.modelRequests()) {
-        assert.equal(r.headers.authorization, `Bearer ${FAKE_MODEL_KEY}`, 'positive control: the headers were recorded');
+        if (s.kind === 'openrouter') {
+          assert.equal(r.headers.authorization, `Bearer ${FAKE_MODEL_KEY}`, 'positive control: the headers were recorded');
+        } else {
+          assert.ok(s.keySent(r, FAKE_ANTHROPIC_KEY), 'positive control: the headers were recorded');
+          assert.equal(r.headers.authorization, undefined);
+        }
         assert.deepEqual(Object.keys(r.headers).filter((h) => ATTRIBUTION.test(h)), [], 'no attribution header');
-        scan(s, [JSON.stringify({ ...r.headers, authorization: undefined }), r.url]);
+        // The one header that may carry the active Key is left out; every other Key and detail is scanned for.
+        scan(s, [JSON.stringify({ ...r.headers, authorization: undefined, 'x-api-key': undefined }), r.url]);
       }
-      const system = agent[0].body.messages.filter((m) => m.role === 'system').map((m) => JSON.stringify(m.content)).join('\n');
+      const system = s.kind === 'openrouter' ? agent[0].body.messages.filter((m) => m.role === 'system').map((m) => JSON.stringify(m.content)).join('\n') : s.view(agent[0]).system;
       assert.doesNotMatch(system, /^#+\s*(Tooling|Execution Bias|Runtime Context|OpenClaw Control|Documentation)\b/m, 'no host sections');
       assert.doesNotMatch(system, /Your text replies are automatically sent/);
       assert.deepEqual(netAttempts(s), []);
@@ -99,14 +108,14 @@ describe('the own runtime prompt', () => {
   });
 
   test('privacy.replaceSystemPrompt off: the system text is still the rendered file, and the scan still holds', async () => {
-    const s = await startOwnStack({ label: 'priv-off', effective: { privacy: { replaceSystemPrompt: false } }, script: () => ({ text: '好的。' }) });
+    const s = await startOwnStack({ provider: PROVIDER, label: 'priv-off', effective: { privacy: { replaceSystemPrompt: false } }, script: () => ({ text: '好的。' }) });
     try {
       const id = nextId();
       s.send(fullAt(CANARY, { id }));
       await s.waitRow(id);
       const req = s.agentRequests()[0];
       assert.ok(req, 'the model was called');
-      const system = req.body.messages.find((m) => m.role === 'system').content.map((c) => c.text).join('');
+      const system = s.kind === 'openrouter' ? req.body.messages.find((m) => m.role === 'system').content.map((c) => c.text).join('') : s.view(req).system;
       assert.equal(system, s.systemPrompt, 'the same prompt: there is no host prompt to fall back to');
       assert.ok(JSON.stringify(req.body).includes(CANARY));
       scan(s, [JSON.stringify(req.body)]);

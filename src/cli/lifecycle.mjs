@@ -5,6 +5,8 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, r
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { activeKindOf } from '../clo-plugin/lib/core/config.js';
+import { CHILD_KEY, DEFAULT_BASE, KEY_ENV } from '../clo-plugin/lib/core/providers/registry.js';
 import { writeAtomic } from '../clo-plugin/lib/core/render.js';
 import { CliError, isLoopback, isTestMode } from './common.mjs';
 
@@ -12,6 +14,11 @@ import { CliError, isLoopback, isTestMode } from './common.mjs';
 // so that is the child's name for the key. CLO_CHAT_API_KEY itself never reaches the child.
 const CHILD_ENV_NAMES = { CLO_QQ_APP_ID: 'CLO_QQ_APP_ID', CLO_QQ_APP_SECRET: 'CLO_QQ_APP_SECRET', CLO_CHAT_API_KEY: 'OPENROUTER_API_KEY' };
 export const ENV_FILE_KEYS = Object.keys(CHILD_ENV_NAMES);
+// The model Keys of the other provider kinds. Read from .env, but never mapped by CHILD_ENV_NAMES: only the own
+// runtime's env builder passes one, the active kind's, under its child name. The Gateway never gets any of them.
+export const PROVIDER_ENV_FILE_KEYS = Object.freeze(Object.values(KEY_ENV).filter((k) => !ENV_FILE_KEYS.includes(k)));
+// Everything start reads from .env.
+const READ_ENV_KEYS = [...ENV_FILE_KEYS, ...PROVIDER_ENV_FILE_KEYS];
 // Old .env names. Never read as a key: finding one only changes what the refusal says.
 export const RENAMED_ENV_KEYS = { OPENROUTER_API_KEY: 'CLO_CHAT_API_KEY', CLO_SEARCH_OPENROUTER_KEY: 'CLO_SEARCH_API_KEY' };
 const OS_ENV_KEYS = ['SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS'];
@@ -60,7 +67,7 @@ function filledEnvLines(file) {
 
 // Reads the named keys and nothing else, so no other line of .env can reach a child by accident.
 // A name on several lines takes its last value. duplicateEnvNames lets doctor say so.
-export function parseEnvFile(file, names = ENV_FILE_KEYS) {
+export function parseEnvFile(file, names = READ_ENV_KEYS) {
   const out = {};
   for (const [name, value] of filledEnvLines(file)) {
     if (names.includes(name)) out[name] = value;
@@ -70,7 +77,7 @@ export function parseEnvFile(file, names = ENV_FILE_KEYS) {
 
 // Names only. The names this project knows that hold a value on more than one line.
 export function duplicateEnvNames(file) {
-  const known = [...ENV_FILE_KEYS, ...Object.keys(RENAMED_ENV_KEYS), ...Object.values(RENAMED_ENV_KEYS)];
+  const known = [...READ_ENV_KEYS, ...Object.keys(RENAMED_ENV_KEYS), ...Object.values(RENAMED_ENV_KEYS)];
   const seen = filledEnvLines(file).map(([name]) => name).filter((name) => known.includes(name));
   return [...new Set(seen.filter((name, i) => seen.indexOf(name) !== i))];
 }
@@ -159,21 +166,28 @@ export function ownEntry(paths, env) {
   return isTestMode(env) && env.CLO_TEST_BOT_ENTRY ? resolve(env.CLO_TEST_BOT_ENTRY) : botEntry(paths);
 }
 
-// The Gateway's env, minus what only the host reads: its OPENCLAW_* settings and the control-port token. The key keeps
-// the name the Gateway gets. CLO_EFFECTIVE_PATH tells the bot which effective.json to read.
-export function ownEnv(paths, parentEnv, { secrets = {} } = {}) {
+// The Gateway's env, minus what only the host reads: its OPENCLAW_* settings and the control-port token. On OpenRouter
+// the key keeps the name the Gateway gets. kind is the provider kind config.json runs on: exactly one model Key
+// reaches the bot, that kind's, under CHILD_KEY[kind]. An unknown or missing kind gets none.
+// CLO_EFFECTIVE_PATH tells the bot which effective.json to read.
+export function ownEnv(paths, parentEnv, { secrets = {}, kind = 'openrouter' } = {}) {
   const env = gatewayEnv(paths, parentEnv, { secrets });
   for (const k of Object.keys(env)) {
     if (k.startsWith('OPENCLAW_')) delete env[k];
+  }
+  if (kind !== 'openrouter') {
+    for (const child of Object.values(CHILD_KEY)) delete env[child];
+    const fileName = Object.hasOwn(KEY_ENV, kind) ? KEY_ENV[kind] : null;
+    if (fileName && secrets[fileName]) env[CHILD_KEY[kind]] = secrets[fileName];
   }
   env.CLO_EFFECTIVE_PATH = paths.effectiveJson;
   return env;
 }
 
-// Same as gatewayEnvForCheck, for the own runtime.
-export function ownEnvForCheck(paths, parentEnv) {
-  const secrets = Object.fromEntries(ENV_FILE_KEYS.map((k) => [k, 'check-only']));
-  return ownEnv(paths, parentEnv, { secrets });
+// Same as gatewayEnvForCheck, for the own runtime and the kind it would run on.
+export function ownEnvForCheck(paths, parentEnv, { kind = 'openrouter' } = {}) {
+  const secrets = Object.fromEntries(READ_ENV_KEYS.map((k) => [k, 'check-only']));
+  return ownEnv(paths, parentEnv, { secrets, kind });
 }
 
 // Node flags the bot must never get: a listening debugger, or a proxy taken from the environment.
@@ -197,12 +211,24 @@ export function inspectArgs(paths, env) {
   return [...nodeImports(env), gatewayEntry(paths, env), 'plugins', 'inspect', 'clo', '--runtime', '--json'];
 }
 
-const FORBIDDEN_CHILD_ENV = /proxy|^PERPLEXITY_API_KEY$|^CLO_CHAT_API_KEY$|^CLO_SEARCH_API_KEY$|^CLO_SEARCH_OPENROUTER_KEY$|^CLO_TEST_API_KEY$|^NODE_OPTIONS$|^NODE_EXTRA_CA_CERTS$/i;
+// For every child. ANTHROPIC_API_KEY is the name SDKs read on their own, so it is never set for anyone; the bot gets its
+// Anthropic Key as CLO_PROVIDER_API_KEY.
+const FORBIDDEN_CHILD_ENV = /proxy|^PERPLEXITY_API_KEY$|^CLO_CHAT_API_KEY$|^CLO_SEARCH_API_KEY$|^CLO_SEARCH_OPENROUTER_KEY$|^CLO_TEST_API_KEY$|^CLO_ANTHROPIC_API_KEY$|^CLO_TEST_ANTHROPIC_API_KEY$|^ANTHROPIC_API_KEY$|^NODE_OPTIONS$|^NODE_EXTRA_CA_CERTS$/i;
+// The Gateway runs on OpenRouter only, so the other kinds' child names never belong in its env.
+const FORBIDDEN_GATEWAY_ENV = new Set(Object.values(CHILD_KEY).filter((k) => k !== CHILD_KEY.openrouter));
 
 // Names only. Used by doctor against gatewayEnvForCheck.
 export function ensureGatewayEnvClean(childEnv) {
+  return Object.keys(childEnv).filter((k) => FORBIDDEN_CHILD_ENV.test(k) || FORBIDDEN_GATEWAY_ENV.has(k));
+}
+
+// Names only. The same list for the bot, which may hold one model Key under its kind's child name.
+export function ensureOwnEnvClean(childEnv) {
   return Object.keys(childEnv).filter((k) => FORBIDDEN_CHILD_ENV.test(k));
 }
+
+// Names only: the model-Key child names in an env. The bot must hold exactly CHILD_KEY[its kind].
+export const modelKeyNames = (childEnv) => Object.values(CHILD_KEY).filter((k) => Object.hasOwn(childEnv, k));
 
 // The environment start would build, with placeholders for the secrets, so the check sees the real child names.
 export function gatewayEnvForCheck(paths, parentEnv) {
@@ -279,6 +305,10 @@ export function assertTestModeWired(cfg, env) {
   if (!env.CLO_TEST_NODE_IMPORT) throw new CliError('测试模式必须设置 CLO_TEST_NODE_IMPORT（net-guard）。');
   if (cfg.qq?.enabled && !(isLoopback(cfg.qq.apiBaseUrl) && isLoopback(cfg.qq.tokenBaseUrl))) throw new CliError('测试模式下 QQ 地址必须是 loopback。');
   if (!isLoopback(cfg.openrouter?.baseUrl)) throw new CliError('测试模式下 openrouter.baseUrl 必须是 loopback。');
+  // Any other kind would default to its real endpoint.
+  for (const e of Object.values(cfg.providers ?? {})) {
+    if (e?.kind && e.kind !== 'openrouter' && !isLoopback(e.baseUrl ?? DEFAULT_BASE[e.kind])) throw new CliError(`测试模式下 ${e.kind} 接口的 baseUrl 必须是 loopback。`);
+  }
 }
 
 const renameOldLine = (old) => `.env 里的 ${old} 已不再读取，请把这一行改名为 ${RENAMED_ENV_KEYS[old]}。`;
@@ -308,7 +338,12 @@ export function requireSecrets(cfg, secrets, { renamed = [] } = {}) {
     if (!secrets.CLO_QQ_APP_SECRET) missing.push('CLO_QQ_APP_SECRET');
     if (secrets.CLO_QQ_APP_ID && secrets.CLO_QQ_APP_ID !== cfg.qq.appId) throw new CliError('.env 的 CLO_QQ_APP_ID 与 config.json 的 qq.appId 不一致。');
   }
-  if (cfg.mode === 'live' && !secrets.CLO_CHAT_API_KEY) missing.push('CLO_CHAT_API_KEY');
+  if (cfg.mode === 'live') {
+    // The Key of the kind config.json runs on. A config that names none is refused by validation first.
+    const kind = activeKindOf(cfg);
+    if (!kind) throw new CliError('config.json 没有指定能用的模型接口（providers、activeProvider）。');
+    if (!secrets[KEY_ENV[kind]]) missing.push(KEY_ENV[kind]);
+  }
   if (missing.length) throw new CliError(`.env 缺少：${missing.join('、')}。${renamedKeyHint(renamed, missing)}`);
 }
 
@@ -348,7 +383,9 @@ export async function startOwn(ctx, cfg, { secrets, lookup = processInfo }) {
   const bad = forbiddenOwnArgs(args);
   if (bad.length) throw new CliError(`可洛进程的启动参数含有不允许的选项：${bad.join('、')}。没有启动。`);
   if (!existsSync(ownEntry(paths, env))) throw new CliError('没有 src/bot/main.mjs，不能用 own 运行时启动。');
-  return spawnRecorded(ctx, { runtime: 'own', args, childEnv: ownEnv(paths, env, { secrets }), port: null, lookup });
+  const kind = activeKindOf(cfg);
+  if (!kind) throw new CliError('config.json 没有指定能用的模型接口，没有启动。');
+  return spawnRecorded(ctx, { runtime: 'own', args, childEnv: ownEnv(paths, env, { secrets, kind }), port: null, lookup });
 }
 
 export function startRuntime(ctx, cfg, opts) {

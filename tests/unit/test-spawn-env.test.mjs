@@ -82,16 +82,17 @@ test('no spawn in src inherits it either, so the console and the probe hold to t
 });
 
 test('the OS tools get only what they need from a hostile parent', () => {
-  const env = osToolEnv({ SystemRoot: 'C:\\W', TEMP: 'C:\\T', PSModulePath: 'C:\\M', OPENROUTER_API_KEY: 'x', CLO_QQ_APP_SECRET: 'x', HTTP_PROXY: 'x', NODE_OPTIONS: 'x' });
+  const env = osToolEnv({ SystemRoot: 'C:\\W', TEMP: 'C:\\T', PSModulePath: 'C:\\M', OPENROUTER_API_KEY: 'x', CLO_QQ_APP_SECRET: 'x', HTTP_PROXY: 'x', NODE_OPTIONS: 'x', ANTHROPIC_API_KEY: 'x', CLO_ANTHROPIC_API_KEY: 'x', CLO_PROVIDER_API_KEY: 'x', CLO_TEST_ANTHROPIC_API_KEY: 'x' });
   assert.deepEqual(env, { SystemRoot: 'C:\\W', PSModulePath: 'C:\\M', TEMP: 'C:\\T' });
 });
 
 test('the clean environment drops provider keys, QQ secrets and proxies from a hostile parent, and keeps the OS parts', () => {
   const parent = {
     SystemRoot: 'C:\\W', TEMP: 'C:\\T', OPENROUTER_API_KEY: 'x', PERPLEXITY_API_KEY: 'x', CLO_QQ_APP_SECRET: 'x', HTTP_PROXY: 'x', https_proxy: 'x', NODE_OPTIONS: 'x', CLO_TEST_ROOT: 'x',
+    ANTHROPIC_API_KEY: 'x', CLO_ANTHROPIC_API_KEY: 'x', CLO_PROVIDER_API_KEY: 'x', CLO_TEST_ANTHROPIC_API_KEY: 'x',
   };
   const env = cleanChildEnv({ EXTRA: '1' }, parent);
-  for (const k of ['OPENROUTER_API_KEY', 'PERPLEXITY_API_KEY', 'CLO_QQ_APP_SECRET', 'HTTP_PROXY', 'https_proxy', 'NODE_OPTIONS', 'CLO_TEST_ROOT']) assert.equal(env[k], undefined, k);
+  for (const k of ['OPENROUTER_API_KEY', 'PERPLEXITY_API_KEY', 'CLO_QQ_APP_SECRET', 'HTTP_PROXY', 'https_proxy', 'NODE_OPTIONS', 'CLO_TEST_ROOT', 'ANTHROPIC_API_KEY', 'CLO_ANTHROPIC_API_KEY', 'CLO_PROVIDER_API_KEY', 'CLO_TEST_ANTHROPIC_API_KEY']) assert.equal(env[k], undefined, k);
   assert.equal(env.SystemRoot, 'C:\\W');
   assert.equal(env.TEMP, 'C:\\T');
   assert.equal(env.EXTRA, '1');

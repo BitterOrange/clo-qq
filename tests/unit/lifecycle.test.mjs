@@ -8,11 +8,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { digestOf, duplicateEnvNames, duplicateLinesHint, gatewayArgs, gatewayEnv, inspectGateway, openclawEntry, lookupProcess, oldLinesHint, parseEnvFile, inspectStartLock, processInfo, readPidRecord, renamedEnvNames, startGateway, startLockFile, stopGateway, withStartLock } from '../../src/cli/lifecycle.mjs';
+import { assertTestModeWired, digestOf, duplicateEnvNames, duplicateLinesHint, gatewayArgs, gatewayEnv, inspectGateway, openclawEntry, lookupProcess, oldLinesHint, parseEnvFile, inspectStartLock, processInfo, PROVIDER_ENV_FILE_KEYS, readPidRecord, renamedEnvNames, requireSecrets, startGateway, startLockFile, stopGateway, withStartLock } from '../../src/cli/lifecycle.mjs';
 import { makeContext } from '../../src/cli/common.mjs';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { e2eGatewayArgs, e2eGatewayEnv } from '../harness/gateway.mjs';
-import { APP_ID, baseConfig, clo, configOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, NODE, readJson, ROOT, testEnv, withDb } from './_cli-helper.mjs';
+import { APP_ID, baseConfig, clo, configOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, NODE, readJson, ROOT, testEnv, withDb, withProviders } from './_cli-helper.mjs';
 
 const roots = [];
 const cleanups = [];
@@ -855,4 +855,38 @@ test('start treats a lookup with no command line as no information: it ends the 
   assert.match(String(failure?.message), /已结束刚启动的进程/);
   assert.equal(existsSync(pidFileOf(s.root)), false);
   await until(() => !alive(pid), 'the stand-in to be gone');
+});
+
+// --- Provider Keys: read from .env by their own names, never mapped into the Gateway env. ---
+
+test('the Anthropic Key is read from .env and counted for duplicates, but the Gateway env never gets it under any name', () => {
+  const r = makeRoot('env-anthropic', null);
+  roots.push(r);
+  const f = join(r.root, 'x.env');
+  writeFileSync(f, `CLO_CHAT_API_KEY=k\nCLO_ANTHROPIC_API_KEY=a1\nCLO_ANTHROPIC_API_KEY=a2\nANTHROPIC_API_KEY=nope\nCLO_TEST_ANTHROPIC_API_KEY=nope\n`);
+  const secrets = parseEnvFile(f);
+  assert.deepEqual(secrets, { CLO_CHAT_API_KEY: 'k', CLO_ANTHROPIC_API_KEY: 'a2' }, 'the last line wins; the SDK name and the probe name are not read');
+  assert.ok(PROVIDER_ENV_FILE_KEYS.includes('CLO_ANTHROPIC_API_KEY'));
+  assert.deepEqual(duplicateEnvNames(f), ['CLO_ANTHROPIC_API_KEY']);
+  const ctx = makeContext({ env: testEnv(r.root), stdout: { write() {} }, stderr: { write() {} } });
+  const host = gatewayEnv(ctx.paths, { ...ctx.env, ANTHROPIC_API_KEY: 'parent', CLO_PROVIDER_API_KEY: 'parent' }, { secrets, token: 'T' });
+  assert.equal(host.OPENROUTER_API_KEY, 'k', 'positive control: the chat key passes');
+  assert.ok(!Object.values(host).includes('a2'), 'the Anthropic Key value is nowhere in the Gateway env');
+  for (const k of ['CLO_ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY', 'CLO_PROVIDER_API_KEY', 'CLO_TEST_ANTHROPIC_API_KEY']) assert.equal(host[k], undefined, k);
+});
+
+test('requireSecrets in live asks for the active kind\'s Key; test mode refuses a non-loopback Anthropic base', () => {
+  const live = { ...withProviders(enabledConfig(), { active: 'anthropic', anthropicBaseUrl: 'http://127.0.0.1:9' }), mode: 'live' };
+  const base = { CLO_QQ_APP_ID: APP_ID, CLO_QQ_APP_SECRET: FAKE_SECRET };
+  assert.throws(() => requireSecrets(live, { ...base, CLO_CHAT_API_KEY: FAKE_KEY }), /缺少：CLO_ANTHROPIC_API_KEY/);
+  assert.doesNotThrow(() => requireSecrets(live, { ...base, CLO_ANTHROPIC_API_KEY: 'x' }), 'control: the Anthropic Key alone is enough');
+  const orLive = { ...enabledConfig(), mode: 'live' };
+  assert.throws(() => requireSecrets(orLive, { ...base, CLO_ANTHROPIC_API_KEY: 'x' }), /缺少：CLO_CHAT_API_KEY/);
+  assert.doesNotThrow(() => requireSecrets({ ...live, mode: 'dry-run' }, base), 'dry-run calls no model');
+
+  const env = testEnv('x', { CLO_TEST_NODE_IMPORT: NET_GUARD });
+  assert.doesNotThrow(() => assertTestModeWired(live, env), 'control: a loopback base');
+  const real = structuredClone(live);
+  delete real.providers.anthropic.baseUrl;
+  assert.throws(() => assertTestModeWired(real, env), /anthropic 接口的 baseUrl 必须是 loopback/);
 });

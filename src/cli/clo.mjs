@@ -2,14 +2,15 @@
 import { appendFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ConfigError, livePreconditions, OPENROUTER_BASE_URL, runtimeOf } from '../clo-plugin/lib/core/config.js';
+import { activeKindOf, ConfigError, livePreconditions, OPENROUTER_BASE_URL, providerOfConfig, runtimeOf } from '../clo-plugin/lib/core/config.js';
 import { checkSentinels, loadPolicy, sha256Hex } from '../clo-plugin/lib/core/contentPolicy.js';
 import { createLedger } from '../clo-plugin/lib/core/ledger.js';
-import { callWorstMicros, fetchCatalog, lockFromCatalog, resolveSelector, validateModels } from '../clo-plugin/lib/core/models.js';
+import { anthropicModelChecks, callWorstMicros, checkAnthropicModels, fetchCatalog, lockFromCatalog, lockFromPriceBook, resolveSelector, validateModels } from '../clo-plugin/lib/core/models.js';
+import { ACTIVE_PROVIDER_CONTROL, hardCapAckProblems, hardCapAckRefusal, hardCapControlKey, KEY_ENV, liveStartCheck, providerRecord, providerRulesRecorded } from '../clo-plugin/lib/core/providers/registry.js';
 import { extractPolicySection, writeAtomic } from '../clo-plugin/lib/core/render.js';
-import { apply as applyRender, assertApplicable as checkApplicable, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, renderAll, requiredHoldMicros, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock } from './common.mjs';
+import { apply as applyRender, assertApplicable as checkApplicable, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, readPriceBook, renderAll, requiredHoldMicros, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock } from './common.mjs';
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, runDoctor } from './doctor.mjs';
-import { assertRuntimeSwitchAllowed, assertTestModeWired, inspectGateway, inspectStartLock, parseEnvFile, recordRuntime, renamedEnvNames, renamedKeyHint, requireSecrets, RUNTIME_LABEL, startLockFile, startRuntime, stopGateway, withStartLock } from './lifecycle.mjs';
+import { assertRuntimeSwitchAllowed, assertTestModeWired, inspectGateway, inspectStartLock, parseEnvFile, readPidRecord, recordRuntime, renamedEnvNames, renamedKeyHint, requireSecrets, RUNTIME_LABEL, startLockFile, startRuntime, stopGateway, withStartLock } from './lifecycle.mjs';
 import { collectStatus, formatStatus, RESIDUAL_EXIT, residualBehind } from './status.mjs';
 import { liveBotLease, releaseLeaseOfPid, STOP_REQUEST_KEY } from '../clo-plugin/lib/channels/qq/lease.js';
 
@@ -26,13 +27,17 @@ const USAGE = `用法：clo <命令>
   budget show | accept-unsettled | clear-pause
   policy test <文件> | rule disable <规则ID> --reason <原因> | hash
   model show | set-primary <id> | set-decision <id> | refresh | check
+        lock --provider <接口>               按价格表锁定这个接口的模型价格
         [--confirm-price] [--qq-platform-notified]
+  provider list | show | add anthropic
+           use <接口> --confirm [--qq-platform-notified]   换模型接口，算一次模型变更
   ack identity | q0 | d3 <决定> | terminal
+      hard-cap <接口> --kind workspace_monthly --usd <金额> --prepaid-no-reload [--confirm]
   doctor [--config-only] [--json]
   start
   stop`;
 
-const BOOLEAN_FLAGS = new Set(['--all', '--reveal', '--confirm-price', '--qq-platform-notified', '--json', '--ack', '--config-only']);
+const BOOLEAN_FLAGS = new Set(['--all', '--reveal', '--confirm-price', '--qq-platform-notified', '--json', '--ack', '--config-only', '--confirm', '--prepaid-no-reload']);
 
 export function parseArgs(argv) {
   const positional = [];
@@ -107,6 +112,10 @@ const LIVE_HINTS = {
   reconciled: '对账没有成功',
   heartbeat: 'Gateway 没有在运行，或还没收到过 READY（先在 dry-run 下 clo start）',
   gateway_key: '运行中的 Gateway 还没有记录 .env 里这个 CLO_CHAT_API_KEY。刚启动的 Gateway 要先连接完成，等 clo status 显示已连接再试。如果已经连上，它用的就不是这个 Key：Gateway 的环境在启动时固定，改过 .env 要先 clo stop 再 clo start',
+  provider: 'config.json 没有指定能用的模型接口（providers、activeProvider）',
+  hard_cap: '这个接口读不到 Key 的花费和限额，要有你本人对硬上限的声明（clo ack hard-cap）：专用、非默认工作区的月度花费上限，加上关闭自动充值的预付费额度，金额至少够一次必答回复的预留，而且声明绑定的就是 .env 里现在这个 Key，也是运行中进程用的 Key。换过 Key 要先停进程，再重新声明',
+  key_valid: '用这个 Key 读不到锁定的两个模型，或模型不支持这里要用的设置（D3 没有记录时不会去读）',
+  provider_rules: '这个接口进入 live 的项目规则还没有记录：CLAUDE.md §8.2 和 DECISIONS.md 要先写进你同意的规则。在那之前只能 dry-run',
   identity: '机器人身份没有确认（看 clo status，再 clo ack identity）',
   notice: '有群没有确认告知（clo group notice-done <群>）',
   q0: 'Q0 没有确认：你还没有确认看过自己的群能收到什么（clo ack q0）',
@@ -119,9 +128,14 @@ const LIVE_HINTS = {
   models: '模型没有锁定（clo model refresh）',
 };
 
-function liveHint(code, failed, hasKey) {
-  if (code === 'key_readable' && !hasKey) return '.env 里没有 CLO_CHAT_API_KEY';
+// keyName: the .env name of the active kind's Key. facts: what gatherLiveFacts found, for short codes only.
+function liveHint(code, failed, hasKey, keyName = KEY_ENV.openrouter, facts = {}) {
+  if ((code === 'key_readable' || code === 'key_valid') && !hasKey) return `.env 里没有 ${keyName}`;
   if (code === 'reconciled' && failed.includes('gateway_key')) return '这次没有对账：Gateway 用的 Key 和 .env 对不上时不对账，先解决 gateway_key';
+  if (code === 'gateway_key' && keyName !== KEY_ENV.openrouter) return `运行中的可洛进程还没有记录 .env 里这个 ${keyName}。刚启动的进程要先连接完成，等 clo status 显示已连接再试。如果已经连上，它用的就不是这个 Key：进程的环境在启动时固定，改过 .env 要先 clo stop 再 clo start`;
+  // The checker's problems are short codes it made itself, never provider text.
+  if (code === 'key_valid' && facts.providerRulesRecorded === false) return '没有检查：这个接口进入 live 的项目规则还没有记录，记录之前不把 Key 发给接口';
+  if (code === 'key_valid' && facts.keyProblems?.length) return `${LIVE_HINTS.key_valid}（${facts.keyProblems.join('、')}）`;
   return LIVE_HINTS[code] ?? '';
 }
 
@@ -138,16 +152,24 @@ export function policyPasses(ctx, cfg) {
   }
 }
 
-// D3 comes first: until it is recorded, this does not contact OpenRouter at all.
-async function gatherLiveFacts(ctx, cfg) {
+// D3 comes first: until it is recorded, this does not contact the provider at all. The provider is config.json's, and
+// each check runs by its kind's capabilities: OpenRouter reads its Key; a kind whose Key cannot be read checks the
+// attested hard cap's Key binding and that the Key can read both locked models, the last only once the kind's
+// project rules are recorded. rulesRecorded: the registry's record; a test passes its own to reach the recorded branch.
+export async function gatherLiveFacts(ctx, cfg, { rulesRecorded = providerRulesRecorded } = {}) {
   const facts = { now: ctx.now(), env: ctx.env };
+  const provider = providerOfConfig(cfg);
+  const kind = provider?.kind ?? null;
   facts.doctorOk = runDoctor(ctx, { level: CONFIG_LEVEL }).ok;
   facts.policyOk = policyPasses(ctx, cfg);
-  facts.modelsLocked = Boolean(usableLock(cfg, readModelsLock(ctx.paths)));
+  facts.modelsLocked = Boolean(kind && usableLock(cfg, readModelsLock(ctx.paths, kind), kind));
+  // From the registry by kind, never from a file.
+  facts.providerRulesRecorded = Boolean(kind) && rulesRecorded(kind) === true;
   // ledger.holdMicros('reply_required') itself, on the effective file just rendered, so the runtime's own hold rule
   // applies. Without a price it is null, and 'models' or the ledger refuses anyway.
   facts.requiredHoldMicros = requiredHoldMicros(readEffective(ctx));
   const secrets = parseEnvFile(ctx.paths.envFile);
+  const envKey = kind ? (secrets[KEY_ENV[kind]] ?? null) : null;
   return withStoreAsync(ctx, async (store) => {
     const number = (k) => {
       const v = store.getControl(k);
@@ -155,18 +177,35 @@ async function gatherLiveFacts(ctx, cfg) {
     };
     facts.heartbeatAt = number('heartbeat_at');
     const running = store.getControl('gateway_key');
-    facts.gatewayKeyMatches = Boolean(secrets.CLO_CHAT_API_KEY) && running === store.key(secrets.CLO_CHAT_API_KEY);
+    facts.gatewayKeyMatches = Boolean(envKey) && running === store.key(envKey);
     facts.lastReadyAt = number('last_ready_at');
     facts.key = null;
     facts.reconciled = false;
-    if (cfg.acks?.d3 && secrets.CLO_CHAT_API_KEY) {
-      const ledger = createLedger({ store, getEffective: () => readEffective(ctx), fetch: ctx.fetch, getKey: () => secrets.CLO_CHAT_API_KEY, log: ctx.log, now: ctx.now });
-      try {
-        facts.key = await ledger.readKey();
-        // The baseline belongs to the Key that spends. Reconciling with another one would read as a Key change.
-        if (facts.gatewayKeyMatches) facts.reconciled = (await ledger.reconcile(ctx.now())).ok;
-      } catch {
-        facts.key = null;
+    facts.hardCapKeyMatches = false;
+    facts.keyValid = false;
+    if (provider?.caps.keyReadable === true) {
+      if (cfg.acks?.d3 && envKey) {
+        const ledger = createLedger({ store, getEffective: () => readEffective(ctx), fetch: ctx.fetch, getKey: () => envKey, log: ctx.log, now: ctx.now });
+        try {
+          facts.key = await ledger.readKey();
+          // The baseline belongs to the Key that spends. Reconciling with another one would read as a Key change.
+          if (facts.gatewayKeyMatches) facts.reconciled = (await ledger.reconcile(ctx.now())).ok;
+        } catch {
+          facts.key = null;
+        }
+      }
+    } else if (provider) {
+      // The attestation is bound to one Key: the one in .env and, while a process is recorded, the one it holds. Mode
+      // can turn live under a running process without a new start.
+      const control = store.getControl(hardCapControlKey(kind));
+      const recorded = readPidRecord(ctx.paths) !== null;
+      facts.hardCapKeyMatches = Boolean(envKey) && control !== null && control === store.key(envKey) && (!recorded || running === control);
+      // A real check of the Key only once its kind may go live: with no project rules recorded, live is refused
+      // anyway, so the Key does not reach the provider for nothing.
+      if (facts.providerRulesRecorded && cfg.acks?.d3 && envKey && kind === 'anthropic') {
+        const checked = await checkAnthropicModels({ fetch: ctx.fetch, baseUrl: provider.baseUrl, key: envKey, models: anthropicModelChecks(cfg) });
+        facts.keyValid = checked.ok === true;
+        facts.keyProblems = checked.problems;
       }
     }
     facts.paidPaused = store.getControl('paid_paused');
@@ -191,9 +230,10 @@ async function cmdModeLive(ctx) {
   const result = livePreconditions(cfg, facts);
   if (!result.ok) {
     ctx.out('拒绝进入 live，以下条件未满足：');
-    const hasKey = Boolean(parseEnvFile(ctx.paths.envFile).CLO_CHAT_API_KEY);
-    for (const code of result.failed) ctx.out(`  ${code}：${liveHint(code, result.failed, hasKey)}`);
-    const hint = hasKey ? '' : renamedKeyHint(renamedEnvNames(ctx.paths.envFile), ['CLO_CHAT_API_KEY']);
+    const keyName = KEY_ENV[activeKindOf(cfg)] ?? KEY_ENV.openrouter;
+    const hasKey = Boolean(parseEnvFile(ctx.paths.envFile)[keyName]);
+    for (const code of result.failed) ctx.out(`  ${code}：${liveHint(code, result.failed, hasKey, keyName, facts)}`);
+    const hint = hasKey ? '' : renamedKeyHint(renamedEnvNames(ctx.paths.envFile), [keyName]);
     if (hint) ctx.out(hint);
     ctx.log('cli_mode_refused', { count: result.failed.length });
     return 1;
@@ -418,19 +458,35 @@ function cmdTargets(ctx, { positional, flags }) {
 
 const ACCEPT_HINT = '想按预留额结清，用 clo budget accept-unsettled。';
 
+// The hard-cap pause sits beside paid_paused, and neither budget command lifts it.
+function hardCapNote(snap) {
+  return snap.hardCapPaused ? `另外，${snap.provider} 接口的硬上限未核实（${snap.hardCapPaused}），付费工作仍暂停；只有重新 clo ack hard-cap 才解除。` : '';
+}
+
 function cmdBudget(ctx, { positional }) {
   const sub = positional[0] ?? 'show';
   const effective = readEffective(ctx);
   return withStore(ctx, (store) => {
     const ledger = createLedger({ store, getEffective: () => effective, fetch: ctx.fetch, getKey: () => null, log: ctx.log, now: ctx.now });
+    // The kind spending under the effective file. Without a Key read the provider column is always 0 and nothing
+    // reconciles: the local estimate is all there is.
+    const snap = ledger.snapshot();
+    const readable = snap.keyReadable;
     if (sub === 'show') {
       const s = ledger.spent(ctx.now());
       const b = effective?.budget;
-      ctx.out(`今日（上海日）有效花费：${usd(s.effectiveMicros)}（本地 ${usd(s.localMicros)}，供应商 ${usd(s.providerMicros)}）`);
+      ctx.out(`今日（上海日）有效花费：${usd(s.effectiveMicros)}（本地 ${usd(s.localMicros)}，供应商 ${readable ? usd(s.providerMicros) : '读不到'}）`);
       ctx.out(`分层：插话 ${usd(s.byTier.interject)}${b ? ` / $${b.interjectUsd}` : ''}，点名 ${usd(s.byTier.named)}${b ? ` / 全部到 $${b.namedUsd} 停` : ''}，@ ${usd(s.byTier.addressed)}${b ? ` / 全部到 $${b.addressedUsd} 停` : ''}`);
       ctx.out(`未结算：${s.unsettled} 笔，${usd(s.unsettledMicros)}。付费暂停：${store.getControl('paid_paused') ?? '否'}`);
-      if (b?.keyDailyLimitUsd !== null && b?.keyDailyLimitUsd !== undefined) ctx.out(`配置写的 Key 日限额：$${b.keyDailyLimitUsd}。要和 OpenRouter 上的限额一样，不一样时 clo mode live 拒绝。`);
-      ctx.out('本地花费是保守估算：未结算的按预留额计。真实数字以 OpenRouter 账单为准。');
+      if (readable) {
+        if (b?.keyDailyLimitUsd !== null && b?.keyDailyLimitUsd !== undefined) ctx.out(`配置写的 Key 日限额：$${b.keyDailyLimitUsd}。要和 OpenRouter 上的限额一样，不一样时 clo mode live 拒绝。`);
+        ctx.out('本地花费是保守估算：未结算的按预留额计。真实数字以 OpenRouter 账单为准。');
+      } else {
+        ctx.out(`对账：不可用（本地估算）。${snap.provider} 接口读不到 Key 的花费和限额，未结算记录不会自动结清，按预留额一直计入，直到 clo budget accept-unsettled。`);
+        ctx.out('本地花费是保守估算，按锁定的价格表计算。真实数字以服务方控制台的账单为准。');
+      }
+      const note = hardCapNote(snap);
+      if (note) ctx.out(note);
       return 0;
     }
     if (sub === 'accept-unsettled') {
@@ -441,18 +497,18 @@ function cmdBudget(ctx, { positional }) {
       if (after === 'residual') note = `但付费工作还没有恢复：现在的暂停原因是 residual。${RESIDUAL_EXIT}`;
       else if (after !== null) note = `但付费工作还没有恢复：现在的暂停原因是 ${after}，这个命令不动它（看 clo status）。`;
       else if (before !== null) note = '崩溃或缺 usage 造成的付费暂停随之解除。';
-      ctx.out(`已按预留额结清 ${n} 笔未结算记录。${note}`);
+      ctx.out(`已按预留额结清 ${n} 笔未结算记录。${note}${hardCapNote(snap)}`);
       return 0;
     }
     if (sub === 'clear-pause') {
       const { cleared, reason } = ledger.clearOwnerPause();
       if (reason === null) {
-        ctx.out('现在没有付费暂停。');
+        ctx.out(`现在没有付费暂停。${hardCapNote(snap)}`);
         return 0;
       }
       if (!cleared) {
         const way = { usage_missing: ACCEPT_HINT, crash_unsettled: ACCEPT_HINT, residual: RESIDUAL_EXIT }[reason] ?? '';
-        ctx.out(`付费暂停 ${reason} 会由 Key 读取或结算解除，这个命令不动它。${way}${residualBehind(reason, store.getControl('residual_over'))}`);
+        ctx.out(`付费暂停 ${reason} 会由${readable ? ' Key 读取或' : ''}结算解除，这个命令不动它。${way}${residualBehind(reason, store.getControl('residual_over'))}`);
         return 1;
       }
       const restart = reason === 'usage_unavailable' ? '需要重启 Gateway 重新加载。' : '';
@@ -464,7 +520,9 @@ function cmdBudget(ctx, { positional }) {
         ctx.out(`已解除 ${reason}，但付费工作还没有恢复：现在的暂停原因是 ${still}。${next}${restart}`);
         return 0;
       }
-      ctx.out(`已解除付费暂停 ${reason}。原因没有消除的话，它会再次暂停。${restart}`);
+      // Without a Key read nothing else lifts it, so the next failure pauses again at once.
+      const again = reason === 'provider_fail' ? '下一次主模型调用失败会立刻再暂停。' : '原因没有消除的话，它会再次暂停。';
+      ctx.out(`已解除付费暂停 ${reason}。${again}${restart}${hardCapNote(snap)}`);
       return 0;
     }
     throw new CliError(USAGE);
@@ -609,12 +667,62 @@ function tryResolve(cfg, catalog) {
   }
 }
 
+// The entries of config.json whose prices come from a hand-entered book, not a catalog: [[name, entry]].
+const bookEntries = (cfg) => Object.entries(cfg.providers ?? {}).filter(([, e]) => e?.kind && e.kind !== 'openrouter');
+
+function showBookLocks(ctx, cfg) {
+  for (const [name, entry] of bookEntries(cfg)) {
+    const lock = readModelsLock(ctx.paths, entry.kind);
+    const active = cfg.activeProvider === name ? '（在用）' : '';
+    if (!lock) {
+      ctx.out(`接口 ${name}（${entry.kind}）${active}：配置 主模型 ${entry.models?.primary}，判定模型 ${entry.models?.decision}；还没锁定价格（clo model lock --provider ${name}）。`);
+      continue;
+    }
+    const fits = lockMatches(cfg, lock, entry.kind, { entryName: name }) ? '' : '（与配置不一致）';
+    ctx.out(`接口 ${name}（${entry.kind}）${active}：锁定 主模型 ${lock.primary.id}，判定模型 ${lock.decision.id}${fits}；价格表价格（每百万 token）：主模型 输入 $${lock.primary.price.inputPerM}，输出 $${lock.primary.price.outputPerM}；判定模型 输入 $${lock.decision.price.inputPerM}，输出 $${lock.decision.price.outputPerM}`);
+  }
+}
+
+// `clo model lock --provider <name>`: the lock of a kind whose API returns no price, from the book in
+// versions.lock.json for exactly the entry's ids. No network. A change of the models in use while QQ is enabled is a
+// model change under protocol §4.2.
+function lockFromBook(ctx, cfg, flags) {
+  const name = need(flags['--provider'], ' --provider <接口>');
+  const entry = cfg.providers && Object.hasOwn(cfg.providers, name) ? cfg.providers[name] : null;
+  if (!entry) throw new CliError(`没有叫 ${name} 的接口。先 clo provider add anthropic，或用 clo provider list 查看。`);
+  if (entry.kind === 'openrouter') throw new CliError('OpenRouter 的模型和价格从目录锁定：clo model refresh。');
+  const kind = entry.kind;
+  const previous = readModelsLock(ctx.paths, kind);
+  const book = readPriceBook(ctx.paths, kind);
+  const confirmPrice = Boolean(flags['--confirm-price']);
+  const qqPlatformNotified = Boolean(flags['--qq-platform-notified']);
+  const r = lockFromPriceBook(entry.models, book, { previous, confirmPrice });
+  if (!r.ok) throw new CliError(`锁定没有通过：\n${r.errors.map((e) => `  ${e.path}: ${e.message}`).join('\n')}`);
+  const { lock } = r;
+  const active = cfg.activeProvider === name;
+  const changed = Boolean(previous) && (previous.primary?.id !== lock.primary.id || previous.decision?.id !== lock.decision.id);
+  if (changed && active && cfg.qq?.enabled && !qqPlatformNotified) {
+    throw new CliError('启用 QQ 时更换在用的模型，要先由你本人向平台报告模型变更（QQ 协议 §4.2），再加 --qq-platform-notified。');
+  }
+  assertApplicable(ctx, cfg, { lock, lockKind: kind });
+  writeModelsLock(ctx, lock, { kind, qqPlatformNotified, changed });
+  const { effective } = apply(ctx, cfg);
+  if (active) budgetWarning(ctx, cfg, effective);
+  ctx.log('cli_model', { model: lock.primary.id, count: changed ? 1 : 0, kind });
+  ctx.out(`已锁定接口 ${name}：主模型 ${lock.primary.id}，判定模型 ${lock.decision.id}。价格取自 versions.lock.json 的价格表（核对日期 ${book.checkedOn}），接口本身不返回价格，费用按这份价格在本地计算。`);
+  if (changed && active && cfg.qq?.enabled) ctx.out('已记录：你确认向平台报告了这次模型变更（QQ 协议 §4.2）。');
+  if (!active) ctx.out(`这个接口现在没在用。切换用 clo provider use ${name} --confirm，那也算一次模型变更。`);
+  return 0;
+}
+
 async function cmdModel(ctx, { positional, flags }) {
   const sub = positional[0] ?? 'show';
   const cfg = readConfig(ctx);
   const lock = readModelsLock(ctx.paths);
+  if (sub === 'lock') return lockFromBook(ctx, cfg, flags);
   if (sub === 'show') {
     ctx.out(`配置：主模型 ${cfg.claudeModel.id}（effort ${cfg.claudeModel.effort}，maxTokens ${cfg.claudeModel.maxTokens}），判定模型 ${cfg.decisionModel.id}（effort ${cfg.decisionModel.effort}，maxTokens ${cfg.decisionModel.maxTokens}）`);
+    showBookLocks(ctx, cfg);
     if (!lock) {
       ctx.out('锁定：还没有。运行 clo model refresh。没有锁定时不能进入 live。');
       return 0;
@@ -672,7 +780,7 @@ function filedCloseCode(ctx) {
   }
 }
 
-function cmdAck(ctx, { positional }) {
+function cmdAck(ctx, { positional, flags }) {
   const sub = positional[0];
   if (sub === 'terminal') {
     const code = withStore(ctx, (store) => {
@@ -708,7 +816,228 @@ function cmdAck(ctx, { positional }) {
     ctx.out('已记录 D3。这只是记录你的决定，不代表 QQ 协议 §4.2 的问题已经解决。');
     return 0;
   }
+  if (sub === 'hard-cap') return ackHardCap(ctx, cfg, positional, flags);
   throw new CliError(USAGE);
+}
+
+// The registry entry of providers[name], active or not: what that entry would be if it were the one in use.
+function entryProvider(cfg, name) {
+  if (!cfg.providers || !Object.hasOwn(cfg.providers, name)) return null;
+  return providerOfConfig({ ...cfg, runtime: 'own', activeProvider: name });
+}
+
+const HARD_CAP_REFUSALS = {
+  not_attested: (name) => `${name} 接口的花费上限是 Key 自己的每日限额，由 clo mode live 读取核对，不用声明。`,
+  live: () => 'live 下不能声明硬上限：之后的 clo mode live 要重新检查整套声明。先 clo mode dry-run。',
+  ack: () => '硬上限声明只接受这一种：专用、非默认工作区的月度花费上限（--kind workspace_monthly），并且是关闭了自动充值的预付费额度（--prepaid-no-reload），--usd 写那个月度上限，必须是正数。',
+};
+
+// `clo ack hard-cap <name>`: the owner's word for the provider's own stop on a kind whose Key cannot be read (decision
+// D2), bound to the fingerprint of the Key in .env now. Only in dry-run with no process: a running process holds the Key
+// it started with, which may not be this one. The Key itself is never printed.
+function ackHardCap(ctx, cfg, positional, flags) {
+  const name = need(positional[1], '接口名称');
+  const provider = entryProvider(cfg, name);
+  if (!provider) throw new CliError(`没有叫 ${name} 的接口。用 clo provider list 查看。`);
+  const usdText = typeof flags['--usd'] === 'string' ? flags['--usd'].trim() : '';
+  const ack = {
+    kind: typeof flags['--kind'] === 'string' ? flags['--kind'] : null,
+    usd: usdText === '' ? Number.NaN : Number(usdText),
+    prepaidNoReload: flags['--prepaid-no-reload'] === true,
+  };
+  const mode = cfg.mode === 'live' || readEffective(ctx)?.mode === 'live' ? 'live' : cfg.mode;
+  const proc = processState(ctx);
+  const refusal = hardCapAckRefusal({ provider, ack, mode, processRunning: proc.running });
+  if (refusal === 'process') throw new CliError(`${proc.why}。运行中的进程用的是它启动时的 Key，不一定是 .env 里现在这个，所以这时不能声明。先 clo stop。`);
+  if (refusal) throw new CliError(`${HARD_CAP_REFUSALS[refusal](name)}${refusal === 'ack' ? `（${hardCapAckProblems(ack).join('、')}）` : ''}`);
+  const key = parseEnvFile(ctx.paths.envFile, [provider.keyEnv])[provider.keyEnv];
+  if (!key) throw new CliError(`.env 里没有 ${provider.keyEnv}。声明要绑定到这个 Key，先由你本人填好。`);
+  if (ack.usd > 31 * cfg.budget.dailyUsd && !flags['--confirm']) {
+    throw new CliError(`$${ack.usd} 超过本地日预算的 31 倍（$${31 * cfg.budget.dailyUsd}）。上限越高，出错的一天可能花得越多。确实要这么高，加 --confirm。`);
+  }
+  const next = structuredClone(cfg);
+  next.acks.hardCap = { ...next.acks.hardCap, [name]: { kind: ack.kind, usd: ack.usd, prepaidNoReload: true, at: new Date(ctx.now()).toISOString() } };
+  saveAndApply(ctx, next);
+  // After the config: a binding with no ack, or an ack with no binding, both still refuse live.
+  withStore(ctx, (store) => createLedger({ store, getEffective: () => readEffective(ctx), fetch: ctx.fetch, getKey: () => null, log: ctx.log, now: ctx.now }).attestHardCap(provider.kind, key, 'cli'));
+  ctx.log('cli_ack_hard_cap', { kind: provider.kind });
+  ctx.out(`已记录 ${name} 的硬上限声明：专用工作区每月花费上限 $${ack.usd}，预付费额度，自动充值已关闭。声明绑定 .env 里现在这个 ${provider.keyEnv}；换了 Key，clo start 和 clo mode live 都会拒绝，要停下进程重新声明。`);
+  ctx.out(`这个上限只靠你本人的声明，程序读不到，也核实不了。出错的一天里，最多可能花到 $${ack.usd}。`);
+  return 0;
+}
+
+// --- provider ---
+
+// Who receives the text a reply needs, by kind: what the group notice has to name.
+const RECIPIENTS = { openrouter: 'OpenRouter 及实际模型提供方', anthropic: 'Anthropic' };
+
+// A process recorded and not proved gone, or a bot holding the account with no record: { running, why }.
+function processState(ctx) {
+  const record = readPidRecord(ctx.paths);
+  if (record) {
+    const { state } = inspectGateway(ctx.paths, ctx.env);
+    if (!['gone', 'mismatch', 'none'].includes(state)) {
+      return { running: true, why: `${RUNTIME_LABEL[recordRuntime(record)]}（进程 ${record.pid}）${state === 'running' ? '还在运行' : '可能还在运行'}` };
+    }
+  }
+  const untracked = untrackedBot(ctx);
+  if (untracked) {
+    return { running: true, why: untracked.pid === null ? 'clo.db 里的连接租约读不出来，可能有可洛进程还连着这个 AppID' : `可洛进程（进程 ${untracked.pid}）还连着这个 AppID，PID 文件里没有它` };
+  }
+  return { running: false, why: '' };
+}
+
+function lockState(ctx, cfg, name, kind) {
+  const lock = readModelsLock(ctx.paths, kind);
+  return usableLock(cfg, lock, kind, kind === 'openrouter' ? undefined : { entryName: name });
+}
+
+function hardCapState(ctx, cfg, name, provider) {
+  if (provider.caps.hardCap !== 'attested') return 'Key 日限额（clo mode live 读取核对）';
+  const ack = cfg.acks?.hardCap?.[name];
+  if (hardCapAckProblems(ack).length) return '硬上限未声明（clo ack hard-cap）';
+  return `硬上限已声明：每月 $${ack.usd}`;
+}
+
+const SWITCH_REFUSALS = {
+  paid_paused: '付费暂停还在。暂停是旧接口留下的，换接口不会让它消失；先按 clo status 的提示解除。',
+  decision_breaker: '判定熔断还在。先等它恢复，或排查旧接口的问题。',
+  reservations: '还有预留中或未结算的记录。它们属于旧接口，先结清（clo budget accept-unsettled），或等它们结算。',
+};
+
+// Pauses that only a clean read of the old kind's Key lifts, and that clo budget clear-pause leaves alone. When that
+// Key can no longer be read (revoked, account closed), nothing else lifts them: switching to another kind is then the
+// way out, so the switch lifts them along with the old Key's read state. Every other pause still refuses the switch.
+const SWITCH_LIFTS = new Set(['key_read_failed', 'residual', 'openrouter_key_limit', 'provider_fail']);
+
+class SwitchRefused extends Error {
+  constructor(reason) {
+    super(reason);
+    this.reason = reason;
+  }
+}
+
+// One transaction: a lifted pause comes back if the reset then refuses. The new provider is recorded in the same one,
+// so apply accepts the config that names it, and only this command can make that record.
+function resetForSwitch(ctx, cfg, kind, record) {
+  const old = providerOfConfig(cfg);
+  const leavesReadableKey = old?.caps?.keyReadable === true && old.kind !== kind;
+  try {
+    return withStore(ctx, (store) => store.tx(() => {
+      const paused = store.getControl('paid_paused');
+      const lifted = leavesReadableKey && SWITCH_LIFTS.has(paused) ? paused : null;
+      if (lifted) store.delControl('paid_paused');
+      const ledger = createLedger({ store, getEffective: () => readEffective(ctx), fetch: ctx.fetch, getKey: () => null, log: ctx.log, now: ctx.now });
+      const out = ledger.resetForProviderSwitch();
+      if (!out.ok) throw new SwitchRefused(out.reason);
+      store.setControl(ACTIVE_PROVIDER_CONTROL, record, 'cli');
+      return { ok: true, lifted };
+    }));
+  } catch (e) {
+    if (e instanceof SwitchRefused) return { ok: false, reason: e.reason };
+    throw e;
+  }
+}
+
+function cmdProvider(ctx, { positional, flags }) {
+  const sub = positional[0] ?? 'show';
+  const cfg = readConfig(ctx);
+  assertValid(ctx, cfg);
+  const active = providerOfConfig(cfg);
+  if (sub === 'list') {
+    if (!cfg.providers) {
+      ctx.out('openrouter\topenrouter\t在用（默认，没有 providers 配置）');
+      return 0;
+    }
+    for (const [name, e] of Object.entries(cfg.providers)) {
+      const p = entryProvider(cfg, name);
+      ctx.out(`${name}\t${e.kind}\t${cfg.activeProvider === name ? '在用' : '未用'}\t价格${lockState(ctx, cfg, name, e.kind) ? '已锁定' : '未锁定'}\t${p.caps.keyReadable ? 'Key 可读' : 'Key 读不到（对账不可用）'}\t${hardCapState(ctx, cfg, name, p)}`);
+    }
+    return 0;
+  }
+  if (sub === 'show') {
+    if (!active) throw new CliError('config.json 没有指定能用的模型接口。');
+    const filled = Boolean(parseEnvFile(ctx.paths.envFile, [active.keyEnv])[active.keyEnv]);
+    ctx.out(`在用的模型接口：${active.name}（${active.kind}）${active.implicit ? '，默认' : ''}`);
+    ctx.out(`Key：.env 的 ${active.keyEnv}，${filled ? '已填' : '未填'}。回复所需的消息发给 ${RECIPIENTS[active.kind]}。`);
+    ctx.out(`价格：${lockState(ctx, cfg, active.name, active.kind) ? '已锁定' : '未锁定'}。对账：${active.caps.keyReadable ? '读 Key 核对' : '不可用（本地估算）'}。上限：${hardCapState(ctx, cfg, active.name, active)}`);
+    if (active.caps.hardCap === 'attested' && existsSync(ctx.paths.db)) {
+      const bound = withStore(ctx, (store) => store.getControl(hardCapControlKey(active.kind)));
+      const key = parseEnvFile(ctx.paths.envFile, [active.keyEnv])[active.keyEnv];
+      const same = Boolean(key) && withStore(ctx, (store) => bound !== null && bound === store.key(key));
+      ctx.out(`硬上限声明绑定的 Key：${bound === null ? '没有' : (same ? '就是 .env 里现在这个' : '不是 .env 里现在这个，要重新声明')}`);
+    }
+    if (!providerRulesRecorded(active.kind)) ctx.out('这个接口进入 live 的项目规则还没有记录（CLAUDE.md §8.2、DECISIONS.md），现在只能 dry-run。');
+    return 0;
+  }
+  if (sub === 'add') {
+    const name = need(positional[1], '接口名称');
+    if (name !== 'anthropic') throw new CliError('这一版只能加 anthropic。OpenRouter 不用加，没有 providers 配置时就是它。');
+    if (cfg.providers && Object.hasOwn(cfg.providers, name)) throw new CliError(`接口 ${name} 已经加过了。`);
+    const next = structuredClone(cfg);
+    if (!next.providers) {
+      // The implicit OpenRouter entry becomes explicit and stays the one in use.
+      next.providers = { openrouter: { kind: 'openrouter', keyEnv: KEY_ENV.openrouter } };
+      next.activeProvider = 'openrouter';
+      next.acks = { ...next.acks, provider: { name: 'openrouter', at: new Date(ctx.now()).toISOString() } };
+    }
+    next.providers[name] = { kind: 'anthropic', keyEnv: KEY_ENV.anthropic, models: { primary: 'claude-opus-5-5', decision: 'claude-haiku-5-5' } };
+    saveAndApply(ctx, next);
+    ctx.out(`已加入接口 ${name}（主模型 claude-opus-5-5，判定模型 claude-haiku-5-5），现在没在用，在用的还是 ${next.activeProvider}。`);
+    ctx.out(`要用它：.env 里填 ${KEY_ENV.anthropic}，clo model lock --provider ${name}，再 clo provider use ${name} --confirm。`);
+    return 0;
+  }
+  if (sub === 'use') return useProvider(ctx, cfg, need(positional[1], '接口名称'), flags);
+  throw new CliError(USAGE);
+}
+
+// `clo provider use <name> --confirm`: a model change under protocol §4.2 and a change of who receives the text
+// (decision D8). Only with nothing running and nothing carried over: the old kind's pauses, breaker and open rows stay
+// with it, so the switch is refused while any is there.
+function useProvider(ctx, cfg, name, flags) {
+  if (!cfg.providers || !Object.hasOwn(cfg.providers, name)) throw new CliError(`没有叫 ${name} 的接口。先 clo provider add anthropic，或用 clo provider list 查看。`);
+  const kind = cfg.providers[name].kind;
+  if (cfg.activeProvider === name) {
+    ctx.out(`已经在用 ${name}。`);
+    return 0;
+  }
+  if (!flags['--confirm']) {
+    throw new CliError(`换接口算一次模型变更：回复所需的消息改发给 ${RECIPIENTS[kind] ?? kind}。每个群的“已告知”和 D3 记录都会清除，要重新告知、重新记录后才能 live。确认后加 --confirm。`);
+  }
+  if (cfg.mode === 'live' || readEffective(ctx)?.mode === 'live') throw new CliError('live 下不能换接口。先 clo mode dry-run，再 clo stop。');
+  const proc = processState(ctx);
+  if (proc.running) throw new CliError(`${proc.why}。进程运行时不能换接口，先 clo stop。`);
+  if (runtimeOf(cfg) !== 'own' && kind !== 'openrouter') throw new CliError('OpenClaw 运行时只能用 OpenRouter。要用这个接口，先把 runtime 改成 own。');
+  if (!lockState(ctx, cfg, name, kind)) {
+    throw new CliError(kind === 'openrouter' ? '没有和配置一致的 OpenRouter 模型锁定。先 clo model refresh。' : `${name} 还没有和配置一致的价格锁定。先 clo model lock --provider ${name}。`);
+  }
+  const qqPlatformNotified = Boolean(flags['--qq-platform-notified']);
+  if (cfg.qq?.enabled && !qqPlatformNotified) {
+    throw new CliError('启用 QQ 时换接口算一次模型变更：先由你本人向平台报告模型信息的变更（QQ 协议 §4.2），再加 --qq-platform-notified。');
+  }
+  const next = structuredClone(cfg);
+  next.activeProvider = name;
+  next.acks = { ...next.acks, provider: { name, at: new Date(ctx.now()).toISOString() }, d3: '' };
+  for (const g of Object.values(next.qq?.groups ?? {})) g.noticeGiven = false;
+  // Everything that could refuse comes before the store and the files change.
+  assertApplicable(ctx, next, { providerSwitch: true });
+  const reset = resetForSwitch(ctx, cfg, kind, providerRecord(providerOfConfig(next)));
+  if (!reset.ok) throw new CliError(`没有换接口：${SWITCH_REFUSALS[reset.reason] ?? reset.reason}`);
+  if (reset.lifted) ctx.log('paid_resumed', { reason: reset.lifted, source: 'provider_switch' });
+  writeConfig(ctx, next);
+  printWarnings(ctx, next);
+  apply(ctx, next);
+  // The models now in use changed: the lock history records it like any other model change.
+  writeModelsLock(ctx, readModelsLock(ctx.paths, kind), { kind, qqPlatformNotified, changed: true });
+  ctx.log('cli_provider_use', { kind });
+  ctx.out(`已换到接口 ${name}（${kind}）。`);
+  if (reset.lifted) ctx.out(`旧接口的付费暂停 ${reset.lifted} 只有读到旧 Key 才能解除，换接口时已一并解除。`);
+  ctx.out(`回复所需的消息现在发给 ${RECIPIENTS[kind] ?? kind}。已清除每个群的“已告知”和 D3 记录：请你本人重新告知各群（告知草稿要写对接收方），再 clo group notice-done <群>，并重新 clo ack d3 <决定>。`);
+  if (cfg.qq?.enabled) ctx.out('已记录：你确认向平台报告了这次模型变更（QQ 协议 §4.2）。');
+  const p = entryProvider(next, name);
+  if (p.caps.keyReadable !== true) ctx.out(`这个接口读不到 Key：对账不可用，只有本地估算。进入 live 前要 clo ack hard-cap ${name}。`);
+  if (!providerRulesRecorded(kind)) ctx.out('这个接口进入 live 的项目规则还没有记录（CLAUDE.md §8.2、DECISIONS.md），记录之前 clo mode live 会拒绝。');
+  return 0;
 }
 
 // --- doctor, start, stop ---
@@ -726,6 +1055,24 @@ const CMDLINE_HINT = '读不到它的命令行，它很可能是用更高权限�
 function untrackedBot(ctx) {
   if (!existsSync(ctx.paths.db)) return null;
   return withStore(ctx, (store) => liveBotLease({ store, now: ctx.now }));
+}
+
+// The start check the bot also runs (contract section 10): in live mode, on a kind whose spend rests on an attested
+// cap, the ack must meet decision D2 and be bound to the Key the child will get, which is the one in .env; and on every
+// kind the project's rules must allow live. Outside live it passes, and no database is opened for it.
+function assertStartAllowed(ctx, cfg, secrets) {
+  const provider = providerOfConfig(cfg);
+  const live = cfg.mode === 'live';
+  const kind = provider?.kind;
+  const envKey = kind ? secrets[KEY_ENV[kind]] : undefined;
+  const bound = live && kind ? withStore(ctx, (store) => ({ control: store.getControl(hardCapControlKey(kind)), keyFp: envKey ? store.key(envKey) : null })) : { control: null, keyFp: null };
+  const check = liveStartCheck({ provider, mode: cfg.mode, ack: provider ? (cfg.acks?.hardCap?.[provider.name] ?? null) : null, ...bound });
+  if (check.ok) return;
+  if (check.code === 'provider') throw new CliError('config.json 没有指定能用的模型接口，不启动。');
+  if (check.code === 'hard_cap') {
+    throw new CliError(`live 下 ${provider.name} 接口的硬上限声明不完整，或绑定的不是 .env 里现在这个 ${provider.keyEnv}。不启动。换过 Key 的话，先 clo mode dry-run，再 clo ack hard-cap ${provider.name} 重新声明。`);
+  }
+  throw new CliError(`${provider.name}（${provider.kind}）接口进入 live 的项目规则还没有记录（CLAUDE.md §8.2、DECISIONS.md），live 下不启动。先 clo mode dry-run。`);
 }
 
 async function startLocked(ctx) {
@@ -757,6 +1104,7 @@ async function startLocked(ctx) {
 
   const secrets = parseEnvFile(ctx.paths.envFile);
   requireSecrets(cfg, secrets, { renamed: renamedEnvNames(ctx.paths.envFile) });
+  assertStartAllowed(ctx, cfg, secrets);
   printWarnings(ctx, cfg);
   apply(ctx, cfg);
   const report = runDoctor(ctx, { level: FULL_LEVEL });
@@ -845,6 +1193,7 @@ const COMMANDS = {
   policy: cmdPolicy,
   model: cmdModel,
   ack: cmdAck,
+  provider: cmdProvider,
   doctor: cmdDoctor,
   start: cmdStart,
   stop: cmdStop,

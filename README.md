@@ -16,6 +16,8 @@
 
 **过渡期：两套运行时。** 用户已决定去掉 OpenClaw。项目自己的运行时已经写好，放在配置项 `runtime: "own"` 后面，**默认仍是 `openclaw`，现在跑的也是它，上面这些真实记录都是在 OpenClaw 上得到的**。新运行时在真实 QQ 上的验收一项都没有做，只有离线测试（mock QQ、mock 模型）和一次不接 QQ 的付费探测（Q5，真实 OpenRouter，两个回合）。这份 README 写的都是 openclaw 路线，另有说明的除外。怎么切换、怎么回退、改了什么，见 [docs/own-runtime.md](docs/own-runtime.md)。
 
+**模型接口（只在新运行时）：** 新运行时的模型调用可以走 OpenRouter（默认），也可以用 `clo provider use` 换成直连 Anthropic API。直连 Anthropic 这条路只在离线测试（mock QQ、mock Anthropic）里跑过，**真实 Anthropic 上一次都没有跑过**，Anthropic 的付费探测也没有跑过。怎么配、怎么换、钱怎么管，见下面“模型接口”。
+
 ## 你需要准备什么
 
 - **Windows x64 和 PowerShell 7。** `setup.ps1` 用到了 Windows PowerShell 5.1 没有的参数。项目自带私有 Node，不用系统 Node，也不改 PATH。
@@ -23,8 +25,9 @@
 - **你自己注册的 QQ 机器人。** 到 [q.qq.com](https://q.qq.com) 用单独的 QQ 号创建，这个项目不提供账号。个人认证、模型信息这些由平台要求，如实填写。注册后拿到 AppID 和 AppSecret。IP 白名单留空。换号不保证隔离风险。
 - **一个你能管理的小测试群。** 不要先用真实的群。群主要愿意打开下面说的权限。
 - **一个 OpenRouter Key，带每日限额。** 给这个项目单独建一个 Key，在 OpenRouter 上设每日限额（`limit_reset` 为 daily）。没有每日限额不能进入 live。
+- **（可选，只在新运行时）一个 Anthropic Key。** 放在专用的、非默认的工作区里，工作区设很小的月度花费上限（约 $20），账户用预付费额度并关闭自动充值。Anthropic 没有按 Key 的每日限额，程序也读不到这些设置，进 live 前要你用 `clo ack hard-cap` 声明，见“模型接口”。
 
-**目前只适用于 OpenRouter。** 代码依赖它的这几样东西：
+**openclaw 路线目前只适用于 OpenRouter。** 代码依赖它的这几样东西：
 
 | 依赖 | 用途 |
 |---|---|
@@ -34,6 +37,8 @@
 | 错误形状 | 分辨 Key 到限额、余额不足、其他失败 |
 
 其他 OpenAI 兼容接口未来可能加入，但现在不能用：live 拒绝任何地址覆盖。通用接口没有账户侧限额，也没法对账，只剩本地估算管钱，所以这会是一个独立的功能，不是改个地址的事。模型也只接受目录里 `anthropic/` 开头的具体型号。
+
+新运行时上另外可以直连 Anthropic。那里上面这四样都没有：费用按手抄的价格表在本地算，没有 Key 接口，也不对账，硬上限是你声明的工作区月度上限。见“模型接口”。
 
 ## 构建和运行
 
@@ -65,6 +70,8 @@ if (-not (Test-Path config.json)) { Copy-Item config.example.json config.json }
 | `CLO_CHAT_API_KEY` | 只有 live 要。这是 OpenRouter Key，启动时映射成宿主要的 `OPENROUTER_API_KEY` |
 | `CLO_SEARCH_API_KEY` | 可选，给还没实现的搜索预留，现在没有代码读它 |
 | `CLO_TEST_API_KEY` | 只有付费探测要（own 运行时的 Q5）。单独建一个 OpenRouter Key，日限额不高于这次探测的上限。机器人不用它，`clo start` 也不把它交给 Gateway 或机器人进程 |
+| `CLO_ANTHROPIC_API_KEY` | 只有新运行时、在用的接口是 Anthropic 时要：`clo ack hard-cap` 和 live 都要它。放在专用的非默认工作区里。`clo start` 只把它交给可洛进程，Gateway 拿不到；用 Anthropic 时可洛进程也拿不到 OpenRouter 的 Key |
+| `CLO_TEST_ANTHROPIC_API_KEY` | 只有 Anthropic 的付费探测（`q5-anthropic.ps1`）要，它还没有跑过。放在另一个专用的探测工作区里。机器人不用它，`clo start` 也不把它交给任何进程 |
 
 ### 3. 改 `config.json`
 
@@ -127,7 +134,7 @@ dry-run 不调用模型，也不发消息。
 .\scripts\clo.ps1 model refresh                  # 读目录，解析并锁定型号。不调用模型
 ```
 
-仓库里的 `versions.lock.json` 已经带一份锁定。目录上的型号变了时，`refresh` 会要求你加 `--qq-platform-notified`，涨价时要加 `--confirm-price`，见“模型”。
+仓库里的 `versions.lock.json` 已经带一份锁定。目录上的型号变了时，`refresh` 会要求你加 `--qq-platform-notified`，涨价时要加 `--confirm-price`，见“模型”。新运行时要直连 Anthropic 的话，见“模型接口”。
 
 ### 8. 确认三件事，进入 live
 
@@ -207,6 +214,36 @@ live 之后手改 `config.json` 再 `clo apply`：新群没告知、或确认项
 - 启用 QQ 时，**任何模型变更**都要加 `--qq-platform-notified`，表示你已向平台报告（§4.2）。
 - 价格超过每百万 token 输出 $30，或同一型号涨价，要加 `--confirm-price`。
 
+### 模型接口（只在新运行时）
+
+`runtime: "own"` 时，模型调用可以走 OpenRouter 或 Anthropic，同一时间只用一个。没有 `providers` 配置就是 OpenRouter，和以前一样。不会自动切换，也不会在失败后换另一个接口。openclaw 运行时只能用 OpenRouter，`clo provider use` 会拒绝换。**直连 Anthropic 只在离线测试里跑过，真实 Anthropic 上一次都没有跑过。**
+
+换到 Anthropic：
+
+```powershell
+.\scripts\clo.ps1 mode dry-run                    # 换接口和声明硬上限，都要在 dry-run、进程停着时做
+.\scripts\stop.ps1
+.\scripts\clo.ps1 provider add anthropic          # 只加配置，在用的还是 OpenRouter
+# 在 .env 里填 CLO_ANTHROPIC_API_KEY
+.\scripts\clo.ps1 model lock --provider anthropic --confirm-price     # 从 versions.lock.json 的价格表锁定，不联网
+.\scripts\clo.ps1 provider use anthropic --confirm --qq-platform-notified
+.\scripts\clo.ps1 ack hard-cap anthropic --kind workspace_monthly --usd 20 --prepaid-no-reload
+# 按新的接收方重新告知各群，再 clo group notice-done <群>，再 clo ack d3 "<你的决定>"
+.\scripts\start.ps1
+.\scripts\clo.ps1 provider show                   # 在用的接口、价格锁定、对账、上限和声明绑定的 Key
+.\scripts\clo.ps1 mode live
+```
+
+- **换接口算一次模型变更。** 启用 QQ 时要加 `--qq-platform-notified`，表示你已向平台报告（QQ 协议 §4.2）。回复所需的消息换了接收方，所以它清除每个群的“已告知”和 D3 记录，你重新告知、重新记录之后 live 才会通过。告知草稿里“消息发给谁”那一句要按在用的接口填。
+- **只能用 `clo provider use` 换：** 它在 `clo.db` 里记下换到的接口。手改 `config.json` 的 `activeProvider` 和 `acks.provider`，`clo apply`、`clo start` 和 `clo mode live` 都拒绝，dry-run 和 live 下一样，因为那样会跳过上一条的报告和清除。改回去，再用 `clo provider use` 换。只用模拟环境验证过
+- **什么时候拒绝换：** live 下；进程在跑，包括没有 PID 记录的；目标接口还没有锁定价格；启用 QQ 却没加 `--qq-platform-notified`；有判定熔断；还有预留中或未结算的记录；有付费暂停，下一条那四种除外。换回 OpenRouter 用 `clo provider use openrouter --confirm`，不需要硬上限声明。
+- **从 OpenRouter 换走时一并解除的付费暂停：** `key_read_failed`、`residual`、`openrouter_key_limit`、`provider_fail` 这四种只有再读到 OpenRouter 的 Key 才会解除，`clo budget clear-pause` 也不管它们；Key 被作废、账户关了时，换接口是唯一的出路。所以从 OpenRouter 换到别的接口时，它们会被删掉，残差计数、余额探测、限额记录、连败计数和读 Key 的状态也一起清掉，换完只打印一行“换接口时已一并解除”，日志记一条 `paid_resumed`。**`residual` 说明 OpenRouter 的 Key 上有本机账本解释不了的花费，可能是 Key 泄露了；换走不会替你查。换之前先去 OpenRouter 上看这个 Key 的用量，有疑问就作废它。** `status` 在 `residual` 那一行说“没有命令能提前解除”，从 OpenRouter 换走是这句话的例外。其他付费暂停（比如 `usage_missing`、`crash_unsettled`）照样拒绝换。只用模拟环境验证过
+- **硬上限声明（`clo ack hard-cap`）：** Anthropic 的 Key 读不到花费和限额，也没有按 Key 的每日限额，能拦住请求的只有工作区的月度花费上限和预付费余额。所以只接受这一种：专用的非默认工作区的月度上限（`--kind workspace_monthly`，`--usd` 写那个上限），加上关闭了自动充值的预付费额度（`--prepaid-no-reload`）。高于本地日预算的 31 倍时还要加 `--confirm`。声明绑定 `.env` 里当时那个 Key：之后换了 Key，`clo start` 拒绝启动，可洛进程启动时暂停付费（`status` 里的“硬上限未核实”），只有停下进程重新声明才解除。**这个上限只靠你的话，程序核实不了。出错的一天最多可能花到这个月度上限**，比 OpenRouter 的每日限额弱。
+- **live 多查三项：** `hard_cap`（声明完整、能放下一次必答预留、绑定的就是现在的 Key）；`key_valid`（D3 记录之后，用这个 Key 读一次两个型号的信息）；`provider_rules`（这条接口进 live 的规则已经记在 `CLAUDE.md` 和 `DECISIONS.md`）。OpenRouter 的 Key 限额和对账两项这时不查。
+- **型号和价格：** 只接受具体型号，现在是 `claude-opus-5-5` 和 `claude-haiku-5-5`。接口不返回价格，价格是手抄进 `versions.lock.json` 的价格表，第一次锁定和价格表涨价时都要 `--confirm-price`。
+- **`status` 显示什么：** “模型接口：anthropic（anthropic）”；“对账：不可用（本地估算）”；声明的核对没过时还有一行“硬上限未核实”。
+- **不对账：** 花费只按价格表在本地算，真实数字以 Anthropic 控制台的账单为准，要你自己对照。没有结算的记录（HTTP 错误、中止、缺用量）一直按预留额计入，直到你运行 `clo budget accept-unsettled`。付费暂停（`provider_fail`、`anthropic_*`）用 `clo budget clear-pause` 解除，原因还在就立刻再暂停。有未结算记录时，先 `accept-unsettled` 再 `clear-pause`。
+
 ### 在线条件和重启
 
 - **没有自启动。** 电脑关机、睡眠、断网时，可洛不工作。开机后要自己运行 `start.ps1`。项目不会改电源设置。
@@ -236,6 +273,8 @@ live 之后手改 `config.json` 再 `clo apply`：新群没告知、或确认项
 
 Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度时自动解除；本地预算到上海时间零点重置。详细情况见“排错”。
 
+**直连 Anthropic 时**（只在新运行时，真实 Anthropic 上没有跑过）：上表的 Key 日限额换成你声明的工作区月度上限，出错的一天最多可能花到它。本地预算和分层上限照旧，预留按价格表算。读不到 Key，所以不对账，未结算记录也不会自动按 0 结清。响应显示走了美国区（价格 1.1 倍）或快速模式，或者这两项读不到时，按更贵的价格算，告警 `price_unexpected` 并暂停付费（`anthropic_price_unexpected`）。见“模型接口”。
+
 - 回复前按最坏情况预留：按当前锁定价格，一次必答回合 $0.312（按两次调用算），一次插话 $0.156，一次判定 $0.00115（按最大输入 10500 token 算出来的，没有跑过；真实测到的一次约 $0.00017）。所以额度比实际花费更早用完。
 - **这个预留不是回合费用的上限。** 在 mock 上，调用失败时宿主一个回合最多发过 10 次请求，上下文过长时还会多发压缩请求，压缩的费用不进本机账本。正式运行没有回合内的请求上限。真正的硬上限是 Key 的每日限额。
 - 本地数字是估算，真实费用以 OpenRouter 账单为准。对账差额过大或读不到 Key 时，付费自动暂停。
@@ -247,7 +286,7 @@ Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度�
 
 ## 数据和隐私
 
-**发给第三方的：** 准入群里的消息，部分会发给 OpenRouter 和模型提供方。判定用 Haiku，回答用 Opus，服务方不一定是 Anthropic 本身。普通消息也可能要过一次判定，并带上近期发言；回答时带上近期群消息；回答过的内容之后还会再发给模型。发言人用代号，开了显示名开关的群，回答请求还带显示名。Gateway 每次启动都会尝试连接 `clawhub.ai`（OpenClaw 的插件目录），没有找到开关。
+**发给第三方的：** 准入群里的消息，部分会发给 OpenRouter 和模型提供方。判定用 Haiku，回答用 Opus，服务方不一定是 Anthropic 本身。普通消息也可能要过一次判定，并带上近期发言；回答时带上近期群消息；回答过的内容之后还会再发给模型。发言人用代号，开了显示名开关的群，回答请求还带显示名。Gateway 每次启动都会尝试连接 `clawhub.ai`（OpenClaw 的插件目录），没有找到开关。新运行时直连 Anthropic 时，这些消息直接发给 Anthropic，不经过 OpenRouter，判定和回答都一样。
 
 **告知群友：** 草稿在 [persona/group-notice.zh.md](persona/group-notice.zh.md)，机器人不会发。
 
@@ -255,7 +294,9 @@ Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度�
 
 | 层 | 内容 | 保留 |
 |---|---|---|
-| `.runtime/clo/clo.db` | 事件、发送、预算记录。ID 是 HMAC，不存正文和显示名。危险路线能从这里推断出来，见下面“危险路线留下什么” | 事件和发送 14 天，预算 90 天，计数到期就清。告警确认后 14 天清，没确认的一直留着 |
+| `.runtime/clo/clo.db` | 事件、发送、预算记录（带接口类型）。ID 是 HMAC，不存正文和显示名。危险路线能从这里推断出来，见下面“危险路线留下什么” | 事件和发送 14 天，预算 90 天，计数到期就清。告警确认后 14 天清，没确认的一直留着 |
+| `.runtime/clo/clo.db.v1.bak` | 这一版第一次打开旧格式（第 1 版）的 `clo.db` 时，升级之前复制的整份库，内容和 `clo.db` 一样，没有正文和显示名 | 升级后满 `retention.eventDays` 天（默认 14 天），由运行中的 Gateway 或可洛进程的定期清理删除。进程不运行时一直留着。按“排错”回退到旧版本时它被移成 `clo.db`，移出去的第 2 版文件旧版本不清理，由你自己删除 |
+| `.runtime/clo/clo.db.v1.bak.<进程号>.tmp` | 升级中途被杀时留下的临时副本，内容同上 | 一小时后由同样的清理删除 |
 | ID 采集表 | 原始群 ID 和成员 ID，无正文 | `targets clear` 或进入 live 时清空 |
 | 内存上下文 | 近期群消息，用化名。开了显示名开关的群，每行还带清洗后的显示名，随这一行过期和清除，也随 `/new`、`/reset` 清除；开关关掉后，这个群下一条任何消息（命令、过期、暂停时的消息也算）或每小时的清理时丢掉；群从名单移除后也一样。关了又马上打开，中间这个群没有任何消息，也没赶上每小时的清理，旧名字还会留着，直到这些行过期。一个成员的所有行共用最新的名字：最新的名字被拒绝时，他之前的行也退回代号 | 最多 40 条或 24 小时，重启即丢 |
 | `.runtime/logs/events.jsonl` | 事件 ID、判定、耗时、费用、错误分类，无正文和显示名。显示名被拒绝或缺失时只记 `display_name` 和一个不分类的原因，不记值。引用回复只记匹配结果、散列、长度和格式前缀，不记原值 | 不自动清理 |
@@ -263,6 +304,7 @@ Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度�
 | `.runtime/temp/openclaw/*.log` | 宿主文件日志。`silent` 时不写 | 由宿主管理 |
 | OpenClaw 会话库（`.runtime/state/agents/main/agent/openclaw-agent.sqlite`） | **被派发的回合正文在这里，模型的思考文字、每回合的提示词副本和全文搜索索引也在这里，模型服务方的错误原文也在这里，包括审核返回的 `flagged_input`** | 由宿主管理，这一版**没有**删除接口，`/new` 也不会删除旧内容（Q6 核对过） |
 | OpenRouter、模型提供方 | 收到的消息。开了显示名开关的群，主模型（Opus）的回答请求还带当前发言人和近期发言人的显示名；判定模型（Haiku）只收代号 | 以它们的政策为准，本项目控制不了 |
+| Anthropic（新运行时直连时） | 收到的消息，和上一行一样，只是不经过 OpenRouter | 以 Anthropic 的政策为准，本项目控制不了 |
 
 **换到自己的运行时，这张表还不能改。** 按代码，`runtime: "own"` 下没有 OpenClaw 会话库，也不访问 `clawhub.ai`，她的回复只在内存里；但这只在离线测试里看过，真实运行里还没有确认，以前跑出来的会话库也不会因为切换而删除。所以上面的会话库和 `clawhub.ai` 两条照样成立，告知草稿也不改。见 [docs/own-runtime.md](docs/own-runtime.md)。
 
@@ -301,7 +343,7 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
                目标校验、内容规则、限额，然后才发到 QQ
 ```
 
-上图是默认的 openclaw 路线。`runtime: "own"` 时中间那一段换成 `src/bot/main.mjs` 一个进程：gate 直接把回合交给 `src/clo-plugin/lib/core/turn.js`，每回合一次 OpenRouter 请求，没有工具，不监听端口；连接、gate、出口、账本和内容策略是同一份代码。见 [docs/own-runtime.md](docs/own-runtime.md)。
+上图是默认的 openclaw 路线。`runtime: "own"` 时中间那一段换成 `src/bot/main.mjs` 一个进程：gate 直接把回合交给 `src/clo-plugin/lib/core/turn.js`，每回合一次模型请求（OpenRouter，或直连 Anthropic），没有工具，不监听端口；连接、gate、出口、账本和内容策略是同一份代码。见 [docs/own-runtime.md](docs/own-runtime.md)。
 
 控制台在 `src/cli/`，运行状态都在项目的 `.runtime/` 里，不碰默认的 OpenClaw 目录。设计细节见 [docs/group-chat-design.md](docs/group-chat-design.md)。
 
@@ -321,7 +363,7 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 
 ## 测试
 
-全部离线：mock QQ、mock OpenRouter、临时目录、假密钥。不读 `.env`。子进程都用明确的环境变量启动，不继承 shell 里的 Key。
+全部离线：mock QQ、mock OpenRouter、mock Anthropic、临时目录、假密钥。不读 `.env`。子进程都用明确的环境变量启动，不继承 shell 里的 Key。
 
 ```powershell
 .\.runtime\node\node.exe --test --test-concurrency=1 tests/unit/*.test.mjs
@@ -330,9 +372,9 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 .\.runtime\node\node.exe --test --test-concurrency=1 tests/e2e-own/<文件>.test.mjs   # 自己的运行时，一个文件一个文件跑
 ```
 
-真实 Gateway 的测试要一个文件一个文件跑。4 个文件并发时，插件换代从单独跑的约 11 秒变成约 87 秒，超过测试的等待时间。
+真实 Gateway 的测试要一个文件一个文件跑。离线测试里、机器负载高时量过一次：4 个文件并发时，插件换代从单独跑的约 11 秒变成约 87 秒，超过测试的等待时间。
 
-`tests/e2e-own/` 启动真实的 `src/bot/main.mjs`，QQ 和模型同样是 mock。它和 `tests/e2e/` 怎么一一对应，见 [docs/own-runtime.md](docs/own-runtime.md) 的“测试对照”。
+`tests/e2e-own/` 启动真实的 `src/bot/main.mjs`，QQ 和模型同样是 mock。默认用 mock OpenRouter；设 `CLO_TEST_PROVIDER=anthropic` 时，和接口有关的文件改用 mock Anthropic，`provider-anthropic.test.mjs` 总是用 mock Anthropic。它和 `tests/e2e/` 怎么一一对应，见 [docs/own-runtime.md](docs/own-runtime.md) 的“测试对照”。
 
 单元和接缝要几分钟，机器忙时更久，没有可靠的时长记录。e2e 串行有记录的一次约 88 分钟。这些测试证明的是接线，不是平台行为。最近的结果和没跑的部分见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
@@ -356,6 +398,10 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 | `stop` 说读不到它的命令行 | 它很可能是用更高权限启动的，还在运行。没有动它，PID 文件保留。从启动它的 shell 里运行 |
 | `stop` 说 `clo start` 可能还在运行 | 启动锁被占着，没有动任何进程。等 `start` 结束再 `clo stop` |
 | `mode live` 报 `key_limit` | `budget.keyDailyLimitUsd` 和 OpenRouter 上的限额不同。改成相同的再试 |
+| `status` 显示“硬上限未核实” | 只在新运行时用 Anthropic 时。启动时声明不全，或者进程拿的 Key 不是声明绑定的那个（`hard_cap`）。付费工作停着。`clo mode dry-run`、`clo stop`，确认 `.env` 里的 Key 在专用工作区里，再 `clo ack hard-cap`。只用模拟环境验证过 |
+| 付费暂停 `anthropic_credits`、`anthropic_spend_limit`、`anthropic_permission`、`anthropic_price_unexpected` | 只在直连 Anthropic 时：余额用完、到了工作区的花费上限、403 没有权限（多半是地区或账户的问题，从不算拒答），或者价格不在预期（美国区、快速模式，或者这两项读不到）。查明后用 `clo budget clear-pause` 解除，原因还在就立刻再暂停。这些错误的真实形状都没有观察过，只用模拟环境验证过 |
+| 直连 Anthropic 时付费暂停 `provider_fail` | 主模型连续 3 次失败，429、529 也算。读不到 Key，不会自动解除：查明后 `clo budget clear-pause`，下一次失败会立刻再暂停。只用模拟环境验证过 |
+| 要回退到只认第 1 版 `clo.db` 的旧版本 | 旧版本拒绝打开第 2 版的库，回退只能用升级前的备份。**备份里没有升级之后写进 `clo.db` 的任何东西，丢的不只是花费**：终止关闭（4914、4915）、全局和分群暂停（包括平台错误码引起的）、插话的自动暂停、付费暂停、没确认的告警都会没有，旧版本启动后照常重连、照常发送。dry-run 也会连 QQ，所以 dry-run 挡不住重连。回退前先 `clo status`：有终止关闭、付费暂停、插话的自动暂停或没确认的告警时不要回退，先按这张表里各自那一行处理完（告警看过后 `clo status --ack`）；只剩全局或分群暂停的，记下来，回退之后、启动之前在旧版本上用 `clo pause` 重新暂停。旧版本只会用 OpenRouter，在用 Anthropic 的先 `clo provider use openrouter --confirm`（启用 QQ 时加 `--qq-platform-notified`）。步骤：`clo stop`，用 `status` 确认没有进程（有记录的、没记录的都没有）；把 `clo.db`、`clo.db-wal`、`clo.db-shm` 三个文件一起移出这个文件夹，只留下 `-wal` 的话它会被重放到恢复的库上；再把 `clo.db.v1.bak` 移成（改名为）`clo.db`。旧版本不认识这些文件，不会清理它们：移出去的三个文件由你自己删除，里面是升级之后的记录，没有正文和显示名。备份里的账本会少算升级之后的花费，所以到下一个上海日开始之前保持 dry-run。备份按“数据和隐私”里的期限删除，过了期限就没有了 |
 | `status` 有告警 `crisis_refused` 或 `crisis_dropped_on_stop` | 一条带危险词、或被判定为危险的消息没有得到完整回复：名额用完、判定失败、预算不够或付费暂停，或者正在跑的回合被 `/stop`、看门狗、暂停、被动窗口到期、出口拒绝打断（原因写在告警里，`/stop` 的是 `owner_stop`）；`crisis_dropped_on_stop` 是停机时还在排队或正在跑。这两种告警都明写了 crisis，看 `status`、日志或 `clo.db` 的人能知道这个群里有一条消息走过危险路线。这些只用模拟环境验证过 |
 | 某群被自动暂停 | 平台返回了群错误码。确认后 `clo resume --group <群>` |
 | 插话被自动暂停 | 一天两次内容违规。确认后 `clo resume --interject` |
@@ -375,6 +421,7 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 | [DECISIONS.md](DECISIONS.md) | 决定和理由，平台实测得到的事实 |
 | [docs/group-chat-design.md](docs/group-chat-design.md) | 群聊部分的设计（英文） |
 | [docs/own-runtime.md](docs/own-runtime.md) | 自己的运行时：现状、切换和回退、改了什么、测试对照 |
+| [docs/provider-contract.md](docs/provider-contract.md) | 模型接口层的合同（英文）：两种接口的请求、结算、暂停，以及还没确认的事实 |
 | [docs/cost-options.md](docs/cost-options.md) | 记下来、还没有实现的省钱办法，和排除的办法 |
 | [docs/q0a-guide.zh.md](docs/q0a-guide.zh.md) | 只监听、不回复的实测指引 |
 | [docs/wiring-trial.md](docs/wiring-trial.md) | 第一次离线接线试验的报告 |

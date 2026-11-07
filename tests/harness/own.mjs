@@ -2,6 +2,9 @@
 // The environment and arguments come from the same builders clo start uses (ownEnv, ownArgs). Business config goes
 // through the same buildEffective and renderWorkspace the console uses. The stack API follows startStack in
 // gateway.mjs, minus what only the host had (openclaw.json, the port, the host CLI).
+// The model provider is CLO_TEST_PROVIDER (default openrouter) or the stack's provider option. On anthropic the
+// business config gets a providers block on the mock's loopback address, the D2 hard-cap ack and its Key binding, and
+// both Keys in the console's secrets, so a test can check that the inactive one never reaches the bot.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -12,17 +15,30 @@ import { pathToFileURL } from 'node:url';
 import { buildEffective, resolvePaths } from '../../src/clo-plugin/lib/core/config.js';
 import { hmacKey } from '../../src/clo-plugin/lib/core/ids.js';
 import { renderWorkspace, writeAtomic } from '../../src/clo-plugin/lib/core/render.js';
+import { hardCapPauseKey, KEY_ENV, LIVE_CODES, providerRulesRecorded } from '../../src/clo-plugin/lib/core/providers/registry.js';
 import { ownArgs, ownEnv } from '../../src/cli/lifecycle.mjs';
 import { cleanChildEnv } from './clean-env.mjs';
+import { FAKE_ANTHROPIC_KEY } from './fake-keys.mjs';
 import {
-  allocPort, APP_ID, cleanupTmp, deepMerge, DECISION_ID, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, makeTmp, NODE, OWNER, pidAlive, PRIMARY_ID,
+  allocPort, APP_ID, cleanupTmp, deepMerge, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, makeTmp, NODE, OWNER, pidAlive,
   readJsonl, ROOT, TERMINAL, until,
 } from './gateway.mjs';
+import { keySent, MODEL_IDS, stackKind, startMockModel, testProvider, view } from './model-view.mjs';
 
+// PRIMARY_ID and DECISION_ID are the ids of a stack made without a provider option, which is always OpenRouter.
 export {
   allocPort, APP_ID, assertEveryPostLegal, BOT_MEMBER, cleanupTmp, DECISION_ID, deepMerge, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, GROUP_B,
   MEMBER, MEMBER2, OWNER, pidAlive, PRIMARY_ID, readJsonl, ROOT, sleep, TERMINAL, until,
 } from './gateway.mjs';
+export { FAKE_ANTHROPIC_KEY } from './fake-keys.mjs';
+export { keySent, view } from './model-view.mjs';
+
+// The provider this run names (CLO_TEST_PROVIDER, default openrouter), and the ids its mock lock carries. It applies
+// only to stacks made with `provider: PROVIDER`: a file opts in once it reads requests and usage through the model view
+// or each kind's own checks. Every other file reads the OpenRouter wire shape, so its stacks stay on OpenRouter
+// whatever CLO_TEST_PROVIDER says (see stackKind in model-view.mjs). A stack's own ids are in stack.ids.
+export const PROVIDER = testProvider();
+export const TEST_IDS = MODEL_IDS[PROVIDER];
 
 const NET_GUARD = join(ROOT, 'tests', 'harness', 'net-guard.mjs');
 const SYSTEM32 = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
@@ -30,10 +46,27 @@ const SYSTEM32 = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
 const STOP_REQUEST_KEY = 'bot_stop_request';
 const GRACEFUL_STOP_MS = 20000;
 
-const MODEL_LOCK = {
-  primary: { id: PRIMARY_ID, selector: 'opus-latest', price: { inputPerM: 5, outputPerM: 20, cacheReadPerM: 0.5, cacheWritePerM: 6.25 } },
-  decision: { id: DECISION_ID, price: { inputPerM: 1, outputPerM: 5, cacheReadPerM: 0.1, cacheWritePerM: 1.25 } },
+// The same short-prompt rates on both kinds, so a settled figure reads the same on either mock. The Anthropic lock adds
+// the one-hour write rate and the decision model's long-prompt card, as models.locks.anthropic carries them.
+const MODEL_LOCKS = {
+  openrouter: {
+    primary: { id: MODEL_IDS.openrouter.primary, selector: 'opus-latest', price: { inputPerM: 5, outputPerM: 20, cacheReadPerM: 0.5, cacheWritePerM: 6.25 } },
+    decision: { id: MODEL_IDS.openrouter.decision, price: { inputPerM: 1, outputPerM: 5, cacheReadPerM: 0.1, cacheWritePerM: 1.25 } },
+  },
+  anthropic: {
+    primary: { id: MODEL_IDS.anthropic.primary, selector: MODEL_IDS.anthropic.primary, price: { inputPerM: 5, outputPerM: 20, cacheReadPerM: 0.5, cacheWritePerM: 6.25, cacheWrite1hPerM: 10 } },
+    decision: {
+      id: MODEL_IDS.anthropic.decision,
+      price: {
+        inputPerM: 1, outputPerM: 5, cacheReadPerM: 0.1, cacheWritePerM: 1.25, cacheWrite1hPerM: 2,
+        long: { aboveTokens: 100000, inputPerM: 2, outputPerM: 10, cacheReadPerM: 0.2, cacheWritePerM: 2.5, cacheWrite1hPerM: 4 },
+      },
+    },
+  },
 };
+
+// Decision D2's pair, as `clo ack hard-cap` records it.
+export const D2_ACK = Object.freeze({ kind: 'workspace_monthly', usd: 20, prepaidNoReload: true, at: '2000-01-01T00:00:00.000Z' });
 
 // Same relaxations as the Gateway harness. Real caps are unit-tested; a test about a cap passes its own `effective`.
 const E2E_RELAXED = {
@@ -132,14 +165,16 @@ export function processTree(pid) {
 
 // The environment clo start builds for the own runtime, from the same builder. Only the temp folders stay in the
 // test root, as in the Gateway harness. Built from an allowlist, so nothing from the shell that runs the tests leaks in.
-export function e2eOwnEnv(tmp, paths, extra = {}) {
+// On anthropic both model Keys are in the secrets, as both would be in .env: ownEnv must hand the bot only the active one.
+export function e2eOwnEnv(tmp, paths, extra = {}, kind = 'openrouter') {
   const parent = { CLO_TEST_ROOT: tmp, CLO_NET_GUARD_LOG: join(tmp, 'net-guard.jsonl') };
   for (const k of ['SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS']) {
     if (process.env[k]) parent[k] = process.env[k];
   }
   const secrets = { CLO_QQ_APP_ID: APP_ID, CLO_QQ_APP_SECRET: FAKE_QQ_SECRET, CLO_CHAT_API_KEY: FAKE_MODEL_KEY };
+  if (kind === 'anthropic') secrets[KEY_ENV.anthropic] = FAKE_ANTHROPIC_KEY;
   return {
-    ...ownEnv(paths, parent, { secrets }),
+    ...(kind === 'openrouter' ? ownEnv(paths, parent, { secrets }) : ownEnv(paths, parent, { secrets, kind })),
     APPDATA: join(tmp, 'appdata', 'Roaming'),
     LOCALAPPDATA: join(tmp, 'appdata', 'Local'),
     TEMP: join(tmp, 'temp'),
@@ -187,13 +222,27 @@ export async function startBot({ tmp, env, args, label = 'bot', cwd }) {
   };
 }
 
-function businessConfig({ qq, model, port, groups, mode, over }) {
+// The providers block of an Anthropic stack: the implicit OpenRouter entry made explicit, the active Anthropic entry on
+// the mock, and the acks the console writes. A null ack leaves the hard-cap ack out.
+function anthropicProviders(cfg, model, ack) {
+  cfg.providers = {
+    openrouter: { kind: 'openrouter', keyEnv: KEY_ENV.openrouter },
+    anthropic: { kind: 'anthropic', keyEnv: KEY_ENV.anthropic, baseUrl: model.base, models: { ...MODEL_IDS.anthropic } },
+  };
+  cfg.activeProvider = 'anthropic';
+  cfg.acks.provider = { name: 'anthropic', at: D2_ACK.at };
+  if (ack) cfg.acks.hardCap = { anthropic: { ...ack } };
+}
+
+function businessConfig({ qq, model, port, groups, mode, over, kind, hardCapAck }) {
   const cfg = JSON.parse(readFileSync(join(ROOT, 'config.example.json'), 'utf8'));
   cfg.runtime = 'own';
   cfg.mode = mode;
   // Never the default port: the own runtime listens on none, and this keeps a test from naming the live one.
   cfg.gatewayPort = port;
+  // On anthropic too: anything still sent to the OpenRouter base lands in the Anthropic mock's `other`.
   cfg.openrouter = { baseUrl: model.base };
+  if (kind === 'anthropic') anthropicProviders(cfg, model, hardCapAck);
   cfg.qq.enabled = true;
   cfg.qq.appId = APP_ID;
   cfg.qq.apiBaseUrl = qq.base;
@@ -216,22 +265,30 @@ const portOf = (base) => Number(new URL(base).port);
  * Options follow startStack: label, groups, mode, config (business config patch), effective (patch after build),
  * script, decision, env (extra child env), ready, start. editPrompt(text) -> text changes the system prompt written to
  * disk; entry points CLO_TEST_BOT_ENTRY at a stand-in.
+ * provider: 'openrouter' or 'anthropic'. Default openrouter, never CLO_TEST_PROVIDER: a provider-aware file passes
+ * PROVIDER. On anthropic only:
+ *   hardCapAck: the ack written to config.json (default D2_ACK; null for none);
+ *   hardCapKey: the Key the attestation is bound to (default the Key the bot gets; null for no binding);
+ *   liftStartPause: see liftProviderRulesPause below (default true).
  */
-export async function startOwnStack({ label, groups = { [GROUP_A]: {} }, mode = 'live', config = {}, effective = {}, script, decision, env = {}, ready = true, start = true, waitReady = true, editPrompt, entry } = {}) {
+export async function startOwnStack({
+  label, groups = { [GROUP_A]: {} }, mode = 'live', config = {}, effective = {}, script, decision, env = {}, ready = true, start = true, waitReady = true, editPrompt, entry,
+  provider, hardCapAck = D2_ACK, hardCapKey = FAKE_ANTHROPIC_KEY, liftStartPause = true,
+} = {}) {
+  const kind = stackKind(provider);
   const tmp = makeTmp(`own-${label}`);
   const { startMockQq } = await import('./mock-qq.mjs');
-  const { startMockOpenRouter } = await import('./mock-openrouter.mjs');
   const qq = await startMockQq({ ready });
-  const model = await startMockOpenRouter();
+  const model = await startMockModel(kind);
   if (script) model.setScript(script);
   if (decision) model.setDecision(decision);
   const port = await allocPort();
 
   const paths = resolvePaths({ CLO_TEST_ROOT: tmp });
   for (const d of [paths.cloDir, paths.logsDir, paths.gatewayCwd, join(paths.runtime, 'pids')]) mkdirSync(d, { recursive: true });
-  const cfg = businessConfig({ qq, model, port, groups, mode, over: config });
+  const cfg = businessConfig({ qq, model, port, groups, mode, over: config, kind, hardCapAck });
   writeFileSync(paths.configJson, `${JSON.stringify(cfg, null, 2)}\n`);
-  const built = buildEffective(cfg, { paths, modelsLock: MODEL_LOCK, env: { CLO_TEST_ROOT: tmp } });
+  const built = buildEffective(cfg, { paths, modelsLock: MODEL_LOCKS[kind], env: { CLO_TEST_ROOT: tmp } });
   const eff = deepMerge(deepMerge(built, E2E_RELAXED), effective);
   const writeEffective = (next) => writeAtomic(paths.effectiveJson, JSON.stringify(next, null, 2));
   writeEffective(eff);
@@ -239,14 +296,24 @@ export async function startOwnStack({ label, groups = { [GROUP_A]: {} }, mode = 
   const systemPrompt = editPrompt ? editPrompt(rendered) : rendered;
   writeAtomic(paths.systemPromptFile, systemPrompt);
 
-  // The store is created and migrated the way the console's first command does, before the bot ever runs.
+  // The store is created and migrated the way the console's first command does, before the bot ever runs. On
+  // anthropic the hard-cap attestation is bound to a Key the way `clo ack hard-cap` binds it.
   {
     const { openStore } = await import('../../src/clo-plugin/lib/core/store.js');
-    openStore(paths.db, { runGen: 'test-setup' }).close();
+    const store = openStore(paths.db, { runGen: 'test-setup' });
+    try {
+      if (kind === 'anthropic' && hardCapKey) {
+        const { createLedger } = await import('../../src/clo-plugin/lib/core/ledger.js');
+        const ledger = createLedger({ store, getEffective: () => eff, fetch: async () => { throw new Error('no network here'); }, getKey: () => null, runtime: 'own' });
+        ledger.attestHardCap('anthropic', hardCapKey, 'test-setup');
+      }
+    } finally {
+      store.close();
+    }
   }
 
   const guardFile = writeAllowlistGuard(join(tmp, 'own-net-guard.mjs'), [portOf(qq.base), portOf(model.base)]);
-  const environment = e2eOwnEnv(tmp, paths, env);
+  const environment = e2eOwnEnv(tmp, paths, env, kind);
   const args = e2eOwnArgs(tmp, guardFile, { entry });
   let bot = null;
   let generations = 0;
@@ -264,6 +331,21 @@ export async function startOwnStack({ label, groups = { [GROUP_A]: {} }, mode = 
   };
   const key = (rawId) => withDb((db) => hmacKey(db.prepare("SELECT value FROM meta WHERE key='hmac_salt'").get().value, rawId));
   const readyCount = () => stack.event('connection_ready').length + stack.event('connection_resumed').length;
+  const startPauses = [];
+
+  // Live on Anthropic is refused by provider_rules until the rule rows recording the user's consent land (the
+  // registry's LIVE_RULES_RECORDED). So in live mode the bot's start check pauses paid work under the hard-cap control
+  // with code provider_rules, and nothing would ever reach the model. Unless the stack was made with
+  // liftStartPause: false, the harness waits for that pause, records its code in stack.startPauses, and lifts it as the
+  // console's ack would. It lifts only a provider_rules pause: a hard_cap one means the attestation is wrong, and fails
+  // the start.
+  async function liftProviderRulesPause() {
+    if (kind !== 'anthropic' || !liftStartPause || stack.eff.mode !== 'live' || providerRulesRecorded('anthropic')) return;
+    const code = await until(() => stack.control(hardCapPauseKey('anthropic')), 'the start check to pause anthropic under provider_rules', 15000, 25);
+    startPauses.push(code);
+    if (code !== LIVE_CODES.providerRules) throw new Error(`the start check paused anthropic with code ${code}, not provider_rules`);
+    await stack.withLedger((ledger) => ledger.liftHardCapPause('anthropic'));
+  }
 
   async function launch(more = {}, wait = waitReady) {
     readyBase = readyCount();
@@ -282,6 +364,12 @@ export async function startOwnStack({ label, groups = { [GROUP_A]: {} }, mode = 
         throw err;
       }
       boots.push(Date.now() - handle.spawnedAt);
+      try {
+        await liftProviderRulesPause();
+      } catch (err) {
+        await handle.kill().catch(() => {});
+        throw err;
+      }
     }
     return handle;
   }
@@ -304,6 +392,15 @@ export async function startOwnStack({ label, groups = { [GROUP_A]: {} }, mode = 
     tmp,
     qq,
     model,
+    kind,
+    /** The model ids this stack's lock carries. */
+    ids: MODEL_IDS[kind],
+    /** The provider-neutral view of a recorded model request (tests/harness/model-view.mjs). */
+    view,
+    /** Whether a recorded request carried exactly this Key in its kind's header. */
+    keySent,
+    /** The hard-cap pause codes the start checks raised, one per live start on anthropic, before the harness lifted them. */
+    startPauses,
     cfg,
     paths,
     eff,
@@ -356,6 +453,11 @@ export async function startOwnStack({ label, groups = { [GROUP_A]: {} }, mode = 
       } finally {
         store.close();
       }
+    },
+    /** fn(ledger) on a ledger over a short console write, built as the console builds one. */
+    async withLedger(fn) {
+      const { createLedger } = await import('../../src/clo-plugin/lib/core/ledger.js');
+      return stack.writeStore((store) => fn(createLedger({ store, getEffective: () => stack.eff, fetch: async () => { throw new Error('no network here'); }, getKey: () => null, runtime: 'own' })));
     },
     /** Clears a paid pause and whatever unsettled rows caused it, as `clo budget accept-unsettled` does. */
     async acceptUnsettled() {

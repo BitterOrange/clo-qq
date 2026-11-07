@@ -1,6 +1,7 @@
 // Status report for the console. No cost or ID leaves this machine through it; IDs are masked here too.
 import { existsSync } from 'node:fs';
-import { runtimeOf } from '../clo-plugin/lib/core/config.js';
+import { providerOfConfig, providerOfEffective, runtimeOf } from '../clo-plugin/lib/core/config.js';
+import { hardCapPauseKey } from '../clo-plugin/lib/core/providers/registry.js';
 import { isQuietHours, shanghaiDay } from '../clo-plugin/lib/core/ids.js';
 import { openStore } from '../clo-plugin/lib/core/store.js';
 import { maskId, readConfig, readEffective } from './common.mjs';
@@ -40,13 +41,21 @@ export function collectStatus(ctx) {
     quietHoursNow: cfg?.quietHours ? isQuietHours(at, cfg.quietHours) : null,
     groups: [],
     db: null,
+    provider: null,
   };
+  // The provider config.json names, or, with no readable config, the one the effective file runs on. Only the name, the
+  // kind and whether its Key can be read leave here; capabilities come from code by kind.
+  const p = cfg ? providerOfConfig(cfg) : (effective ? providerOfEffective(effective) : null);
+  if (p) report.provider = { name: p.name, kind: p.kind, implicit: p.implicit, keyReadable: p.caps.keyReadable === true, hardCapPaused: null };
+  else if (cfg) report.provider = { name: null, kind: null, implicit: false, keyReadable: false, hardCapPaused: null };
   const groups = cfg?.qq?.groups ?? {};
   if (existsSync(paths.db)) {
     const store = openStore(paths.db, { now });
     try {
       const snap = store.statusSnapshot(at);
       report.db = { ...snap, readyUsername: store.getControl('ready_username'), discoveryUntil: store.getControl('discovery_until'), residualOver: store.getControl('residual_over') };
+      // The hard-cap pause of the active kind. It is not a paid_paused reason, so statusSnapshot does not show it.
+      if (report.provider?.kind) report.provider.hardCapPaused = store.getControl(hardCapPauseKey(report.provider.kind));
       const owned = cfg?.qq?.owner?.groupMember ?? {};
       report.groups = Object.entries(groups).map(([id, g]) => ({
         label: g.label, idMasked: maskId(id), paused: snap.paused.groups.includes(store.key(id)),
@@ -86,6 +95,18 @@ export function formatStatus(s) {
   const pidText = { none: '没有 PID 文件', gone: '记录的进程已不在', mismatch: 'PID 已被其他进程占用', unknown: '查不到进程状态，可能还在运行', running: `进程 ${s.pid} 在运行` }[s.pidState];
   const label = RUNTIME_LABEL[s.pidRuntime ?? s.runtime] ?? 'Gateway';
   lines.push(`${label}：${pidText}；心跳新鲜：${yn(s.heartbeatFresh)}；判定存活：${yn(s.alive)}`);
+  const p = s.provider;
+  // Shown once a providers block exists, or whenever the provider is not the implicit OpenRouter one.
+  if (p && !p.implicit) {
+    lines.push(p.kind ? `模型接口：${p.name}（${p.kind}）` : '模型接口：config.json 没有指定能用的接口，不能调用模型');
+    if (p.kind && !p.keyReadable) lines.push('对账：不可用（本地估算）。这个接口读不到 Key 的花费和限额，花费只按本地估算；未结算记录要用 clo budget accept-unsettled 结清，付费暂停要用 clo budget clear-pause 解除。');
+  }
+  if (p?.hardCapPaused) {
+    const why = p.hardCapPaused === 'provider_rules'
+      ? '这个接口进入 live 的项目规则还没有记录（CLAUDE.md §8.2、DECISIONS.md），启动检查没有通过'
+      : '启动时声明的硬上限和进程用的 Key 对不上，或声明不完整';
+    lines.push(`硬上限未核实：${p.name ?? p.kind} 的付费工作已暂停（${p.hardCapPaused}）。${why}。只有在 dry-run、进程停止时重新 clo ack hard-cap ${p.name ?? p.kind} 才解除。`);
+  }
   if (s.runtime === 'own' || s.pidRuntime === 'own') lines.push(`运行时：配置为 ${s.runtime}${s.pidRuntime && s.pidRuntime !== s.runtime ? `，记录的进程是 ${s.pidRuntime}，clo stop 再 clo start 才会切换` : ''}`);
   if (s.groups.length === 0) lines.push('群：无（空列表表示全部关闭）');
   for (const g of s.groups) {

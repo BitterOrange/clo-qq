@@ -1,8 +1,10 @@
-// The own runtime's main turn: one non-streaming request to OpenRouter with no tools, built here byte for byte. The
+// The own runtime's main turn: one non-streaming request with no tools to the provider the client was built for. The
+// client's adapter builds the body; the OpenRouter one is byte for byte what it was before the provider layer. The
 // content-policy markers are checked on the exact system string sent. A reply reaches the exit only through collect(),
 // once, as the whole text; nothing is posted from here. Provider text never reaches a log, an Error or the ledger.
 import { checkSentinels } from './contentPolicy.js';
 import { estimateTokens } from './context.js';
+import { openrouterAdapter } from './providers/openrouterAdapter.js';
 
 // An optional reply this close to the passive window's end would be paid for and then cut off.
 const MIN_OPTIONAL_TURN_MS = 15000;
@@ -13,8 +15,6 @@ const DELIVERY_RESERVE_MS = 15000;
 export const OWN_LABEL = '可洛';
 // The silent tokens the exit treats as no reply. Kept in step with the exit's own pattern.
 const SILENT = /^[\s\p{P}\p{S}]*(?:NO_REPLY|HEARTBEAT_OK|ANNOUNCE_SKIP|REPLY_SKIP)[\s\p{P}\p{S}]*$/iu;
-// Only a concrete anthropic/ model: no router, no :suffix variant, no ~ alias.
-const MODEL_ID = /^anthropic\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 const shanghaiTime = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
@@ -42,21 +42,14 @@ export function renderUserMessage(turn) {
   return `${frameLine(turn)}\n${JSON.stringify({ recent, speaker, text: String(turn.text ?? '') })}`;
 }
 
-export function buildTurnRequest(eff, system, turn) {
+function turnBodyOf(adapter, eff, system, turn) {
   const { primary } = eff.models;
-  return {
-    model: primary.id,
-    stream: false,
-    reasoning: { effort: primary.effort },
-    max_tokens: primary.maxTokens,
-    provider: { require_parameters: true },
-    usage: { include: true },
-    messages: [
-      // One cache breakpoint, at the end of the stable system block, with the default five-minute lifetime.
-      { role: 'system', content: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }] },
-      { role: 'user', content: renderUserMessage(turn) },
-    ],
-  };
+  return adapter.turnBody({ model: primary.id, effort: primary.effort, maxTokens: primary.maxTokens, system, user: renderUserMessage(turn) });
+}
+
+// The OpenRouter request, as the goldens and the Q5 probe build it.
+export function buildTurnRequest(eff, system, turn) {
+  return turnBodyOf(openrouterAdapter, eff, system, turn);
 }
 
 const failed = (usage) => ({ started: true, hostError: true, aborted: false, usage });
@@ -84,6 +77,9 @@ export function createTurnRunner({ client, getEffective, readSystemPrompt, getEx
     }
   };
 
+  // The adapter of the provider the client sends to. A client without one is an OpenRouter client.
+  const adapter = client?.adapter ?? openrouterAdapter;
+
   return async function dispatchTurn(turn, { signal } = {}) {
     const started = now();
     const { eventKey } = turn;
@@ -104,19 +100,29 @@ export function createTurnRunner({ client, getEffective, readSystemPrompt, getEx
       eff = null;
     }
     const primary = eff?.models?.primary;
-    if (!primary || typeof primary.id !== 'string' || !MODEL_ID.test(primary.id)) {
+    // Only a concrete model under the provider's own id rule: on OpenRouter an anthropic/ model with no router, no
+    // :suffix variant and no ~ alias; on Anthropic an Opus, Sonnet or Haiku id with no alias and no date.
+    if (!primary || typeof primary.id !== 'string' || !adapter.idRule.test(primary.id)) {
       log('turn_refused', { eventKey, reason: 'model' });
       return { started: false, reason: 'model' };
     }
 
     // The markers are read on the very string that goes into the request. A checker that fails counts as missing.
-    let body;
+    let system = null;
+    let body = null;
     let check;
     try {
-      body = buildTurnRequest(eff, readSystemPrompt(), turn);
-      check = checkSentinels(body.messages[0].content[0].text, eff.contentPolicy.version);
+      system = readSystemPrompt();
+      body = turnBodyOf(adapter, eff, system, turn);
+      check = checkSentinels(adapter.systemTextOf(body), eff.contentPolicy.version);
     } catch {
       check = { ok: false, reason: 'unreadable' };
+    }
+    // A readable prompt the adapter would not build a request around (an effort or a token limit its provider does not
+    // take) is a configuration fault, not a missing marker.
+    if (body === null && typeof system === 'string' && system !== '') {
+      log('turn_refused', { eventKey, reason: 'request' });
+      return { started: false, reason: 'model' };
     }
     if (!check.ok) {
       alert('policy_sentinel', { reason: check.reason });
@@ -125,7 +131,7 @@ export function createTurnRunner({ client, getEffective, readSystemPrompt, getEx
     }
 
     // The host used to bound input by its own count. Here the deliberately high estimate decides, before anything is sent.
-    const estimate = estimateTokens(body.messages[0].content[0].text) + estimateTokens(body.messages[1].content);
+    const estimate = estimateTokens(adapter.systemTextOf(body)) + estimateTokens(adapter.userTextOf(body));
     if (estimate > primary.contextTokens) {
       log('turn_refused', { eventKey, reason: 'input_bound', count: estimate });
       return { started: false, reason: 'input_bound' };

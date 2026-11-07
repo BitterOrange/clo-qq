@@ -1,0 +1,1066 @@
+{
+  "ok": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "好的。",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": "stop",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "anthropic/fake-opus"
+      },
+      "info": null,
+      "kind": "ok",
+      "reason": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "provider_error_200": {
+    "result": {
+      "kind": "error",
+      "reason": "provider_error",
+      "status": 200,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": {
+        "status": 200,
+        "error_type": "moderation",
+        "provider_name": "FakeProv",
+        "provider_code": 502,
+        "limitSource": null
+      }
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "http_400": {
+    "result": {
+      "kind": "error",
+      "reason": "http",
+      "status": 400,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": {
+        "status": 400,
+        "error_type": "moderation",
+        "provider_name": "FakeProv",
+        "provider_code": 400,
+        "limitSource": null
+      }
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "credits_402": {
+    "result": {
+      "kind": "error",
+      "reason": "http",
+      "status": 402,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": {
+        "status": 402,
+        "error_type": "moderation",
+        "provider_name": "FakeProv",
+        "provider_code": 402,
+        "limitSource": "openrouter_credits"
+      }
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "key_limit_403": {
+    "result": {
+      "kind": "error",
+      "reason": "http",
+      "status": 403,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": {
+        "status": 403,
+        "error_type": "moderation",
+        "provider_name": "FakeProv",
+        "provider_code": 403,
+        "limitSource": "openrouter_key_limit"
+      }
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "flagged_403": {
+    "result": {
+      "kind": "refusal",
+      "reason": "moderation",
+      "status": 403,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": {
+        "status": 403,
+        "error_type": "moderation",
+        "provider_name": "FakeProv",
+        "provider_code": 403,
+        "limitSource": null
+      }
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "not_json_500": {
+    "result": {
+      "kind": "error",
+      "reason": "http",
+      "status": 500,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": {
+        "status": 500,
+        "error_type": {
+          "$undefined": true
+        },
+        "provider_name": {
+          "$undefined": true
+        },
+        "provider_code": {
+          "$undefined": true
+        },
+        "limitSource": null
+      }
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "billed_500": {
+    "result": {
+      "kind": "error",
+      "reason": "http",
+      "status": 500,
+      "message": null,
+      "finishReason": null,
+      "usage": {
+        "input": 10,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "costUsd": 0.002,
+        "model": null
+      },
+      "info": {
+        "status": 500,
+        "error_type": "moderation",
+        "provider_name": "FakeProv",
+        "provider_code": 500,
+        "limitSource": null
+      }
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "rate_429": {
+    "result": {
+      "kind": "error",
+      "reason": "http",
+      "status": 429,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": {
+        "status": 429,
+        "error_type": "moderation",
+        "provider_name": "FakeProv",
+        "provider_code": 429,
+        "limitSource": null
+      }
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "refusal": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": null,
+        "refusal": true,
+        "toolCalls": 0
+      },
+      "finishReason": "stop",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "anthropic/fake-opus"
+      },
+      "info": null,
+      "kind": "refusal",
+      "reason": "refusal"
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "content_filter": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "好的。",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": "content_filter",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "anthropic/fake-opus"
+      },
+      "info": null,
+      "kind": "refusal",
+      "reason": "content_filter"
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "length": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "好的。",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": "length",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "anthropic/fake-opus"
+      },
+      "info": null,
+      "kind": "ok",
+      "reason": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "empty_content": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": "stop",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "anthropic/fake-opus"
+      },
+      "info": null,
+      "kind": "ok",
+      "reason": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "no_choices": {
+    "result": {
+      "status": 200,
+      "message": null,
+      "finishReason": null,
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "costUsd": 0.001,
+        "model": null
+      },
+      "info": null,
+      "kind": "error",
+      "reason": "no_choice"
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "bare_body": {
+    "result": {
+      "status": 200,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null,
+      "kind": "error",
+      "reason": "no_choice"
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "not_json_200": {
+    "result": {
+      "status": 200,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": {
+        "status": 200,
+        "error_type": {
+          "$undefined": true
+        },
+        "provider_name": {
+          "$undefined": true
+        },
+        "provider_code": {
+          "$undefined": true
+        },
+        "limitSource": null
+      },
+      "kind": "error",
+      "reason": "bad_body"
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "tool_calls_message": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": null,
+        "refusal": false,
+        "toolCalls": 1
+      },
+      "finishReason": "stop",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "anthropic/fake-opus"
+      },
+      "info": null,
+      "kind": "error",
+      "reason": "tool_calls"
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "tool_calls_finish": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "好的。",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": "tool_calls",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "anthropic/fake-opus"
+      },
+      "info": null,
+      "kind": "error",
+      "reason": "tool_calls"
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "finish_error": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "好的。",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": "error",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "anthropic/fake-opus"
+      },
+      "info": null,
+      "kind": "error",
+      "reason": "finish_error"
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "no_finish_reason": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "好的。",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": null,
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "anthropic/fake-opus"
+      },
+      "info": null,
+      "kind": "error",
+      "reason": "finish_reason"
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "model_mismatch": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "好的。",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": "stop",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "openai/other"
+      },
+      "info": null,
+      "kind": "error",
+      "reason": "model_mismatch"
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "usage_missing": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "好的。",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": "stop",
+      "usage": null,
+      "info": null,
+      "kind": "ok",
+      "reason": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "usage_bad_model": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "好的。",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": "stop",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": null
+      },
+      "info": null,
+      "kind": "ok",
+      "reason": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":null,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "network": {
+    "result": {
+      "kind": "error",
+      "reason": "network",
+      "status": null,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "connect_retry_ok": {
+    "result": {
+      "status": 200,
+      "message": {
+        "content": "好的。",
+        "refusal": false,
+        "toolCalls": 0
+      },
+      "finishReason": "stop",
+      "usage": {
+        "input": 50,
+        "output": 40,
+        "cacheRead": 1000,
+        "cacheWrite": 150,
+        "costUsd": 0.0123,
+        "model": "anthropic/fake-opus"
+      },
+      "info": null,
+      "kind": "ok",
+      "reason": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      },
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": [
+      {
+        "event": "openrouter_retry",
+        "attempt": 2,
+        "reason": "connect"
+      }
+    ]
+  },
+  "connect_twice": {
+    "result": {
+      "kind": "not_sent",
+      "reason": "connect",
+      "status": null,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      },
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": [
+      {
+        "event": "openrouter_retry",
+        "attempt": 2,
+        "reason": "connect"
+      }
+    ]
+  },
+  "connect_no_deadline": {
+    "result": {
+      "kind": "not_sent",
+      "reason": "connect",
+      "status": null,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "connect_tight": {
+    "result": {
+      "kind": "not_sent",
+      "reason": "connect",
+      "status": null,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "connect_refused_retry": {
+    "result": {
+      "kind": "not_sent",
+      "reason": "connect",
+      "status": null,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "body_lost": {
+    "result": {
+      "kind": "error",
+      "reason": "network",
+      "status": 200,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  },
+  "unavailable": {
+    "result": {
+      "kind": "not_sent",
+      "reason": "unavailable",
+      "status": null,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null
+    },
+    "calls": [],
+    "logs": []
+  },
+  "no_base_url": {
+    "result": {
+      "kind": "not_sent",
+      "reason": "unavailable",
+      "status": null,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null
+    },
+    "calls": [],
+    "logs": []
+  },
+  "aborted_before": {
+    "result": {
+      "kind": "aborted",
+      "reason": "aborted",
+      "status": null,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null
+    },
+    "calls": [],
+    "logs": []
+  },
+  "timeout": {
+    "result": {
+      "kind": "error",
+      "reason": "timeout",
+      "status": null,
+      "message": null,
+      "finishReason": null,
+      "usage": null,
+      "info": null
+    },
+    "calls": [
+      {
+        "url": "http://127.0.0.1:9/api/v1/chat/completions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer <key>",
+          "Content-Type": "application/json"
+        },
+        "redirect": "error",
+        "body": "{\"model\":\"anthropic/fake-opus\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+        "signal": true
+      }
+    ],
+    "logs": []
+  }
+}

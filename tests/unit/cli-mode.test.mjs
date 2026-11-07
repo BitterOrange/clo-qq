@@ -1,12 +1,15 @@
 // Modes, live preconditions, pause, status, targets, budget, policy. In-process, temp root, fake provider.
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { processInfo } from '../../src/cli/lifecycle.mjs';
-import { createEffectiveReader, validateBusinessConfig } from '../../src/clo-plugin/lib/core/config.js';
+import { gatherLiveFacts } from '../../src/cli/clo.mjs';
+import { makeContext, readConfig } from '../../src/cli/common.mjs';
+import { createEffectiveReader, livePreconditions, validateBusinessConfig } from '../../src/clo-plugin/lib/core/config.js';
 import { createLedger } from '../../src/clo-plugin/lib/core/ledger.js';
-import { APP_ID, baseConfig, clo, configOf, dbOf, effectiveOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, markRunning, OWNER_ID, readJson, readyForLive, ROOT, withDb } from './_cli-helper.mjs';
+import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
+import { APP_ID, baseConfig, clo, configOf, dbOf, effectiveOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, markRunning, OWNER_ID, readJson, readyForLive, recordProvider, ROOT, testEnv, withDb, withProviders, writePriceBook } from './_cli-helper.mjs';
 
 const roots = [];
 const root = (label, cfg) => {
@@ -36,7 +39,7 @@ test('.env.example holds placeholders only, under the current names', () => {
     assert.match(line, /^[A-Z_]+=$/, 'a value in .env.example');
     names.push(line.slice(0, -1));
   }
-  assert.deepEqual(names, ['CLO_QQ_APP_ID', 'CLO_QQ_APP_SECRET', 'CLO_CHAT_API_KEY', 'CLO_SEARCH_API_KEY', 'CLO_TEST_API_KEY']);
+  assert.deepEqual(names, ['CLO_QQ_APP_ID', 'CLO_QQ_APP_SECRET', 'CLO_CHAT_API_KEY', 'CLO_SEARCH_API_KEY', 'CLO_TEST_API_KEY', 'CLO_ANTHROPIC_API_KEY', 'CLO_TEST_ANTHROPIC_API_KEY']);
   assert.match(text, /only with OpenRouter/);
   assert.match(text, /OpenAI-compatible endpoints are not\s+(# )?supported yet/);
   assert.match(text, /Nothing reads it/);
@@ -891,4 +894,166 @@ test('a daily budget between the own and the host hold is refused under openclaw
   const ownRun = await clo(r, ['mode', 'live'], { fetch: provider.fetch, env });
   assert.equal(ownRun.code, 0, `${ownRun.out}${ownRun.err}`);
   assert.equal(effectiveOf(r).mode, 'live');
+});
+
+// --- A provider whose Key cannot be read: Anthropic, on the own runtime. Mock only; nothing leaves loopback. ---
+
+const OTHER_ANTHROPIC_KEY = 'sk-ant-FAKE-OTHER-KEY-FOR-LOCAL-MOCK-ONLY';
+const ANTHROPIC_RAW = [FAKE_KEY, FAKE_SECRET, FAKE_ANTHROPIC_KEY, OTHER_ANTHROPIC_KEY];
+const jsonOf = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+// The capability leaves models.js reads, all supported. Their paths are unverified against the real API.
+const ANTHROPIC_CAPS = {
+  effort: Object.fromEntries(['low', 'medium', 'high', 'xhigh', 'max'].map((e) => [e, { supported: true }])),
+  structured_outputs: { supported: true },
+  thinking: { types: { disabled: { supported: true } } },
+};
+
+function fakeAnthropic({ status = 200 } = {}) {
+  const calls = [];
+  const state = { status };
+  const fetch = async (url, init) => {
+    const u = String(url);
+    const key = init?.headers?.['x-api-key'];
+    let who = null;
+    if (key === FAKE_ANTHROPIC_KEY) who = 'active';
+    else if (key === OTHER_ANTHROPIC_KEY) who = 'other';
+    else if (key) who = 'unknown';
+    calls.push({ url: u, key: who, auth: init?.headers?.Authorization ?? null });
+    const m = /\/v1\/models\/([^/?]+)$/.exec(u);
+    if (!m) return jsonOf({ error: 'mock: no route' }, 404);
+    if (state.status !== 200) return jsonOf({ type: 'error', error: { type: 'authentication_error', message: 'mock' } }, state.status);
+    return jsonOf({ id: decodeURIComponent(m[1]), max_tokens: 64000, capabilities: ANTHROPIC_CAPS });
+  };
+  return { fetch, calls, state };
+}
+
+function noKeyIn(res) {
+  const text = `${res.out}${res.err}`;
+  for (const raw of ANTHROPIC_RAW) assert.ok(!text.includes(raw), 'a Key in the output');
+  assert.doesNotMatch(text, /sk-(ant|or-v1)-/, 'a Key-shaped string in the output');
+}
+
+async function anthropicRoot(label) {
+  const r = root(label, null);
+  appendFileSync(join(r, '.env'), `CLO_ANTHROPIC_API_KEY=${FAKE_ANTHROPIC_KEY}\n`);
+  writePriceBook(r);
+  const cfg = enabledConfig();
+  cfg.qq.groups[GROUP_ID].noticeGiven = true;
+  cfg.acks = { q0Recorded: true, d3: 'test-only decision', identityConfirmedAppId: APP_ID };
+  writeFileSync(join(r, 'config.json'), JSON.stringify(withProviders(cfg, { active: 'anthropic', anthropicBaseUrl: 'http://127.0.0.1:9' }), null, 2));
+  recordProvider(r);
+  const env = ownEntryEnv(r);
+  const locked = await clo(r, ['model', 'lock', '--provider', 'anthropic', '--confirm-price'], { env });
+  assert.equal(locked.code, 0, `${locked.out}${locked.err}`);
+  withDb(r, (store) => {
+    store.setControl('heartbeat_at', Date.now(), 'test');
+    store.setControl('last_ready_at', Date.now(), 'test');
+    store.setControl('gateway_key', store.key(FAKE_ANTHROPIC_KEY), 'test');
+  });
+  return { r, env };
+}
+
+// gatherLiveFacts in this process with a given rule record (recorded by default, as the registry ships): the checks
+// `clo mode live` runs, without turning the mode live.
+async function factsWithRules(r, env, fetch, rulesRecorded = () => true) {
+  const sink = { write: () => {} };
+  const ctx = makeContext({ env: testEnv(r, env), fetch, stdout: sink, stderr: sink });
+  const cfg = readConfig(ctx);
+  const record = { rulesRecorded };
+  const facts = await gatherLiveFacts(ctx, cfg, record);
+  return { facts, failed: livePreconditions(cfg, facts, record).failed };
+}
+
+test('anthropic live: hard_cap and key_valid decide with the project rules recorded; a record that says otherwise sends no Key (control)', async () => {
+  const { r, env } = await anthropicRoot('anthropic-live');
+  const an = fakeAnthropic({ status: 401 });
+  const live = () => clo(r, ['mode', 'live'], { fetch: an.fetch, env });
+
+  // D3 first: until it is recorded nothing is sent to the provider at all.
+  editConfig(r, (c) => { c.acks.d3 = ''; });
+  const noD3 = await live();
+  assert.equal(noD3.code, 1);
+  assert.ok(failedCodes(noD3.out).includes('d3'));
+  assert.ok(failedCodes(noD3.out).includes('key_valid'));
+  assert.equal(an.calls.length, 0, 'no call before D3');
+  const noD3Facts = await factsWithRules(r, env, an.fetch);
+  assert.equal(an.calls.length, 0, 'no call before D3, even with the rules recorded');
+  assert.equal(noD3Facts.facts.keyValid, false);
+  editConfig(r, (c) => { c.acks.d3 = 'test-only decision'; });
+
+  // A rule record that says the rules are unrecorded: live is refused whatever the Key says, and the Key stays here.
+  const unrecorded = await factsWithRules(r, env, an.fetch, () => false);
+  for (const code of ['hard_cap', 'key_valid', 'provider_rules']) assert.ok(unrecorded.failed.includes(code), `${code} in ${unrecorded.failed}`);
+  assert.equal(an.calls.length, 0, 'no provider call while the project rules are unrecorded');
+
+  // This build records the rules: the two locked models are read, and the 401 fails key_valid.
+  const first = await live();
+  assert.equal(first.code, 1);
+  const codes = failedCodes(first.out);
+  for (const code of ['hard_cap', 'key_valid']) assert.ok(codes.includes(code), `${code} in ${codes}`);
+  assert.ok(!codes.includes('provider_rules'), 'the rules are recorded');
+  for (const code of ['key_readable', 'key_limit', 'reconciled']) assert.ok(!codes.includes(code), `${code} is not checked on a Key that cannot be read`);
+  assert.equal(an.calls.length, 2, 'with the rules recorded the two locked models are read');
+  assert.ok(an.calls.every((c) => c.key === 'active' && c.auth === null && /^http:\/\/127\.0\.0\.1:9\/v1\/models\//.test(c.url)), 'the Key goes in x-api-key, to the entry base only');
+  assert.ok(!an.calls.some((c) => c.url.endsWith('/key')), 'an Anthropic Key never reaches a Key-read endpoint');
+  const recorded = await factsWithRules(r, env, an.fetch);
+  assert.equal(recorded.facts.keyValid, false);
+  assert.ok(recorded.facts.keyProblems.includes('primary:http_401'), 'the short code is named');
+  noKeyIn(first);
+
+  an.state.status = 200;
+  const acked = await clo(r, ['ack', 'hard-cap', 'anthropic', '--kind', 'workspace_monthly', '--usd', '20', '--prepaid-no-reload'], { env });
+  assert.equal(acked.code, 0, `${acked.out}${acked.err}`);
+  const passing = await factsWithRules(r, env, an.fetch);
+  assert.equal(passing.facts.keyValid, true);
+  assert.deepEqual(passing.failed, [], 'the hard cap passes and so does the Key');
+  const second = await live();
+  assert.equal(second.code, 0, `${second.out}${second.err}`);
+  assert.equal(effectiveOf(r).mode, 'live');
+  noKeyIn(second);
+  noKeyIn(acked);
+});
+
+test('anthropic live: a Key changed after the ack fails hard_cap, and so does a running process holding another Key (controls: the bound Key passes)', async () => {
+  const { r, env } = await anthropicRoot('anthropic-rekey');
+  const an = fakeAnthropic();
+  const live = () => clo(r, ['mode', 'live'], { fetch: an.fetch, env });
+  // The bound-Key controls read the facts in this process, so the mode never turns live between the runs below.
+  const bound = async () => (await factsWithRules(r, env, an.fetch)).failed;
+  assert.equal((await clo(r, ['ack', 'hard-cap', 'anthropic', '--kind', 'workspace_monthly', '--usd', '20', '--prepaid-no-reload'], { env })).code, 0);
+  assert.deepEqual(await bound(), [], 'control: the bound Key');
+
+  const envFile = join(r, '.env');
+  const original = readFileSync(envFile, 'utf8');
+  writeFileSync(envFile, original.replace(FAKE_ANTHROPIC_KEY, OTHER_ANTHROPIC_KEY));
+  const seen = an.calls.length;
+  const rekeyed = await live();
+  assert.equal(rekeyed.code, 1);
+  assert.deepEqual(failedCodes(rekeyed.out).sort(), ['gateway_key', 'hard_cap']);
+  assert.match(rekeyed.out, /CLO_ANTHROPIC_API_KEY/, 'the hint names the Key by its .env name');
+  assert.ok(an.calls.length > seen && an.calls.slice(seen).every((c) => c.key === 'other'), 'the new Key is the one checked');
+  noKeyIn(rekeyed);
+  writeFileSync(envFile, original);
+  assert.deepEqual(await bound(), [], 'control: the bound Key again');
+
+  // The process holds another Key. With no process recorded only gateway_key sees it; with one recorded, hard_cap does too.
+  withDb(r, (store) => store.setControl('gateway_key', store.key(OTHER_ANTHROPIC_KEY), 'test'));
+  assert.deepEqual(failedCodes((await live()).out).sort(), ['gateway_key']);
+  const pidFile = join(r, '.runtime', 'pids', 'gateway.json');
+  mkdirSync(dirname(pidFile), { recursive: true });
+  writeFileSync(pidFile, JSON.stringify({ pid: 2147483000, runtime: 'own' }));
+  assert.deepEqual(failedCodes((await live()).out).sort(), ['gateway_key', 'hard_cap']);
+  rmSync(pidFile);
+  assert.equal(effectiveOf(r).mode, 'dry-run');
+});
+
+test('an explicit OpenRouter entry goes live on the same checks as the implicit one', async () => {
+  const r = root('explicit-or');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  editConfig(r, (c) => { withProviders(c); });
+  const res = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(res.code, 0, `${res.out}${res.err}`);
+  assert.equal(effectiveOf(r).mode, 'live');
+  assert.ok(provider.calls.some((c) => c.url.endsWith('/key')), 'the OpenRouter Key is read');
 });

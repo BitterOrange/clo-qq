@@ -3,8 +3,10 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { fullAt, nextId, plain, push } from '../fixtures/qq-events.mjs';
-import { decisionText } from '../harness/mock-openrouter.mjs';
-import { assertEveryPostLegal, DECISION_ID, GROUP_A, GROUP_B, MEMBER, MEMBER2, netAttempts, PRIMARY_ID, sleep, startOwnStack } from '../harness/own.mjs';
+import { decisionText, NEVER_SENT } from '../harness/model-view.mjs';
+import { assertEveryPostLegal, GROUP_A, GROUP_B, MEMBER, MEMBER2, netAttempts, PROVIDER, sleep, startOwnStack, TEST_IDS } from '../harness/own.mjs';
+
+const { primary: PRIMARY_ID, decision: DECISION_ID } = TEST_IDS;
 
 const REPLY_DECISION = () => ({ text: decisionText({ action: 'reply' }) });
 const SKIP_DECISION = () => ({ text: decisionText({ action: 'skip' }) });
@@ -13,8 +15,17 @@ const QUESTION = '有人知道退货要怎么办吗';
 const ALWAYS_DAY = { quietHours: { start: '00:00', end: '00:00', timezone: 'Asia/Shanghai' } };
 
 // The main request the own runtime builds: the locked model, its output cap and effort, no tools and no fallbacks.
+// On Anthropic the effort goes in output_config, and no thinking key is sent: Opus 5.5 thinking cannot be turned off.
 function assertMainRequest(s, rec) {
   const { primary } = s.eff.models;
+  if (s.kind === 'anthropic') {
+    assert.equal(rec.body.model, PRIMARY_ID);
+    assert.equal(rec.body.max_tokens, primary.maxTokens);
+    assert.deepEqual(rec.body.output_config, { effort: primary.effort });
+    assert.equal(rec.body.thinking, undefined);
+    for (const k of NEVER_SENT.anthropic) assert.equal(rec.body[k], undefined, `no ${k}`);
+    return;
+  }
   assert.equal(rec.body.model, PRIMARY_ID);
   assert.equal(rec.body.stream, false);
   assert.equal(rec.body.max_tokens, primary.maxTokens);
@@ -22,8 +33,21 @@ function assertMainRequest(s, rec) {
   for (const k of ['tools', 'tool_choice', 'fallbacks', 'models', 'response_format']) assert.equal(rec.body[k], undefined, `no ${k}`);
 }
 
+// On Anthropic, effort 'none' is sent as thinking disabled at effort low, with the schema in output_config.format
+// (decision D9; the paid probe confirms Haiku 5.5 takes it).
 function assertDecisionRequest(s, rec) {
   const { decision } = s.eff.models;
+  if (s.kind === 'anthropic') {
+    assert.equal(decision.effort, 'none');
+    assert.equal(rec.body.model, DECISION_ID);
+    assert.equal(rec.body.max_tokens, decision.maxTokens);
+    assert.deepEqual(rec.body.thinking, { type: 'disabled' });
+    assert.equal(rec.body.output_config.effort, 'low');
+    assert.equal(rec.body.output_config.format.type, 'json_schema');
+    assert.ok(s.view(rec).schema?.properties?.action, 'positive control: the decision schema went out');
+    for (const k of NEVER_SENT.anthropic) assert.equal(rec.body[k], undefined, `no ${k}`);
+    return;
+  }
   assert.equal(rec.body.model, DECISION_ID);
   assert.equal(rec.body.stream, false);
   assert.equal(rec.body.max_tokens, decision.maxTokens);
@@ -34,7 +58,7 @@ function assertDecisionRequest(s, rec) {
 describe('interjection off (default)', () => {
   let s;
   before(async () => {
-    s = await startOwnStack({ label: 'ij-off', groups: { [GROUP_A]: { interject: false } }, decision: REPLY_DECISION, script: () => ({ text: '插话。' }), effective: ALWAYS_DAY });
+    s = await startOwnStack({ provider: PROVIDER, label: 'ij-off', groups: { [GROUP_A]: { interject: false } }, decision: REPLY_DECISION, script: () => ({ text: '插话。' }), effective: ALWAYS_DAY });
   });
   after(async () => {
     await s?.stop();
@@ -73,6 +97,7 @@ describe('interjection on', () => {
   const cooldown = 8;
   before(async () => {
     s = await startOwnStack({
+      provider: PROVIDER,
       label: 'ij-on',
       groups: { [GROUP_A]: { interject: true, nameMention: true, cooldownMinutes: cooldown, perHour: 6, perDay: 8 }, [GROUP_B]: { interject: true, cooldownMinutes: cooldown } },
       decision: REPLY_DECISION,
@@ -128,7 +153,7 @@ describe('interjection on', () => {
     assert.equal(posts[0].msg_id, id, 'a passive reply, tied to the message');
     assert.ok(posts[0].msg_seq >= 1);
     assert.equal(s.claims().filter((c) => c.status === 'consumed').length, 1);
-    const user = s.model.agentRequests()[0].body.messages.at(-1).content;
+    const user = s.view(s.model.agentRequests()[0]).user;
     assert.match(user, /^\[clo-turn class=interject /);
   });
 
@@ -157,7 +182,7 @@ describe('interjection on', () => {
     push(s, plain('可洛你觉得这个怎么样', { id }));
     const row = await s.waitRow(id);
     assert.equal(s.model.decisionRequests().length, decisions + 1);
-    assert.equal(JSON.parse(s.model.decisionRequests().at(-1).body.messages[1].content).trigger, 'name');
+    assert.equal(JSON.parse(s.view(s.model.decisionRequests().at(-1)).user).trigger, 'name');
     assert.equal(row.cls, 'name_addressed');
     assert.equal(row.state, 'completed');
     assert.equal(s.reservations(id).find((r) => r.category === 'reply').tier, 'named');
@@ -169,7 +194,7 @@ describe('interjection on', () => {
     push(s, plain('可洛这个名字挺好听的', { id }));
     const row = await s.waitRow(id);
     assert.equal(`${row.state}:${row.reason}`, 'skipped:decision_skip');
-    assert.equal(JSON.parse(s.model.decisionRequests().at(-1).body.messages[1].content).trigger, 'name');
+    assert.equal(JSON.parse(s.view(s.model.decisionRequests().at(-1)).user).trigger, 'name');
     s.model.setDecision(REPLY_DECISION);
   });
 
@@ -196,7 +221,7 @@ describe('interjection on', () => {
     push(s, plain('可洛这本书好看吗', { id: ids[1], member: MEMBER2 }));
     const rows = await Promise.all(ids.map((i) => s.waitRow(i)));
     assert.deepEqual(rows.map((r) => `${r.state}:${r.cls}`), ['completed:name_addressed', 'completed:name_addressed']);
-    const asked = s.model.decisionRequests().slice(decisions).map((r) => JSON.parse(r.body.messages[1].content));
+    const asked = s.model.decisionRequests().slice(decisions).map((r) => JSON.parse(s.view(r).user));
     assert.deepEqual(asked.map((d) => d.trigger), ['name', 'name']);
     assert.equal(s.messagePosts().length, posts + 2);
   });
@@ -210,6 +235,7 @@ describe('interjection on', () => {
 describe('quota under concurrency', () => {
   test('two groups fill at once: each interjects once; the second window of the same group cannot take a claim', async () => {
     const s = await startOwnStack({
+      provider: PROVIDER,
       label: 'ij-conc',
       groups: { [GROUP_A]: { interject: true, cooldownMinutes: 8, perHour: 1, perDay: 1 }, [GROUP_B]: { interject: true, cooldownMinutes: 8, perHour: 1, perDay: 1 } },
       decision: () => ({ text: decisionText({ action: 'reply' }), delayMs: 800 }),
@@ -249,6 +275,7 @@ describe('quota under concurrency', () => {
 describe('a silent token on an interjection', () => {
   test('one model call, no retry, silent, cooldown consumed', async () => {
     const s = await startOwnStack({
+      provider: PROVIDER,
       label: 'ij-silent',
       groups: { [GROUP_A]: { interject: true, cooldownMinutes: 8 } },
       decision: REPLY_DECISION,
@@ -286,6 +313,7 @@ describe('quiet hours', () => {
   test('ordinary messages stop in quiet hours and a real @ does not', async () => {
     // A window covering every minute of the day: start one minute after end.
     const s = await startOwnStack({
+      provider: PROVIDER,
       label: 'ij-quiet',
       groups: { [GROUP_A]: { interject: true } },
       decision: REPLY_DECISION,

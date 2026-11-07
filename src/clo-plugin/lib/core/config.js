@@ -3,7 +3,13 @@ import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { POLICY_CATEGORIES, POLICY_V1_SHA256 } from './contentPolicy.js';
-import { usdToMicros } from './ledger.js';
+import { DECISION_INPUT_TOKENS, usdToMicros } from './ledger.js';
+import {
+  ANTHROPIC_EFFORTS, hardCapAckProblems, KEY_ENV, MODEL_ID_RULES, PROVIDER_ENTRY_FIELDS, PROVIDER_KINDS, PROVIDER_NAME_RE,
+  providerOfConfig, providerOfEffective, providerRulesRecorded,
+} from './providers/registry.js';
+
+export { providerOfConfig, providerOfEffective };
 
 export class ConfigError extends Error {}
 
@@ -261,8 +267,96 @@ export function validateBusinessConfig(cfg, { env = process.env } = {}) {
   if (typeof cfg.privacy?.replaceSystemPrompt !== 'boolean') err('privacy.replaceSystemPrompt', 'must be a boolean');
   if (cfg.openrouter?.baseUrl !== undefined && !(testMode && isLoopbackUrl(cfg.openrouter.baseUrl))) err('openrouter.baseUrl', 'allowed only in test mode, on loopback');
 
+  validateProviders(cfg, err, testMode);
+
   return { ok: errors.length === 0, errors, warnings };
 }
+
+// Fields that would make one provider stand in for another. Nothing here fails over, so they are refused by name.
+const FAILOVER_FIELDS = ['fallbacks', 'priority', 'failover', 'order', 'backup'];
+
+// The optional providers block. Without it nothing new is checked and every generated file is as before. The provider
+// is never guessed: activeProvider names the entry, and acks.provider records that the console made that choice.
+function validateProviders(cfg, err, testMode) {
+  // The effective file's field. In config.json it would let the live checks look at one kind while the bot runs another.
+  if (cfg.apiProvider !== undefined) err('apiProvider', 'belongs to the generated effective file only; use providers and activeProvider');
+  for (const f of FAILOVER_FIELDS) {
+    if (cfg[f] !== undefined) err(f, 'there is no failover between providers or models');
+  }
+  if (cfg.providers === undefined) {
+    if (cfg.activeProvider !== undefined) err('activeProvider', 'needs a providers block');
+    return;
+  }
+  const providers = cfg.providers;
+  if (!isObj(providers) || Object.keys(providers).length === 0) {
+    err('providers', 'must be a non-empty object');
+    return;
+  }
+  const own = runtimeOf(cfg) === 'own';
+  const kinds = new Set();
+  for (const [name, e] of Object.entries(providers)) {
+    const at = `providers.${name}`;
+    if (!PROVIDER_NAME_RE.test(name)) err(at, 'names are lower case letters, digits and -, starting with a letter, at most 32');
+    if (!isObj(e)) {
+      err(at, 'must be an object');
+      continue;
+    }
+    for (const f of Object.keys(e)) {
+      if (FAILOVER_FIELDS.includes(f)) err(`${at}.${f}`, 'there is no failover between providers or models');
+      else if (!PROVIDER_ENTRY_FIELDS.includes(f)) err(`${at}.${f}`, `unknown field; allowed: ${PROVIDER_ENTRY_FIELDS.join(', ')}`);
+    }
+    if (!PROVIDER_KINDS.includes(e.kind)) {
+      err(`${at}.kind`, `must be one of ${PROVIDER_KINDS.join(', ')}`);
+      continue;
+    }
+    // One fixed Key name per kind in this build, so at most one entry of each kind. The field holds a name only.
+    if (kinds.has(e.kind)) err(at, `only one entry of kind ${e.kind}`);
+    kinds.add(e.kind);
+    if (e.keyEnv !== KEY_ENV[e.kind]) err(`${at}.keyEnv`, `must be ${KEY_ENV[e.kind]} for kind ${e.kind}`);
+    if (e.baseUrl !== undefined) {
+      if (!(testMode && isLoopbackUrl(e.baseUrl))) err(`${at}.baseUrl`, 'allowed only in test mode, on loopback');
+      // The OpenClaw runtime reads only openrouter.baseUrl, so an entry's own address would be ignored there.
+      else if (!own) err(`${at}.baseUrl`, 'only with runtime own; the OpenClaw runtime reads openrouter.baseUrl');
+      if (e.kind === 'openrouter' && cfg.openrouter?.baseUrl !== undefined) err(`${at}.baseUrl`, 'set either this or openrouter.baseUrl, not both');
+    }
+    if (e.kind === 'openrouter') {
+      // Its ids stay in claudeModel.id and decisionModel.id, checked as before.
+      if (e.models !== undefined) err(`${at}.models`, 'an OpenRouter entry takes its models from claudeModel and decisionModel');
+    } else if (e.kind === 'anthropic') {
+      const m = e.models;
+      if (!isObj(m)) {
+        err(`${at}.models`, 'needs primary and decision');
+      } else {
+        for (const f of Object.keys(m)) {
+          if (f !== 'primary' && f !== 'decision') err(`${at}.models.${f}`, 'allowed: primary, decision');
+        }
+        for (const role of ['primary', 'decision']) {
+          if (!(typeof m[role] === 'string' && MODEL_ID_RULES.anthropic.test(m[role]))) {
+            err(`${at}.models.${role}`, 'must be a concrete Opus, Sonnet or Haiku id such as claude-opus-5-5: no -latest, no date, no other line');
+          }
+        }
+      }
+    }
+  }
+  const active = cfg.activeProvider;
+  if (!(typeof active === 'string' && Object.hasOwn(providers, active))) {
+    err('activeProvider', 'must name an entry in providers');
+    return;
+  }
+  // Only `clo provider use` writes both, so a switch made by editing one of them is refused here.
+  if (cfg.acks?.provider?.name !== active) err('acks.provider', 'must name activeProvider; switch with clo provider use');
+  const kind = providers[active]?.kind;
+  if (!PROVIDER_KINDS.includes(kind)) return;
+  if (!own && kind !== 'openrouter') err('activeProvider', 'the OpenClaw runtime runs on OpenRouter only');
+  if (kind === 'anthropic') {
+    // Opus 5.5 cannot turn thinking off. The decision runs with thinking disabled, so its small max_tokens holds JSON.
+    if (!ANTHROPIC_EFFORTS.primary.includes(cfg.claudeModel?.effort)) err('claudeModel.effort', `on Anthropic: one of ${ANTHROPIC_EFFORTS.primary.join(', ')}`);
+    if (!ANTHROPIC_EFFORTS.decision.includes(cfg.decisionModel?.effort)) err('decisionModel.effort', `on Anthropic: ${ANTHROPIC_EFFORTS.decision.join(', ')}`);
+  }
+}
+
+// The kind config.json runs on, or null when it names none this build can use.
+export const activeKindOf = (cfg) => providerOfConfig(cfg)?.kind ?? null;
 
 function ownersOf(qq, groupId) {
   const list = qq.owner?.groupMember?.[groupId];
@@ -292,7 +386,10 @@ export function buildEffective(cfg, { paths, modelsLock = null, env = process.en
   const b = cfg.budget;
   const cp = cfg.contentPolicy;
   const rt = cfg.retention;
-  return {
+  const models = modelsOf(cfg, modelsLock);
+  const fit = lockFitProblems(cfg, models);
+  if (fit.length) throw new ConfigError(`invalid config: ${fit.map((p) => p.path).join(', ')}`);
+  const effective = {
     version: 1,
     generatedAt: new Date(now()).toISOString(),
     mode: cfg.mode,
@@ -345,24 +442,8 @@ export function buildEffective(cfg, { paths, modelsLock = null, env = process.en
       providerFailStreakPause: 3,
       ...Object.fromEntries(BUDGET_WAITS.filter((f) => b[f] !== undefined).map((f) => [f, b[f]])),
     },
-    models: {
-      primary: {
-        id: modelsLock?.primary?.id ?? null,
-        selector: cfg.claudeModel.id,
-        effort: cfg.claudeModel.effort,
-        maxTokens: cfg.claudeModel.maxTokens,
-        contextTokens: cfg.claudeModel.contextTokens,
-        cacheRetention: cfg.claudeModel.cacheRetention ?? 'short',
-        price: modelsLock?.primary?.price ?? null,
-      },
-      decision: {
-        id: modelsLock?.decision?.id ?? (cfg.decisionModel.id),
-        effort: cfg.decisionModel.effort,
-        maxTokens: cfg.decisionModel.maxTokens,
-        price: modelsLock?.decision?.price ?? null,
-      },
-    },
-    openrouter: { baseUrl: cfg.openrouter?.baseUrl ?? OPENROUTER_BASE_URL },
+    models,
+    openrouter: { baseUrl: openrouterBaseOf(cfg) },
     timeouts: { decisionMs: cfg.timeouts.decisionMs, turnSeconds: cfg.timeouts.turnSeconds },
     retention: {
       eventDays: rt.eventDays,
@@ -392,11 +473,83 @@ export function buildEffective(cfg, { paths, modelsLock = null, env = process.en
       decisionPromptFile: join(paths.repoRoot, 'persona', 'decision-prompt.zh.md'),
     },
   };
+  // Only the own runtime with a providers block gets the field, so every other effective file stays as it was.
+  const apiProvider = apiProviderOf(cfg);
+  if (apiProvider) effective.apiProvider = apiProvider;
+  return effective;
+}
+
+const ownWithProviders = (cfg) => runtimeOf(cfg) === 'own' && cfg.providers !== undefined;
+
+// The base the OpenRouter Key reads and catalog use. An OpenRouter entry's own base counts only on the own runtime;
+// validation refuses it elsewhere, and refuses it together with openrouter.baseUrl.
+function openrouterBaseOf(cfg) {
+  if (cfg.openrouter?.baseUrl !== undefined) return cfg.openrouter.baseUrl;
+  if (ownWithProviders(cfg)) {
+    const entry = Object.values(cfg.providers).find((e) => e?.kind === 'openrouter' && typeof e.baseUrl === 'string');
+    if (entry) return entry.baseUrl;
+  }
+  return OPENROUTER_BASE_URL;
+}
+
+// {name, kind, baseUrl, hardCap}: what the bot runs on and the attested cap it re-checks at start. Capabilities are
+// never written: code looks them up by kind.
+function apiProviderOf(cfg) {
+  if (!ownWithProviders(cfg)) return null;
+  const p = providerOfConfig(cfg);
+  if (!p) throw new ConfigError('invalid config: activeProvider');
+  const ack = cfg.acks?.hardCap?.[p.name];
+  return { name: p.name, kind: p.kind, baseUrl: p.baseUrl, hardCap: isObj(ack) ? structuredClone(ack) : null };
+}
+
+// modelsLock is the lock of the active kind. On Anthropic the ids come from the entry, with selector = id, and a price
+// only from a lock for exactly those ids: a lock for other ids prices nothing, and holds then refuse.
+function modelsOf(cfg, modelsLock) {
+  const primary = {
+    id: modelsLock?.primary?.id ?? null,
+    selector: cfg.claudeModel.id,
+    effort: cfg.claudeModel.effort,
+    maxTokens: cfg.claudeModel.maxTokens,
+    contextTokens: cfg.claudeModel.contextTokens,
+    cacheRetention: cfg.claudeModel.cacheRetention ?? 'short',
+    price: modelsLock?.primary?.price ?? null,
+  };
+  const decision = {
+    id: modelsLock?.decision?.id ?? (cfg.decisionModel.id),
+    effort: cfg.decisionModel.effort,
+    maxTokens: cfg.decisionModel.maxTokens,
+    price: modelsLock?.decision?.price ?? null,
+  };
+  if (activeKindOf(cfg) === 'anthropic') {
+    const ids = cfg.providers[cfg.activeProvider].models;
+    const matches = modelsLock?.primary?.id === ids.primary && modelsLock?.decision?.id === ids.decision;
+    Object.assign(primary, { id: ids.primary, selector: ids.primary, price: matches ? modelsLock.primary.price ?? null : null });
+    Object.assign(decision, { id: ids.decision, price: matches ? modelsLock.decision.price ?? null : null });
+  }
+  return { primary, decision };
+}
+
+// Holds price a whole prompt on a card's short-prompt rates. A price with a long-prompt card that begins below what one
+// call may send would hold less than that call can settle, so such a lock is refused rather than held on the wrong
+// card. lock: { primary: { price }, decision: { price } }, as locked or as modelsOf priced them. A price without a long
+// card, as every OpenRouter price is, always fits.
+export function lockFitProblems(cfg, lock) {
+  const out = [];
+  const check = (price, tokens, path, what) => {
+    const above = price?.long?.aboveTokens;
+    if (Number.isInteger(above) && !(Number.isInteger(tokens) && tokens <= above)) {
+      out.push({ path, aboveTokens: above, message: `${what} (${tokens}) is above ${above} tokens, where the model's long-prompt rates begin` });
+    }
+  };
+  check(lock?.primary?.price, cfg?.claudeModel?.contextTokens, 'claudeModel.contextTokens', 'the primary input bound');
+  check(lock?.decision?.price, DECISION_INPUT_TOKENS, 'decisionModel', 'the decision input bound');
+  return out;
 }
 
 function isEffectiveShape(e) {
-  // A runtime this build does not know reads as no config at all, so nothing runs on a guess.
+  // A runtime or a provider kind this build does not know reads as no config at all, so nothing runs on a guess.
   return isObj(e) && e.version === 1 && (e.mode === 'dry-run' || e.mode === 'live') && (e.runtime === undefined || RUNTIMES.includes(e.runtime))
+    && (e.apiProvider === undefined || (isObj(e.apiProvider) && PROVIDER_KINDS.includes(e.apiProvider.kind)))
     && isObj(e.qq) && isObj(e.qq.groups) && isObj(e.budget) && isObj(e.limits) && isObj(e.window) && isObj(e.paths);
 }
 
@@ -440,9 +593,18 @@ export function liveConfigProblems(cfg) {
 
 // facts: { now, key: readKey() result | null, reconciled, heartbeatAt, lastReadyAt, gatewayKeyMatches, policyOk, doctorOk, paidPaused, modelsLocked, requiredHoldMicros, env }
 // requiredHoldMicros: the hold of one required reply, in micro-USD. Absent or null when it cannot be priced yet.
-export function livePreconditions(cfg, facts = {}) {
+// On a kind whose Key cannot be read, key_readable, key_limit and reconciled are not checked. These take their place:
+//   hard_cap: the attested cap meets decision D2, covers one required hold, and facts.hardCapKeyMatches is true (the
+//     attested Key is the one in .env and, while a process is recorded, the one that process holds);
+//   key_valid: facts.keyValid is true (checkAnthropicModels passed for both locked ids);
+//   provider_rules: facts.providerRulesRecorded is true and the registry says the rules are recorded for the kind.
+// The provider comes from config.json itself, never from a fact. A config that names no usable one fails 'provider'.
+// rulesRecorded is the registry's, and only a test passes another.
+export function livePreconditions(cfg, facts = {}, { rulesRecorded = providerRulesRecorded } = {}) {
+  const provider = providerOfConfig(cfg);
   const failed = [];
   const check = (code, ok) => { if (!ok) failed.push(code); };
+  check('provider', Boolean(provider));
   const qq = cfg?.qq ?? {};
   const allowed = Array.isArray(qq.allowedGroupIds) ? qq.allowedGroupIds : [];
   const inConfig = liveConfigProblems(cfg);
@@ -458,10 +620,19 @@ export function livePreconditions(cfg, facts = {}) {
   check('daily_hold', hold === undefined || hold === null || (isNum(hold) && isNum(budget?.dailyUsd) && usdToMicros(budget.dailyUsd) >= hold));
   check('targets', !inConfig.includes('targets'));
   check('dm_closed', Array.isArray(qq.allowedDmUserIds) && qq.allowedDmUserIds.length === 0);
-  check('key_readable', keyDaily);
-  // Only a readable daily limit can be compared. A limit below the local budget is fine, as long as it is the one declared.
-  check('key_limit', !keyDaily || budget?.keyDailyLimitUsd === undefined || usdToMicros(budget.keyDailyLimitUsd) === key.limitMicros);
-  check('reconciled', facts.reconciled === true);
+  if (provider?.caps.keyReadable === true) {
+    check('key_readable', keyDaily);
+    // Only a readable daily limit can be compared. A limit below the local budget is fine, as long as it is the one declared.
+    check('key_limit', !keyDaily || budget?.keyDailyLimitUsd === undefined || usdToMicros(budget.keyDailyLimitUsd) === key.limitMicros);
+    check('reconciled', facts.reconciled === true);
+  } else if (provider) {
+    // The provider's own stop rests on the owner's word, bound to one Key. One day can spend up to it.
+    const ack = cfg.acks?.hardCap?.[provider.name];
+    const covers = hold === undefined || hold === null || (isNum(hold) && isPos(ack?.usd) && usdToMicros(ack.usd) >= hold);
+    check('hard_cap', hardCapAckProblems(ack).length === 0 && covers && facts.hardCapKeyMatches === true);
+    check('key_valid', facts.keyValid === true);
+    check('provider_rules', facts.providerRulesRecorded === true && rulesRecorded(provider.kind) === true);
+  }
   check('heartbeat', isNum(facts.heartbeatAt) && now - facts.heartbeatAt <= HEARTBEAT_FRESH_MS && isNum(facts.lastReadyAt));
   check('gateway_key', facts.gatewayKeyMatches === true);
   check('identity', !inConfig.includes('identity'));
@@ -471,7 +642,8 @@ export function livePreconditions(cfg, facts = {}) {
   check('policy', !inConfig.includes('policy') && facts.policyOk === true);
   check('numbers', noLocalNumbers(cfg?.contentPolicy?.crisis?.localNumbers));
   check('doctor', facts.doctorOk === true);
-  const urls = [qq.apiBaseUrl, qq.tokenBaseUrl, cfg?.openrouter?.baseUrl].filter((u) => u !== undefined && u !== '');
+  const entryUrls = isObj(cfg?.providers) ? Object.values(cfg.providers).map((e) => (isObj(e) ? e.baseUrl : undefined)) : [];
+  const urls = [qq.apiBaseUrl, qq.tokenBaseUrl, cfg?.openrouter?.baseUrl, ...entryUrls].filter((u) => u !== undefined && u !== '');
   check('base_urls', urls.length === 0 || testMode);
   check('no_paid_pause', !facts.paidPaused);
   // Holds refuse an unlocked price anyway, so this only gives a clearer refusal at the console.

@@ -7,6 +7,7 @@
 - **新运行时已经写好，放在配置项 `runtime: "own"` 后面。默认仍是 `openclaw`。** `config.example.json` 写的是 `openclaw`，没写这一项的 `config.json` 也按 `openclaw` 算。
 - **现在真正在跑的仍是 OpenClaw 这条路。** README 和 DEPLOYMENT 里的真实 QQ 记录（Q3 到 Q7）全部是在 OpenClaw Gateway 上得到的，对新运行时不算数。
 - **新运行时在真实 QQ 上的验收一项都没有做。** 没有连过真实 QQ。真实模型和真实 OpenRouter 只有一次付费探测（Q5，2026-11-07，两个回合，不接 QQ，见下面“付费探测”）。除了那一节，下面所有的“已观察”都是离线的：mock QQ、mock OpenRouter、临时目录、假密钥。
+- **模型接口：** 新运行时可以走 OpenRouter（默认），也可以换成直连 Anthropic，见下面“模型接口”。直连 Anthropic 只在离线测试（mock Anthropic）里跑过，**真实 Anthropic 上一次都没有跑过**。
 - 按决定，要在测试群里把 Q3 到 Q7 在新运行时上重做一遍，才把默认改成 `own`；改完默认之后，才删 OpenClaw 的代码和依赖，那时再改写 `CLAUDE.md` 里提到宿主的规则。在那之前，`CLAUDE.md` 写的宿主规则仍然适用于 `openclaw` 这条路。
 
 ## 切换和回退
@@ -51,7 +52,7 @@
 
 ## 改了什么
 
-QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复都是同一份代码。变的是中间那一段：不再有 OpenClaw Gateway，主回复由 gate 直接交给项目自己的回合程序（`src/clo-plugin/lib/core/turn.js`），它通过 `src/clo-plugin/lib/core/openrouterChat.js` 调 OpenRouter。判定模型也改用这个客户端。进程入口是 `src/bot/main.mjs`。
+QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复都是同一份代码。变的是中间那一段：不再有 OpenClaw Gateway，主回复由 gate 直接交给项目自己的回合程序（`src/clo-plugin/lib/core/turn.js`），它通过共用的发送循环（`src/clo-plugin/lib/core/providers/modelChat.js`）调在用的接口：OpenRouter（`openrouterChat.js` 现在只是这个循环加上 OpenRouter 的适配），或者直连 Anthropic。判定模型也用这个客户端。进程入口是 `src/bot/main.mjs`。
 
 | 项目 | openclaw（现在默认） | own |
 |---|---|---|
@@ -71,6 +72,19 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 | 进程输出 | `.runtime/logs/gateway.log` | 同一个文件 |
 
 这些行为都有离线测试（下面“测试对照”），没有一项在真实 QQ 或真实模型上看过。唯一的例外是请求本身：Q5 的付费探测里，回合程序构造的请求在真实 OpenRouter 上被接受过一次（见下面“付费探测”），但那次没有 gate、出口和账本。新的请求布局也会影响人设和回答质量，Q5 没有记录回答内容，所以这一点还不知道。
+
+## 模型接口
+
+用户 2026-11-07 同意了共用接口层（见 [DECISIONS.md](../DECISIONS.md) 的“用户定的（2026-11-07，Provider）”）。合同在 [provider-contract.md](provider-contract.md)（英文）。
+
+- **只在 own 运行时有。** openclaw 运行时只能用 OpenRouter，请求和行为和以前逐字节相同。own 上没有 `providers` 配置就是 OpenRouter。
+- **同一时间只用一个接口。** 不自动切换，没有优先级，也不在失败后换另一个接口。
+- **配置和切换：** `clo provider add anthropic` 加配置，`.env` 里填 `CLO_ANTHROPIC_API_KEY`，`clo model lock --provider anthropic --confirm-price` 从价格表锁定，`clo provider use anthropic --confirm` 切换（启用 QQ 时加 `--qq-platform-notified`），`clo ack hard-cap anthropic …` 声明工作区上限。换接口要在 dry-run、进程停着时做，它算一次模型变更，会清除每个群的“已告知”和 D3 记录。完整步骤见 README 的“模型接口”。
+- **钱：** Anthropic 读不到 Key 的花费和限额，所以不对账，`status` 显示“对账：不可用（本地估算）”。硬上限是部署者声明的专用工作区月度上限加关闭自动充值的预付费额度，程序核实不了，出错的一天最多可能花到它。声明绑定 Key 的指纹，可洛进程和 `clo start` 每次启动都核对。未结算记录按预留额计入，直到 `clo budget accept-unsettled`；付费暂停由 owner 用 `clo budget clear-pause` 解除。
+- **请求：** 用项目自己的 `fetch` 直连 Messages API，不用 SDK，不流式，不发 fallback、beta 请求头和工具。只有确认没发出去的连接错误在期限内重试一次，和 OpenRouter 一样。服务方的错误文字、请求编号和停止细节不出适配层，不进日志和 QQ。
+- **进程拿到哪个 Key：** 用 Anthropic 时，可洛进程只拿到 `CLO_ANTHROPIC_API_KEY`（进程里的名字是 `CLO_PROVIDER_API_KEY`），拿不到 OpenRouter 的 Key；Gateway 永远拿不到 Anthropic 的 Key。
+- **数据去哪里：** 用 OpenRouter 时，消息经 OpenRouter 到实际的模型服务方；直连 Anthropic 时，消息直接发给 Anthropic。告知草稿“消息发给谁”那一句按在用的接口填。本机这边，`clo.db` 升到第 2 版（预算记录多一列接口类型），升级前的整份旧库留成 `clo.db.v1.bak`，保留多久见 README 的“数据和隐私”。
+- **没有确认的：** Haiku 关闭思考加 effort low 能不能用、错误的真实形状（余额用完、花费上限、403）、响应里的地区和速度字段、出错或中止的请求收不收费，都等付费探测（`scripts\q5-anthropic.ps1`，还没有跑过）。
 
 ## 内存
 
@@ -164,6 +178,7 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 | `qq-slash-text.test.mjs` | `qq-slash-text.test.mjs` | 规则变了：只有列出的 owner 命令算命令 |
 | `qq-unsettled-clear.test.mjs` | `qq-unsettled-clear.test.mjs` | 直接移植 |
 | `tool-list.test.mjs` | `tool-list.test.mjs` | 证明请求里没有 `tools` 字段，调工具的回答按失败算 |
+| 没有 | `provider-anthropic.test.mjs` | 新增：直连 Anthropic，旁边一套 OpenRouter 作对照。按 token 结算、价格标记、拒答、403、429 和 529 的连败、花费上限和余额的形状（没确认）、启动时的硬上限检查、不对账 |
 | 没有 | `smoke.test.mjs` | 新增：一次 @、一次请求、结算、停机、不监听 |
 
 只在宿主上有意义、移植时去掉的检查：宿主提示文字、宿主文件日志、宿主看门狗、`openclaw.json`、通道和插件重载、插件加载。单元测试里 `host-notices`、`host-output-filter`、`render-validate` 和 `render` 的 `openclaw.json` 部分只守 openclaw 路线，切换之前继续跑。
@@ -173,4 +188,4 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 - 整合时发现 `src/bot/main.mjs` 构造闸门和出口、`src/bot/services.mjs` 构造账本时没有传 `runtime: 'own'`，进程里这三样按 openclaw 的规则跑。已经改了，`tests/unit/bot-main.test.mjs` 在 bot 进程里检查 Key 限额暂停、预留大小、`/stop` 中止回合、她的回复进下一轮上下文。只离线测过。
 - e2e-own 全量只以并发 4 跑过，没有串行跑过。
 - Q5 只有一次样本，一次冷回合、一次热回合。思考 token（51、155）、回答长度、缓存命中和对账延迟都只有这一个点；判定调用、拒答、429、1 小时缓存和中止请求的计费都没有真实数据。
-- 回合程序的一次连接重试不另外预留，用的是回合原来的预留，重试前再查模式、`qq.enabled` 和暂停（`src/bot/services.mjs` 的 `retryAllowed`）。用户定的是重试单独预留，这里没有照做，是开发时的选择，用户还没有确认，见 [DECISIONS.md](../DECISIONS.md) 的“自己的运行时里和上一节不一致的地方”。探测里不重试。
+- 回合程序的一次连接重试不另外预留，用的是回合原来的预留，重试前再查模式、`qq.enabled` 和暂停（`src/bot/services.mjs` 的 `retryAllowed`）。用户定的是重试单独预留，这里没有照做，是开发时的选择，用户还没有确认，见 [DECISIONS.md](../DECISIONS.md) 的“自己的运行时里和上一节不一致的地方”。两种接口上都一样，要用户决定，列在 `DECISIONS.md` 的“待定”。探测里不重试。

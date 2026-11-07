@@ -107,6 +107,51 @@ test('the log whitelist is exactly the design list, and long values cannot carry
   assert.equal(log.droppedKeys(), 2);
 });
 
+// Anthropic answers carry provider text in more places: error.message, request_id, stop_details on a refusal, and
+// thinking blocks. The adapter keeps all of it; what leaves is the short scalars the log whitelist takes.
+test('Anthropic error bodies, refusals and thinking text never reach a Result or the log', async () => {
+  const { anthropicAdapter } = await import('../../src/clo-plugin/lib/core/providers/anthropicAdapter.js');
+  const { createChatClient } = await import('../../src/clo-plugin/lib/core/providers/modelChat.js');
+  const PLANT = 'ANTHROPICPLANT7731';
+  const err = (status, type, extra = {}) => [status, { type: 'error', error: { type, message: `${PLANT} ${BODY} ${MEMBER}`, ...extra }, request_id: `req_${PLANT}` }];
+  const message = (over) => [200, { id: `msg_${PLANT}`, type: 'message', role: 'assistant', model: 'claude-opus-5-5', stop_sequence: null, usage: { input_tokens: 5, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, inference_geo: 'global', speed: 'standard' }, ...over }];
+  const shapes = [
+    err(400, 'invalid_request_error'),
+    err(402, 'billing_error'),
+    err(403, 'permission_error'),
+    err(429, 'rate_limit_error', { details: { error_code: 'enforced_spend_limit_reached', note: PLANT } }),
+    err(529, 'overloaded_error'),
+    err(200, 'api_error'),
+    message({ content: [], stop_reason: 'refusal', stop_details: { category: 'cyber', explanation: `${PLANT} ${BODY}` } }),
+    message({ content: [{ type: 'thinking', thinking: `${PLANT} ${MEMBER}`, signature: PLANT }, { type: 'redacted_thinking', data: PLANT }, { type: 'text', text: REPLY }], stop_reason: 'end_turn' }),
+    message({ content: [{ type: 'tool_use', id: `toolu_${PLANT}`, name: 'exec', input: { cmd: PLANT } }], stop_reason: 'tool_use' }),
+  ];
+  const file = join(dir, 'anthropic.jsonl');
+  const log = createLog(file);
+  const results = [];
+  for (const [status, body] of shapes) {
+    const fetch = async () => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+    const client = createChatClient({ adapter: anthropicAdapter, fetch, getKey: () => 'sk-ant-FAKE-KEY-FOR-LOCAL-MOCK-ONLY', getBaseUrl: () => 'http://mock', log });
+    const body_ = anthropicAdapter.turnBody({ model: 'claude-opus-5-5', effort: 'low', maxTokens: 100, system: 'S', user: 'U' });
+    const r = await client.post(body_);
+    results.push(r);
+    // What a careless caller might hand the log from a Result and the raw answer.
+    log('provider_error', { ...(r.info ?? {}), kind: r.kind, reason: r.reason, message: JSON.stringify(body), raw: body, request_id: body.request_id, stop_details: body.stop_details });
+  }
+  // Positive controls: the plants were in what the provider sent, and the log kept the scalars.
+  assert.ok(shapes.every(([, b]) => JSON.stringify(b).includes(PLANT)));
+  const logText = readFileSync(file, 'utf8');
+  assert.match(logText, /"status":403/);
+  assert.match(logText, /"error_type":"permission_error"/);
+  assert.deepEqual(results.map((r) => `${r.kind}/${r.reason}`), ['error/http', 'error/http', 'error/http', 'error/http', 'error/http', 'error/provider_error', 'refusal/refusal', 'ok/null', 'error/tool_calls']);
+  assert.equal(results[7].message.content, REPLY, 'positive control: the text block came through');
+  for (const r of results) {
+    const text = JSON.stringify(r);
+    for (const c of [PLANT, BODY, MEMBER]) assert.ok(!text.includes(c), `${c} in a Result: ${r.kind}/${r.reason}`);
+  }
+  for (const c of [PLANT, BODY, MEMBER, 'sk-ant-']) assert.ok(!logText.includes(c), `${c} in the log`);
+});
+
 test('a log write failure never throws into the bot', () => {
   const log = createLog(join(dir, 'turn.db', 'cannot', 'be', 'a', 'dir.jsonl'));
   log('e', { code: 1 });

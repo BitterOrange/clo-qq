@@ -8,7 +8,9 @@ import { Server } from 'node:net';
 import { join } from 'node:path';
 import { after, afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { GROUP_A, makeEffective, MEMBER, OWNER, ROOT, tempDir } from '../fixtures/inbound.mjs';
+import { anthropicEffective, GROUP_A, makeEffective, MEMBER, OWNER, ROOT, tempDir } from '../fixtures/inbound.mjs';
+import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
+import { hardCapControlKey, hardCapPauseKey } from '../../src/clo-plugin/lib/core/providers/registry.js';
 import { startMockOpenRouter } from '../harness/mock-openrouter.mjs';
 import { startMockQq } from '../harness/mock-qq.mjs';
 
@@ -37,7 +39,7 @@ registerHooks({
   },
 });
 
-const { EXIT, STOP_REQUEST_KEY, errorClass, installProcessHandlers, runBot } = await import('../../src/bot/main.mjs');
+const { EXIT, STOP_REQUEST_KEY, errorClass, installProcessHandlers, runBot, startCheck } = await import('../../src/bot/main.mjs');
 const { CONSUMER_LEASE_KEY, LEASE_STALE_MS, stopRun } = await import('../../src/clo-plugin/lib/channels/qq/startup.js');
 const { openBotServices } = await import('../../src/bot/services.mjs');
 const { openStore } = await import('../../src/clo-plugin/lib/core/store.js');
@@ -95,13 +97,15 @@ async function mockOr() {
   return m;
 }
 
-// runtime: null leaves the field out, which reads as the OpenClaw default.
-function site(qq, { runtime = 'own', or = null, over = {} } = {}) {
+// runtime: null leaves the field out, which reads as the OpenClaw default. kind 'anthropic' writes the file of the own
+// runtime on the Anthropic kind, with hardCap as the copied ack.
+function site(qq, { runtime = 'own', or = null, over = {}, kind = 'openrouter', hardCap = null } = {}) {
   const dir = tempDir('clo-bot-');
   const db = join(dir, 'clo.db');
   const promptFile = join(dir, 'system-prompt.md');
   writeFileSync(promptFile, PROMPT);
-  const eff = makeEffective({
+  const build = kind === 'anthropic' ? (o) => anthropicEffective(o, { hardCap }) : makeEffective;
+  const eff = build({
     paths: { db, eventLog: join(dir, 'events.jsonl'), systemPromptFile: promptFile },
     qq: { apiBaseUrl: qq.base, tokenBaseUrl: qq.base },
     openrouter: { baseUrl: or ? or.base : `${qq.base}/none` },
@@ -121,7 +125,7 @@ function stubFactories({ onTurn } = {}) {
   return {
     seen,
     factories: {
-      createOpenRouterClient(args) {
+      createChatClient(args) {
         seen.client = args;
         seen.clientObj = { post: async () => ({ kind: 'not_sent' }) };
         return seen.clientObj;
@@ -287,6 +291,7 @@ test('an @ goes gate -> turn runner -> exit -> QQ, with the contract arguments',
   assert.equal(seen.turns.length, 1);
   assert.equal(typeof seen.turns[0].turn.turnId, 'string');
   assert.equal(seen.client.getKey(), KEY);
+  assert.equal(seen.client.adapter.kind, 'openrouter', 'the implicit provider is OpenRouter');
   assert.equal(seen.client.getBaseUrl(), or.base);
   assert.equal(typeof seen.client.fetch, 'function');
   assert.equal(seen.runner.readSystemPrompt(), PROMPT);
@@ -644,7 +649,7 @@ function servicesFor(s, behave) {
     env: envFor(s),
     fetch: async () => { throw new Error('no network in this test'); },
     factories: {
-      createOpenRouterClient: () => ({ post: async () => ({ kind: 'not_sent' }) }),
+      createChatClient: () => ({ post: async () => ({ kind: 'not_sent' }) }),
       createTurnRunner: (args) => {
         handed.push(args);
         return async (turn) => behave(args, turn);
@@ -720,14 +725,15 @@ test('own dispatch: the runner gets an alert sink that writes clo status alerts,
     assert.deepEqual(alertKinds(services.store).sort(), ['model_mismatch', 'policy_sentinel']);
     assert.equal(typeof seen.beforeRetry, 'function');
     assert.equal(seen.beforeRetry(TURN), true, 'live and nothing paused: the retry may go');
-    for (const [key, value] of [['global_paused', '1'], ['group_paused:G1', '1'], ['paid_paused', 'provider_fail'], ['terminal_close', '4914']]) {
+    for (const [key, value] of [['global_paused', '1'], ['group_paused:G1', '1'], ['paid_paused', 'provider_fail'], ['terminal_close', '4914'], [hardCapPauseKey('openrouter'), 'hard_cap']]) {
       services.store.setControl(key, value, 'test');
       assert.equal(seen.beforeRetry(TURN), false, `${key} stops the retry`);
       services.store.delControl(key);
       assert.equal(seen.beforeRetry(TURN), true, `without ${key} it may go again`);
     }
-    // Another group's pause does not stop this group's retry.
+    // Another group's pause does not stop this group's retry, nor another kind's hard-cap pause.
     services.store.setControl('group_paused:G2', '1', 'test');
+    services.store.setControl(hardCapPauseKey('anthropic'), 'hard_cap', 'test');
     assert.equal(seen.beforeRetry(TURN), true);
     writeFileSync(s.effectivePath, JSON.stringify({ ...s.eff, mode: 'dry-run' }));
     await until(() => services.getEffective()?.mode === 'dry-run', 'the reader sees dry-run');
@@ -947,5 +953,258 @@ test('one consumer: the OpenClaw plugin refuses to connect while a live bot hold
     await ends(running3, 'an aborted plugin run');
   } finally {
     stopServices();
+  }
+});
+
+// ---- the provider the bot opens with ----
+
+const D2_ACK = Object.freeze({ kind: 'workspace_monthly', usd: 20, prepaidNoReload: true, at: '2026-01-01T00:00:00.000Z' });
+const anthropicEnv = (s, over = {}) => envFor(s, { OPENROUTER_API_KEY: undefined, CLO_PROVIDER_API_KEY: FAKE_ANTHROPIC_KEY, ...over });
+const anthropicSite = (qq, { mode = 'dry-run', hardCap = null } = {}) => site(qq, { kind: 'anthropic', hardCap, over: { mode } });
+// Rewrites the effective file the way clo apply would. The size changes too, so the reader sees a new file at once.
+function rewrite(s, mutate) {
+  const eff = JSON.parse(readFileSync(s.effectivePath, 'utf8'));
+  mutate(eff);
+  writeFileSync(s.effectivePath, JSON.stringify(eff));
+}
+
+test('services on anthropic: the Anthropic adapter on CLO_PROVIDER_API_KEY; the OpenRouter name is never read for it (control: openrouter reads its own)', async () => {
+  const qq = await mockQq();
+  const s = anthropicSite(qq);
+  const sent = [];
+  const fetch = async (url, init) => {
+    sent.push({ url, init });
+    return new Response(JSON.stringify({ type: 'message', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'x' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }), { status: 200 });
+  };
+  const services = openBotServices(s.effectivePath, { env: anthropicEnv(s), fetch });
+  try {
+    assert.equal(services.provider.kind, 'anthropic');
+    assert.equal(services.client.adapter.kind, 'anthropic');
+    assert.equal(services.getKey() === FAKE_ANTHROPIC_KEY, true);
+    assert.equal(services.secrets().includes(FAKE_ANTHROPIC_KEY), true, 'the exit refuses text carrying it');
+    const r = await services.client.post({ model: 'claude-opus-5-5' });
+    assert.equal(r.kind, 'ok');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].url, `${s.eff.apiProvider.baseUrl}/v1/messages`);
+    assert.equal(sent[0].init.headers['x-api-key'] === FAKE_ANTHROPIC_KEY, true);
+  } finally {
+    services.close();
+  }
+
+  // Only the OpenRouter name in the environment: an Anthropic run holds no Key, and sends nothing.
+  const onlyOr = openBotServices(s.effectivePath, { env: envFor(s), fetch });
+  try {
+    assert.equal(onlyOr.getKey(), null);
+    assert.equal((await onlyOr.client.post({ model: 'claude-opus-5-5' })).reason, 'unavailable');
+    assert.equal(sent.length, 1);
+    assert.equal(onlyOr.secrets().includes(KEY), true, 'whatever it holds is still a secret to the exit');
+  } finally {
+    onlyOr.close();
+  }
+
+  const or = site(qq);
+  const orServices = openBotServices(or.effectivePath, { env: envFor(or, { CLO_PROVIDER_API_KEY: FAKE_ANTHROPIC_KEY }), fetch });
+  try {
+    assert.equal(orServices.client.adapter.kind, 'openrouter');
+    assert.equal(orServices.getKey(), KEY);
+  } finally {
+    orServices.close();
+  }
+});
+
+test('services: once the file names another kind, the Key goes nowhere and nothing is sent (control: the matching kind sends one)', async () => {
+  const qq = await mockQq();
+  const s = anthropicSite(qq);
+  let fetched = 0;
+  const fetch = async () => {
+    fetched += 1;
+    return new Response(JSON.stringify({ type: 'message', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'x' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }), { status: 200 });
+  };
+  const services = openBotServices(s.effectivePath, { env: anthropicEnv(s), fetch });
+  try {
+    assert.equal((await services.client.post({ model: 'claude-opus-5-5' })).kind, 'ok');
+    assert.equal(fetched, 1, 'control: the kind it opened with sends');
+    rewrite(s, (eff) => { delete eff.apiProvider; });
+    assert.equal(services.getEffective().apiProvider, undefined, 'the reader sees the new file');
+    const r = await services.client.post({ model: 'claude-opus-5-5' });
+    assert.deepEqual({ k: r.kind, r: r.reason }, { k: 'not_sent', r: 'unavailable' });
+    assert.equal(fetched, 1, 'no request to either provider');
+    assert.equal(services.getKey(), null, 'the ledger and the decider see no Key either');
+    await assert.rejects(services.ledger.readKey(), 'no OpenRouter Key read with the Anthropic Key');
+    assert.equal(fetched, 1);
+  } finally {
+    services.close();
+  }
+});
+
+test('own start on anthropic: gateway_key is the Anthropic Key the process holds (control: openrouter records its own)', async () => {
+  const qq = await mockQq();
+  const s = anthropicSite(qq);
+  const { ctl, run } = start(s, { env: anthropicEnv(s) });
+  await until(() => qq.identifies.length === 1, 'identify');
+  peek(s, (store) => {
+    assert.equal(store.getControl('gateway_key'), store.key(FAKE_ANTHROPIC_KEY));
+    assert.notEqual(store.getControl('gateway_key'), 'none');
+  });
+  ctl.abort();
+  await ends(run, 'an aborted run');
+
+  const o = site(qq);
+  const second = start(o, { env: envFor(o, { CLO_PROVIDER_API_KEY: FAKE_ANTHROPIC_KEY }) });
+  await until(() => qq.identifies.length === 2, 'identify');
+  peek(o, (store) => assert.equal(store.getControl('gateway_key'), store.key(KEY)));
+  second.ctl.abort();
+  await ends(second.run, 'an aborted run');
+});
+
+test('own start on anthropic in live: a Key the ack is not bound to pauses as hard_cap; the bound Key passes and pauses nothing', async () => {
+  const qq = await mockQq();
+  const cases = [
+    ['bound to another Key', (store) => store.key('ANOTHER-ANTHROPIC-KEY'), 'hard_cap'],
+    ['no binding at all', () => null, 'hard_cap'],
+    // The cap check passes, and the rules for this kind are recorded (contract 11.3).
+    ['bound to the Key held', (store) => store.key(FAKE_ANTHROPIC_KEY), null],
+  ];
+  for (const [i, [label, bind, want]] of cases.entries()) {
+    const s = anthropicSite(qq, { mode: 'live', hardCap: D2_ACK });
+    peek(s, (store) => {
+      const fp = bind(store);
+      if (fp) store.setControl(hardCapControlKey('anthropic'), fp, 'cli');
+    });
+    const { ctl, run } = start(s, { env: anthropicEnv(s) });
+    await until(() => qq.identifies.length === i + 1, 'identify');
+    peek(s, (store) => {
+      assert.equal(store.getControl(hardCapPauseKey('anthropic')), want, label);
+      assert.equal(store.getControl('paid_paused'), null, `${label}: paid_paused is left alone`);
+      assert.equal(alertKinds(store).includes('paid_paused'), want !== null, label);
+    });
+    ctl.abort();
+    await ends(run, 'an aborted run');
+  }
+  // Dry-run, and OpenRouter in live: nothing to pause.
+  const dry = anthropicSite(qq, { hardCap: D2_ACK });
+  const d = start(dry, { env: anthropicEnv(dry) });
+  await until(() => qq.identifies.length === cases.length + 1, 'identify');
+  peek(dry, (store) => assert.equal(store.getControl(hardCapPauseKey('anthropic')), null));
+  d.ctl.abort();
+  await ends(d.run, 'an aborted run');
+  const or = await mockOr();
+  const o = site(qq, { or });
+  const live = start(o);
+  await until(() => qq.identifies.length === cases.length + 2, 'identify');
+  peek(o, (store) => {
+    assert.equal(store.getControl(hardCapPauseKey('openrouter')), null);
+    assert.equal(store.getControl(hardCapPauseKey('anthropic')), null);
+  });
+  live.ctl.abort();
+  await ends(live.run, 'an aborted run');
+});
+
+test('startCheck: a weaker ack bound to the right Key is hard_cap; the D2 ack passes; no provider pauses nothing', async () => {
+  const qq = await mockQq();
+  const s = anthropicSite(qq);
+  const services = openBotServices(s.effectivePath, { env: anthropicEnv(s), fetch: async () => { throw new Error('no network in this test'); } });
+  try {
+    const { store, ledger, provider } = services;
+    store.setControl(hardCapControlKey('anthropic'), store.key(FAKE_ANTHROPIC_KEY), 'cli');
+    const live = (ack) => ({ ...s.eff, mode: 'live', apiProvider: { ...s.eff.apiProvider, hardCap: ack } });
+    const weaker = [
+      ['prepaid only', { ...D2_ACK, kind: 'prepaid_no_reload' }],
+      ['auto-reload left on', { ...D2_ACK, prepaidNoReload: false }],
+      ['no amount', { ...D2_ACK, usd: 0 }],
+      ['no ack', null],
+    ];
+    for (const [label, ack] of weaker) {
+      ledger.liftHardCapPause('anthropic');
+      assert.deepEqual(startCheck({ store, ledger, eff: live(ack), provider, key: FAKE_ANTHROPIC_KEY }), { ok: false, code: 'hard_cap' }, label);
+      assert.equal(store.getControl(hardCapPauseKey('anthropic')), 'hard_cap', label);
+    }
+    ledger.liftHardCapPause('anthropic');
+    assert.deepEqual(startCheck({ store, ledger, eff: live(D2_ACK), provider, key: FAKE_ANTHROPIC_KEY }), { ok: true });
+    assert.equal(store.getControl(hardCapPauseKey('anthropic')), null, 'the D2 ack pauses nothing');
+    assert.deepEqual(startCheck({ store, ledger, eff: live(D2_ACK), provider, key: 'ANOTHER-ANTHROPIC-KEY' }), { ok: false, code: 'hard_cap' }, 'the fingerprint is of the Key held');
+    // A pass lifts nothing: only a new ack does.
+    assert.deepEqual(startCheck({ store, ledger, eff: { ...s.eff, mode: 'dry-run' }, provider, key: FAKE_ANTHROPIC_KEY }), { ok: true });
+    assert.equal(store.getControl(hardCapPauseKey('anthropic')), 'hard_cap');
+    ledger.liftHardCapPause('anthropic');
+    assert.deepEqual(startCheck({ store, ledger, eff: live(D2_ACK), provider: null, key: FAKE_ANTHROPIC_KEY }), { ok: false, code: 'provider' });
+    assert.equal(store.getControl(hardCapPauseKey('anthropic')), null, 'nothing to pause without a provider');
+  } finally {
+    services.close();
+  }
+});
+
+test('a file edited to live under a running anthropic bot sends nothing: the Key is withheld, the hard-cap pause set, and reserve refuses (control: dry-run and openrouter keep their Key)', async () => {
+  const qq = await mockQq();
+  const s = anthropicSite(qq);
+  let fetched = 0;
+  const fetch = async () => {
+    fetched += 1;
+    return new Response(JSON.stringify({ type: 'message', model: 'claude-haiku-5-5', content: [{ type: 'text', text: '{}' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }), { status: 200 });
+  };
+  const services = openBotServices(s.effectivePath, { env: anthropicEnv(s), fetch });
+  const ask = () => services.decide({ trigger: 'ordinary', lines: [], current: { sender: 'U1', text: 'x' } });
+  try {
+    const { store, ledger } = services;
+    // Control: the dry-run file the start check passed keeps the Key; nothing is paused.
+    assert.equal(services.getKey() === FAKE_ANTHROPIC_KEY, true);
+    assert.equal(store.getControl(hardCapPauseKey('anthropic')), null);
+
+    // The hand edit: live, still no ack. No Key leaves, nothing is sent or charged, and paid work pauses.
+    rewrite(s, (eff) => { eff.mode = 'live'; });
+    assert.equal(services.getEffective().mode, 'live', 'the reader sees the new file');
+    assert.equal(services.getKey() === null, true, 'no Key');
+    const d = await ask();
+    assert.deepEqual({ i: d.invalid, p: d.paid, f: fetched }, { i: 'unavailable', p: false, f: 0 });
+    assert.equal((await services.client.post({ model: 'claude-opus-5-5' })).reason, 'unavailable');
+    assert.equal(fetched, 0);
+    assert.equal(store.getControl(hardCapPauseKey('anthropic')), 'hard_cap');
+    assert.equal(store.getControl('paid_paused'), null, 'paid_paused is left alone');
+    assert.deepEqual(ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: 1000 }), { ok: false, reason: 'hard_cap_unverified' });
+
+    // Control: the D2 ack bound to the Key held passes the cap and the recorded rules, so the Key is given again.
+    ledger.liftHardCapPause('anthropic');
+    store.setControl(hardCapControlKey('anthropic'), store.key(FAKE_ANTHROPIC_KEY), 'cli');
+    rewrite(s, (eff) => { eff.apiProvider.hardCap = D2_ACK; });
+    assert.equal(services.getKey() === FAKE_ANTHROPIC_KEY, true, 'the Key');
+    assert.equal(store.getControl(hardCapPauseKey('anthropic')), null);
+    assert.equal(fetched, 0);
+  } finally {
+    services.close();
+  }
+
+  // Control: OpenRouter in live keeps its Key and pauses nothing.
+  const or = site(qq);
+  const orServices = openBotServices(or.effectivePath, { env: envFor(or), fetch });
+  try {
+    assert.equal(orServices.getEffective().mode, 'live');
+    assert.equal(orServices.getKey(), KEY);
+    assert.equal(orServices.store.getControl(hardCapPauseKey('openrouter')), null);
+  } finally {
+    orServices.close();
+  }
+});
+
+test('startCheck with no file to read fails closed on anthropic (hard_cap, paused); openrouter passes and pauses nothing', async () => {
+  const qq = await mockQq();
+  const s = anthropicSite(qq);
+  const services = openBotServices(s.effectivePath, { env: anthropicEnv(s), fetch: async () => { throw new Error('no network in this test'); } });
+  try {
+    const { store, ledger, provider } = services;
+    assert.deepEqual(startCheck({ store, ledger, eff: s.eff, provider, key: FAKE_ANTHROPIC_KEY }), { ok: true }, 'control: the dry-run file passes');
+    assert.equal(store.getControl(hardCapPauseKey('anthropic')), null);
+    assert.deepEqual(startCheck({ store, ledger, eff: null, provider, key: FAKE_ANTHROPIC_KEY }), { ok: false, code: 'hard_cap' });
+    assert.equal(store.getControl(hardCapPauseKey('anthropic')), 'hard_cap');
+  } finally {
+    services.close();
+  }
+  const or = site(qq);
+  const orServices = openBotServices(or.effectivePath, { env: envFor(or), fetch: async () => { throw new Error('no network in this test'); } });
+  try {
+    const { store, ledger, provider } = orServices;
+    assert.deepEqual(startCheck({ store, ledger, eff: null, provider, key: KEY }), { ok: true });
+    assert.equal(store.getControl(hardCapPauseKey('openrouter')), null);
+  } finally {
+    orServices.close();
   }
 });

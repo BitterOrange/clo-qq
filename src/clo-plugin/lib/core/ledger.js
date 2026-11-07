@@ -2,6 +2,10 @@
 import { randomUUID } from 'node:crypto';
 import { shanghaiDay, shanghaiDayStart, utcDay } from './ids.js';
 import { callWorstMicros } from './models.js';
+import {
+  ANTHROPIC_LIMIT_SOURCES, HARD_CAP_PAUSE, LIVE_CODES, OPENROUTER_LIMIT_SOURCES, OWNER_CLEARED_PROVIDER_PAUSES,
+  PROVIDER_KINDS, hardCapControlKey, hardCapPauseKey, providerOfEffective,
+} from './providers/registry.js';
 import { pauseRank } from './store.js';
 
 const KEY_TIMEOUT_MS = 8000;
@@ -17,9 +21,14 @@ const STREAK_TTL_MS = 7 * 24 * 3600000;
 const DECISION_STREAK_KEY = 'decision_fail_streak';
 const DECISION_BREAKER = 'decision_paused';
 const DECISION_RETRY_MS = 10 * 60000;
-const LIMIT_SOURCES = new Set(['openrouter_key_limit', 'openrouter_credits']);
+const LIMIT_SOURCES = new Set(OPENROUTER_LIMIT_SOURCES);
+// They pause under their own names, and only while an Anthropic Key is the one spending.
+const ANTHROPIC_LIMITS = new Set(ANTHROPIC_LIMIT_SOURCES);
 // No Key read can lift these: usage_unavailable waits for a person to look, and credits for a person to top up.
 const OWNER_CLEARS = new Set(['usage_unavailable', 'openrouter_credits']);
+// A provider whose Key cannot be read has nothing that could lift its pauses but the owner (decisions D3 to D5).
+const OWNER_CLEARS_PROVIDER = new Set(OWNER_CLEARED_PROVIDER_PAUSES);
+const HARD_CAP_CODES = new Set([LIVE_CODES.hardCap, LIVE_CODES.providerRules]);
 const CREDITS_PROBE = 'credits_probe';
 const CLEAR_ON_CLEAN_READ = new Set(['key_read_failed', 'residual', 'provider_fail', 'openrouter_key_limit']);
 const CLEAR_WHEN_SETTLED = new Set(['crash_unsettled', 'usage_missing']);
@@ -61,9 +70,26 @@ function microsOf(v) {
   return Number.isFinite(n) ? usdToMicros(n) : null;
 }
 
-export function createLedger({ store, getEffective, fetch = globalThis.fetch, getKey, log = () => {}, now = Date.now, setTimer = setInterval, clearTimer = clearInterval, runtime = 'openclaw' }) {
+// getProvider(eff) gives the provider entry that spends under that effective file (registry shape), or null when none
+// can be named. Its caps decide whether the Key can be read at all: an Anthropic Key is never sent to OpenRouter's /key.
+// Each call resolves the provider once, from the very eff it uses, so one call never mixes two reads of the file. On the
+// own runtime an unreadable file names no provider: the implicit OpenRouter entry would read and pause on the wrong Key.
+export function createLedger({ store, getEffective, fetch = globalThis.fetch, getKey, log = () => {}, now = Date.now, setTimer = setInterval, clearTimer = clearInterval, runtime = 'openclaw', getProvider = (eff) => (eff == null && runtime === 'own' ? null : providerOfEffective(eff)) }) {
   if (runtime !== 'openclaw' && runtime !== 'own') throw new TypeError('createLedger: runtime must be openclaw or own');
   const { q } = store;
+  const provider = (eff) => {
+    try {
+      return getProvider(eff) ?? null;
+    } catch {
+      return null;
+    }
+  };
+  // No provider means nothing can be sent, and nothing is read either.
+  const keyReadable = (p) => p?.caps?.keyReadable === true;
+  // What reservations.provider holds: the kind, or NULL for the implicit OpenRouter entry.
+  const providerColumn = (p) => (p.implicit ? null : p.kind);
+  // The rows the OpenRouter Key figure can speak for.
+  const OPENROUTER_ROWS = "(provider IS NULL OR provider='openrouter')";
   let keyFailures = 0;
   let timer = null;
   let liveStarted = false;
@@ -138,6 +164,10 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     return store.tx(() => {
       const eff = getEffective();
       if (!eff) return { ok: false, reason: 'total' };
+      const p = provider(eff);
+      if (!p) return { ok: false, reason: 'provider' };
+      // Its own control, so it neither hides nor replaces what paid_paused holds, and it binds only its own kind.
+      if (store.getControl(hardCapPauseKey(p.kind)) !== null) return { ok: false, reason: HARD_CAP_PAUSE };
       if (store.getControl('paid_paused') !== null) return { ok: false, reason: 'paid_paused' };
       const at = now();
       const s = spent(at);
@@ -154,9 +184,9 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
         return { ok: false, reason: 'tier' };
       }
       const id = randomUUID();
-      q(`INSERT INTO reservations(id, local_day, utc_day, tier, category, held_micros, status, event_key, model, run_gen, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?)`)
-        .run(id, shanghaiDay(at), utcDay(at), tier, category, heldMicros, eventKey, model, store.runGen, at);
+      q(`INSERT INTO reservations(id, local_day, utc_day, tier, category, held_micros, status, event_key, model, run_gen, created_at, provider)
+         VALUES (?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?, ?)`)
+        .run(id, shanghaiDay(at), utcDay(at), tier, category, heldMicros, eventKey, model, store.runGen, at, providerColumn(p));
       return { ok: true, id };
     });
   }
@@ -197,16 +227,22 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     return Number(q("UPDATE reservations SET status='released', settled_at=? WHERE id=? AND status='held'").run(now(), id).changes) === 1;
   }
 
-  function insertSettledRow({ tier, category, actualMicros, source, model, eventKey }) {
+  // providerValue: the reservations.provider of the row; by default the provider spending now.
+  function insertSettledRow({ tier, category, actualMicros, source, model, eventKey, providerValue }) {
     const at = now();
     const id = randomUUID();
-    q(`INSERT INTO reservations(id, local_day, utc_day, tier, category, held_micros, actual_micros, status, source, event_key, model, run_gen, created_at, settled_at)
-       VALUES (?, ?, ?, ?, ?, 0, ?, 'settled', ?, ?, ?, ?, ?, ?)`)
-      .run(id, shanghaiDay(at), utcDay(at), tier, category, actualMicros, source ?? null, eventKey ?? null, model ?? null, store.runGen, at, at);
+    let value = providerValue;
+    if (value === undefined) {
+      const p = provider(getEffective());
+      value = p ? providerColumn(p) : null;
+    }
+    q(`INSERT INTO reservations(id, local_day, utc_day, tier, category, held_micros, actual_micros, status, source, event_key, model, run_gen, created_at, settled_at, provider)
+       VALUES (?, ?, ?, ?, ?, 0, ?, 'settled', ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, shanghaiDay(at), utcDay(at), tier, category, actualMicros, source ?? null, eventKey ?? null, model ?? null, store.runGen, at, at, value ?? null);
     return id;
   }
 
-  const streakLimit = () => getEffective()?.budget.providerFailStreakPause ?? 3;
+  const streakLimit = (eff = getEffective()) => eff?.budget.providerFailStreakPause ?? 3;
 
   // Other reasons can relabel provider_fail. A streak that reached the limit ends with the pause under any label;
   // a shorter one has paused nothing, so it keeps counting.
@@ -249,18 +285,20 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
           resumeIfSettled();
           return { status: 'settled', id: row.id };
         }
-        const prior = q('SELECT tier FROM reservations WHERE event_key=? ORDER BY created_at DESC LIMIT 1').get(eventKey);
+        const prior = q('SELECT tier, provider FROM reservations WHERE event_key=? ORDER BY created_at DESC LIMIT 1').get(eventKey);
         if (prior) {
-          return { status: 'adjusted', id: insertSettledRow({ tier: prior.tier, category: 'adjustment', actualMicros, source, model, eventKey }) };
+          // It belongs to the provider that ran the event.
+          return { status: 'adjusted', id: insertSettledRow({ tier: prior.tier, category: 'adjustment', actualMicros, source, model, eventKey, providerValue: prior.provider }) };
         }
       }
       return { status: 'unattributed', id: insertSettledRow({ tier: 'none', category: 'unattributed', actualMicros, source, model, eventKey }) };
     });
   }
 
-  async function readKey() {
-    const eff = getEffective();
+  async function readKey(eff = getEffective()) {
     if (!eff) throw new Error('key read failed: no effective config');
+    // Before the Key is even fetched: a Key this provider cannot read with must never reach the /key endpoint.
+    if (!keyReadable(provider(eff))) throw new Error('key read unsupported');
     const key = getKey();
     if (!key) throw new Error('key read failed: no key');
     const res = await fetch(`${eff.openrouter.baseUrl}/key`, {
@@ -292,7 +330,7 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     const b = getEffective()?.budget;
     const delay = b?.unsettledClearMs ?? UNSETTLED_CLEAR_MS;
     const reads = b?.unsettledClearReads ?? UNSETTLED_CLEAR_READS;
-    for (const row of q("SELECT id, created_at FROM reservations WHERE status='unsettled' AND created_at>=? AND created_at<=? ORDER BY created_at").all(base.at, at - delay)) {
+    for (const row of q(`SELECT id, created_at FROM reservations WHERE status='unsettled' AND ${OPENROUTER_ROWS} AND created_at>=? AND created_at<=? ORDER BY created_at`).all(base.at, at - delay)) {
       const seen = q('SELECT COUNT(*) AS n FROM key_snapshots WHERE taken_at>?').get(row.created_at).n;
       if (seen < reads) continue;
       q("UPDATE reservations SET status='settled', actual_micros=0, source='key_delta_none', settled_at=? WHERE id=? AND status='unsettled'").run(at, row.id);
@@ -322,8 +360,8 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     return days > 0 && at - base.at > days * DAY_MS;
   }
 
-  // What the key has charged since the baseline, beyond what local rows already explain.
-  function attribute(k, keyId, at) {
+  // What the key has charged since the baseline, beyond what local rows already explain. p: the provider of the read.
+  function attribute(k, keyId, at, p) {
     let base = loadBaseline();
     // A baseline from before it carried an id takes the current one: a rotation in that one gap shows only if the figure falls.
     if (base && ((base.keyId && base.keyId !== keyId) || k.usageMicros < base.usage)) {
@@ -348,19 +386,20 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
       saveBaseline(k.usageMicros, at, keyId);
       return;
     }
-    const explained = q("SELECT COALESCE(SUM(actual_micros), 0) AS m FROM reservations WHERE status='settled' AND settled_at>=?").get(base.at).m;
+    // Only rows the OpenRouter Key could have charged explain its figure: another provider's spend never shows there.
+    const explained = q(`SELECT COALESCE(SUM(actual_micros), 0) AS m FROM reservations WHERE status='settled' AND ${OPENROUTER_ROWS} AND settled_at>=?`).get(base.at).m;
     // Calls in flight may already be in the provider figure, so they are not unexplained yet.
-    const inFlight = q("SELECT COALESCE(SUM(held_micros), 0) AS m FROM reservations WHERE status='held'").get().m;
+    const inFlight = q(`SELECT COALESCE(SUM(held_micros), 0) AS m FROM reservations WHERE status='held' AND ${OPENROUTER_ROWS}`).get().m;
     let unexplained = k.usageMicros - base.usage - explained - inFlight;
     const clean = unexplained <= 0 && inFlight === 0;
     if (unexplained > 0) {
-      for (const row of q("SELECT id, held_micros FROM reservations WHERE status='unsettled' ORDER BY created_at").all()) {
+      for (const row of q(`SELECT id, held_micros FROM reservations WHERE status='unsettled' AND ${OPENROUTER_ROWS} ORDER BY created_at`).all()) {
         if (unexplained <= 0) break;
         const amount = Math.min(unexplained, row.held_micros);
         setSettled(row.id, amount, 'key_delta', null);
         unexplained -= amount;
       }
-      if (unexplained > 0) insertSettledRow({ tier: 'none', category: 'unattributed', actualMicros: unexplained, source: 'key_delta' });
+      if (unexplained > 0) insertSettledRow({ tier: 'none', category: 'unattributed', actualMicros: unexplained, source: 'key_delta', providerValue: providerColumnOfKey(p) });
     }
     if (clean) clearUnbilled(base, at);
     if (at - base.at > REBASE_AFTER_MS && quietToRebase(at)) saveBaseline(k.usageMicros, at, keyId);
@@ -394,12 +433,21 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     return at - store.controlUpdatedAt('paid_paused') >= (getEffective()?.budget?.creditsRetryMs ?? CREDITS_RETRY_MS);
   }
 
+  // What the OpenRouter Key's own rows carry: the implicit entry stays NULL, an explicit one 'openrouter'.
+  function providerColumnOfKey(p) {
+    return p && p.kind === 'openrouter' ? providerColumn(p) : 'openrouter';
+  }
+
   async function reconcile(at = now(), { atStart = false } = {}) {
+    const startEff = getEffective();
+    const startP = provider(startEff);
+    // Nothing to read, so nothing to pause on: the local estimate is all there is (decision D3).
+    if (!keyReadable(startP)) return { ok: false, unsupported: true };
     const readStartedAt = now();
     let k;
     let keyId;
     try {
-      k = await readKey();
+      k = await readKey(startEff);
       keyId = store.key(getKey());
     } catch {
       keyFailures += 1;
@@ -411,11 +459,15 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     lastReadAt = at;
     const eff = getEffective();
     if (!eff) return { ok: false, residualMicros: null, paused: store.getControl('paid_paused') !== null };
+    // The file may have changed during the read. A figure read for another kind, or under a provider whose Key can no
+    // longer be read, explains nothing here.
+    const p = provider(eff);
+    if (!keyReadable(p) || p.kind !== startP.kind) return { ok: false, residualMicros: null, paused: store.getControl('paid_paused') !== null };
     return store.tx(() => {
       q(`INSERT OR REPLACE INTO key_snapshots(taken_at, usage_micros, usage_daily_micros, limit_micros, remaining_micros, limit_reset)
          VALUES (?, ?, ?, ?, ?, ?)`).run(at, k.usageMicros, k.usageDailyMicros, k.limitMicros, k.remainingMicros, k.limitReset);
       noteKeyLimit(k, eff);
-      attribute(k, keyId, at);
+      attribute(k, keyId, at, p);
 
       const day = shanghaiDay(at);
       const residualMicros = residualFor(day);
@@ -448,7 +500,7 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
 
   async function tick() {
     const eff = getEffective();
-    if (!eff || eff.mode !== 'live' || !getKey()) return;
+    if (!eff || eff.mode !== 'live' || !keyReadable(provider(eff)) || !getKey()) return;
     const at = now();
     const unsettled = q("SELECT COUNT(*) AS n FROM reservations WHERE status='unsettled'").get().n;
     if (!liveStarted) {
@@ -459,12 +511,61 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     }
   }
 
+  // The baseline and the snapshots belong to one Key, and the baseline is the only record of which Key that was.
+  // Dropping both makes the next read start a new baseline and a new day figure, so a switch back to OpenRouter, with
+  // this Key or another, never reads another Key's figure, or the time away, as charges. Local rows still hold what was
+  // spent today. Safe only with no row held or unsettled.
+  function rebaseKey() {
+    q('DELETE FROM meta WHERE key=?').run(BASELINE_META);
+    q('DELETE FROM key_snapshots').run();
+  }
+
+  // Before `clo provider use` writes the config. It refuses while a pause, the decision breaker or any open row would
+  // carry over to the other provider; otherwise it clears what only the old provider's Key reads or calls could end.
+  // Hard-cap pauses and attestations stay: they belong to their kind, and switching away needs no attestation.
+  function resetForProviderSwitch() {
+    const out = store.tx(() => {
+      if (store.getControl('paid_paused') !== null) return { ok: false, reason: 'paid_paused' };
+      if (store.getControl(DECISION_BREAKER) !== null) return { ok: false, reason: 'decision_breaker' };
+      if (q("SELECT COUNT(*) AS n FROM reservations WHERE status IN ('held','unsettled')").get().n > 0) return { ok: false, reason: 'reservations' };
+      store.delControl(RESIDUAL_COUNT);
+      store.delControl(CREDITS_PROBE);
+      store.delControl(KEY_LIMIT_SEEN);
+      q('DELETE FROM counters WHERE key=?').run(STREAK_KEY);
+      rebaseKey();
+      return { ok: true };
+    });
+    if (out.ok) {
+      keyFailures = 0;
+      lastReadAt = 0;
+    }
+    return out;
+  }
+
+  function checkKind(kind) {
+    if (!PROVIDER_KINDS.includes(kind)) throw new TypeError('ledger: unknown provider kind');
+  }
+
   function runTick() {
     tick().catch(() => log('reconcile_error', {}));
   }
 
   // The Key is shared, so a limit error from either path stops all paid work. A bare 402 still means no money.
-  function pauseOnLimit(httpStatus, limitSource) {
+  // Each kind's limit names count only while that kind spends: a stray one from the other kind pauses nothing under
+  // its name, so no pause can appear that only the other kind's Key read could lift.
+  // p: the provider spending now, resolved once by the caller. With none named (an unreadable file on the own runtime)
+  // no limit pause is taken under either kind's names: the error still counts in the streak.
+  function pauseOnLimit(httpStatus, limitSource, p) {
+    if (!p) return false;
+    if (p.kind === 'anthropic') {
+      if (ANTHROPIC_LIMITS.has(limitSource)) {
+        pausePaid(limitSource);
+        return true;
+      }
+      if (httpStatus !== 402) return false;
+      pausePaid('anthropic_credits');
+      return true;
+    }
     if (httpStatus !== 402 && httpStatus !== 403) return false;
     if (LIMIT_SOURCES.has(limitSource)) {
       pausePaid(limitSource);
@@ -483,17 +584,20 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     markUnsettled,
     applyLateUsage,
     spent,
-    readKey,
+    readKey: () => readKey(),
     reconcile,
     pausePaid,
 
     // Primary model errors. Provider text never reaches this function.
     noteProviderError({ httpStatus = null, limitSource = null } = {}) {
-      if (pauseOnLimit(httpStatus, limitSource)) return;
+      const eff = getEffective();
+      const p = provider(eff);
+      if (pauseOnLimit(httpStatus, limitSource, p)) return;
       if (httpStatus === 403) store.addAlert('provider_403', { httpStatus });
       const { value } = store.bumpCounter(STREAK_KEY, now() + STREAK_TTL_MS);
-      if (value < streakLimit()) return;
-      pausePaid(probeLive() ? 'openrouter_credits' : 'provider_fail');
+      if (value < streakLimit(eff)) return;
+      // The credits probe speaks of OpenRouter credits only.
+      pausePaid(p?.kind === 'openrouter' && probeLive() ? 'openrouter_credits' : 'provider_fail');
     },
     noteProviderOk() {
       q('DELETE FROM counters WHERE key=?').run(STREAK_KEY);
@@ -502,13 +606,14 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
 
     // Decision errors stop decisions only: a failing cheap model must not silence real @ replies.
     noteDecisionError({ httpStatus = null, limitSource = null } = {}) {
-      if (pauseOnLimit(httpStatus, limitSource)) return;
+      const eff = getEffective();
+      if (pauseOnLimit(httpStatus, limitSource, provider(eff))) return;
       if (httpStatus === 403) store.addAlert('provider_403', { httpStatus });
       store.tx(() => {
         const { value } = store.bumpCounter(DECISION_STREAK_KEY, now() + STREAK_TTL_MS);
         if (store.getControl(DECISION_BREAKER) !== null) {
           store.setControl(DECISION_BREAKER, 'open', 'ledger');
-        } else if (value >= (getEffective()?.budget.providerFailStreakPause ?? 3)) {
+        } else if (value >= streakLimit(eff)) {
           store.setControl(DECISION_BREAKER, 'open', 'ledger');
           store.addAlert('decision_paused', { count: value });
           log('decision_paused', { count: value });
@@ -546,13 +651,23 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     },
 
     // The owner says the cause is dealt with. Only for pauses nothing else can lift early; a wrong call pauses again.
+    // provider_fail too where no Key read can lift it. Then the streak is left one short of the limit, so one more
+    // failure pauses again at once; an anthropic_* limit pauses again at its next occurrence.
     clearOwnerPause() {
       return store.tx(() => {
         const reason = store.getControl('paid_paused');
-        if (!OWNER_CLEARS.has(reason)) return { cleared: false, reason };
+        const eff = getEffective();
+        const providerFail = reason === 'provider_fail' && provider(eff)?.caps?.ownerClearsProviderFail === true;
+        if (!OWNER_CLEARS.has(reason) && !OWNER_CLEARS_PROVIDER.has(reason) && !providerFail) return { cleared: false, reason };
         liftPause(reason);
-        // The failures behind the pause end with it. New ones still need a full streak to pause again.
-        q('DELETE FROM counters WHERE key=?').run(STREAK_KEY);
+        const limit = streakLimit(eff);
+        if (providerFail && limit > 1) {
+          q(`INSERT INTO counters(key, value, expires_at) VALUES (?, ?, ?)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at`).run(STREAK_KEY, limit - 1, now() + STREAK_TTL_MS);
+        } else {
+          // The failures behind the pause end with it. New ones still need a full streak to pause again.
+          q('DELETE FROM counters WHERE key=?').run(STREAK_KEY);
+        }
         log('paid_resumed', { reason });
         // Not past what is already known: a residual this pause was masking, or rows still unknown.
         holdForResidual();
@@ -574,6 +689,59 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
         log('accept_unsettled', { count: rows.length, source: 'manual', reason: String(by).slice(0, 32) });
         return rows.length;
       });
+    },
+
+    rebaseKey,
+    resetForProviderSwitch,
+
+    // The hard-cap pause (contract 8.1). Not a paid_paused reason: it lives in a control per kind, so it never
+    // replaces a lower pause, lifting it never clears one, and it binds only while its kind spends.
+    pauseHardCap(kind, by = 'ledger', code = LIVE_CODES.hardCap) {
+      checkKind(kind);
+      if (!HARD_CAP_CODES.has(code)) throw new TypeError('ledger.pauseHardCap: unknown code');
+      store.tx(() => {
+        const key = hardCapPauseKey(kind);
+        if (store.getControl(key) === code) return;
+        store.setControl(key, code, String(by).slice(0, 32));
+        store.addAlert('paid_paused', { reason: HARD_CAP_PAUSE, code });
+        log('paid_paused', { reason: HARD_CAP_PAUSE });
+      });
+    },
+    // Only an ack calls this. Whatever paid_paused holds stays as it is.
+    liftHardCapPause(kind) {
+      checkKind(kind);
+      store.delControl(hardCapPauseKey(kind));
+    },
+    hardCapPaused(kind) {
+      checkKind(kind);
+      return store.getControl(hardCapPauseKey(kind));
+    },
+    // `clo ack hard-cap`: binds the attestation to this Key's fingerprint and lifts that kind's hard-cap pause, together.
+    attestHardCap(kind, key, by = 'cli') {
+      checkKind(kind);
+      if (typeof key !== 'string' || key === '') throw new TypeError('ledger.attestHardCap: no key');
+      store.tx(() => {
+        store.setControl(hardCapControlKey(kind), store.key(key), String(by).slice(0, 32));
+        store.delControl(hardCapPauseKey(kind));
+      });
+    },
+    // Whether the attested fingerprint is this Key's. No Key, or no attestation, is not a match.
+    hardCapKeyMatches(kind, key) {
+      checkKind(kind);
+      const control = store.getControl(hardCapControlKey(kind));
+      return typeof key === 'string' && key !== '' && control !== null && control === store.key(key);
+    },
+
+    // What status shows beside paid_paused: the kind spending now, whether its Key can be read (reconciliation is
+    // unavailable where it cannot), and that kind's hard-cap pause.
+    snapshot() {
+      const p = provider(getEffective());
+      return {
+        provider: p ? p.kind : null,
+        keyReadable: keyReadable(p),
+        paidPaused: store.getControl('paid_paused'),
+        hardCapPaused: p ? store.getControl(hardCapPauseKey(p.kind)) : null,
+      };
     },
   };
 }

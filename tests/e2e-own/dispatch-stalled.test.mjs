@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { after, before, test } from 'node:test';
 import { fullAt, nextId, push } from '../fixtures/qq-events.mjs';
-import { MEMBER, MEMBER2, netAttempts, startOwnStack, until } from '../harness/own.mjs';
+import { MEMBER, MEMBER2, netAttempts, PROVIDER, startOwnStack, until } from '../harness/own.mjs';
 
 const PASSIVE_WINDOW_MS = 285000;
 const STALL_MS = 120000;
@@ -17,6 +17,7 @@ let s;
 
 before(async () => {
   s = await startOwnStack({
+    provider: PROVIDER,
     label: 'stalled',
     script: () => ({ text: REPLY }),
     effective: { window: { staleMs: PASSIVE_WINDOW_MS + 60000 } },

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
-import { baseConfig, CATALOG, catalogRow, clo, configOf, effectiveOf, enabledConfig, fakeProvider, makeRoot, openclawOf, readJson, readyForLive } from './_cli-helper.mjs';
+import { baseConfig, CATALOG, catalogRow, clo, configOf, effectiveOf, enabledConfig, fakeProvider, makeRoot, openclawOf, readJson, readyForLive, recordProvider, TEST_ANTHROPIC_BOOK, withProviders, writePriceBook } from './_cli-helper.mjs';
 
 const roots = [];
 const root = (label, cfg) => {
@@ -294,4 +294,81 @@ test('check compares prices when the model is the same', async () => {
   assert.doesNotMatch(res.out, /与锁定一致/);
   assert.match(res.out, /目录价格和锁定时不同/);
   assert.deepEqual(snapshot(r), before);
+});
+
+// --- clo model lock --provider: a kind whose API returns no price locks from the hand-entered book. No network. ---
+
+const bookRoot = (label, { active = 'openrouter', qq = false } = {}) => {
+  const cfg = qq ? enabledConfig() : baseConfig();
+  const r = root(label, withProviders(cfg, { active, anthropicBaseUrl: active === 'anthropic' ? 'http://127.0.0.1:9' : undefined }));
+  recordProvider(r);
+  return r;
+};
+
+test('model lock --provider anthropic: from the book, only with --confirm-price the first time, and nothing else in the lock file moves', async () => {
+  const r = bookRoot('book-lock');
+  assert.equal((await clo(r, ['model', 'refresh'], { fetch: fakeProvider().fetch })).code, 0);
+  const noBook = await clo(r, ['model', 'lock', '--provider', 'anthropic', '--confirm-price']);
+  assert.equal(noBook.code, 1);
+  assert.match(noBook.err, /priceBook/);
+  writePriceBook(r);
+  const before = snapshot(r);
+  const orBefore = lockOf(r);
+
+  const first = await clo(r, ['model', 'lock', '--provider', 'anthropic']);
+  assert.equal(first.code, 1);
+  assert.match(first.err, /--confirm-price/);
+  assert.deepEqual(snapshot(r), before, 'a refused lock writes nothing');
+  const wrongKind = await clo(r, ['model', 'lock', '--provider', 'openrouter', '--confirm-price']);
+  assert.equal(wrongKind.code, 1);
+  assert.match(wrongKind.err, /clo model refresh/);
+  const missing = await clo(r, ['model', 'lock']);
+  assert.equal(missing.code, 1);
+
+  const ok = await clo(r, ['model', 'lock', '--provider', 'anthropic', '--confirm-price']);
+  assert.equal(ok.code, 0, `${ok.out}${ok.err}`);
+  assert.match(ok.out, /价格表/);
+  assert.match(ok.out, /clo provider use anthropic --confirm/, 'not in use yet, and the switch is named');
+  const models = lockOf(r);
+  assert.deepEqual(models.locks.anthropic.primary, { id: 'claude-opus-5-5', selector: 'claude-opus-5-5', price: TEST_ANTHROPIC_BOOK().models['claude-opus-5-5'] });
+  assert.deepEqual(models.locks.anthropic.decision, { id: 'claude-haiku-5-5', price: TEST_ANTHROPIC_BOOK().models['claude-haiku-5-5'] });
+  for (const k of ['lock', 'primarySelector', 'primaryResolved', 'decision', 'changes', 'priceBooks']) assert.deepEqual(models[k], orBefore[k], `${k} unchanged`);
+  assert.equal(readFileSync(join(r, 'config.json'), 'utf8'), before[0], 'config.json unchanged');
+
+  // A relock at the same prices needs no confirmation; a changed book price does, and a catalog refresh leaves it alone.
+  assert.equal((await clo(r, ['model', 'lock', '--provider', 'anthropic'])).code, 0, 'control: same ids, same prices');
+  const book = TEST_ANTHROPIC_BOOK();
+  book.models['claude-opus-5-5'].outputPerM = 25;
+  writePriceBook(r, book);
+  const dearer = await clo(r, ['model', 'lock', '--provider', 'anthropic']);
+  assert.equal(dearer.code, 1);
+  assert.match(dearer.err, /--confirm-price/);
+  assert.equal(lockOf(r).locks.anthropic.primary.price.outputPerM, 20);
+  assert.equal((await clo(r, ['model', 'refresh'], { fetch: fakeProvider().fetch })).code, 0);
+  assert.deepEqual(lockOf(r).locks.anthropic, models.locks.anthropic, 'refresh never touches the Anthropic lock');
+  assert.deepEqual(lockOf(r).priceBooks.anthropic, book, 'or the book');
+});
+
+test('model lock: changing the models in use while QQ is enabled needs --qq-platform-notified, and is recorded as a change', async () => {
+  const r = bookRoot('book-change', { active: 'anthropic', qq: true });
+  const book = TEST_ANTHROPIC_BOOK();
+  book.models['claude-sonnet-5-5'] = { inputPerM: 3, outputPerM: 15, cacheReadPerM: 0.3, cacheWritePerM: 3.75, cacheWrite1hPerM: 6 };
+  writePriceBook(r, book);
+  assert.equal((await clo(r, ['model', 'lock', '--provider', 'anthropic', '--confirm-price'])).code, 0);
+  assert.equal(effectiveOf(r).models.primary.id, 'claude-opus-5-5');
+  const cfg = configOf(r);
+  cfg.providers.anthropic.models.primary = 'claude-sonnet-5-5';
+  writeFileSync(join(r, 'config.json'), JSON.stringify(cfg, null, 2));
+  const before = snapshot(r);
+  const silent = await clo(r, ['model', 'lock', '--provider', 'anthropic', '--confirm-price']);
+  assert.equal(silent.code, 1);
+  assert.match(silent.err, /§4\.2/);
+  assert.deepEqual(snapshot(r), before);
+  const told = await clo(r, ['model', 'lock', '--provider', 'anthropic', '--confirm-price', '--qq-platform-notified']);
+  assert.equal(told.code, 0, `${told.out}${told.err}`);
+  assert.match(told.out, /已记录：你确认向平台报告了这次模型变更/);
+  assert.equal(effectiveOf(r).models.primary.id, 'claude-sonnet-5-5');
+  assert.deepEqual(lockOf(r).changes.at(-1), { ...lockOf(r).changes.at(-1), kind: 'anthropic', primary: 'claude-sonnet-5-5', qqPlatformNotified: true });
+  const shown = await clo(r, ['model', 'show']);
+  assert.match(shown.out, /接口 anthropic（anthropic）（在用）：锁定 主模型 claude-sonnet-5-5/);
 });
