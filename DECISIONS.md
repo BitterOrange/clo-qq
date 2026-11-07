@@ -223,6 +223,7 @@
 | 换接口算模型变更（规划 D8） | `clo provider use` 算一次模型变更：启用 QQ 时要加 `--qq-platform-notified`，表示部署者本人已向平台报告（协议 §4.2）。它清除每个群的“已告知”和 D3（协议 §4.2）的记录，所以换完要重新告知、重新 `clo ack d3`，live 才会通过。告知的接收方也变了：直连 Anthropic 时，文字直接发给 Anthropic，不经过 OpenRouter。只有这个命令能换：它在 `clo.db` 里记下换到的接口（`active_provider`），`clo apply` 和 `clo start` 发现 `config.json` 里在用的接口和记下的不一样就拒绝，手改 `activeProvider` 和 `acks.provider` 跳不过这些步骤。没有记录时按生效配置里的接口，生效配置也没有时按 OpenRouter |
 | 改写的规则 | `CLAUDE.md` 第 4 节的密钥表和“只适用于 OpenRouter”那一段、第 6 节、第 8.2 节按上面几条改写，两种接口分开写清楚。“Key 日限额是硬上限”在 Anthropic 上换成声明的工作区月度上限。其他 OpenAI 兼容接口仍然不能用。第 7.1 到 7.5 节不动。代码里 live 的 `provider_rules` 一项（`src/clo-plugin/lib/core/providers/registry.js` 的 `LIVE_RULES_RECORDED`）以这几行为依据，和这几行在同一次提交里对 Anthropic 打开 |
 | 告知草稿 | `persona/group-notice.zh.md` 里“消息发给谁”那一句改成占位，由部署者按在用的接口填。**改过的草稿要用户本人看过**，告知仍由用户本人做（D5） |
+| D6 结算顺序（用户确认） | 用户 2026-11-07 确认按现在的做法：own 运行时走 OpenRouter 时，有上报的费用就按上报的结算，没有上报才按 token 乘锁定价；上报高于算出来的 1.10 倍时记一条告警，不暂停付费。理由和代价见下一节“OpenRouter 在 own 上怎么结算（规划 D6）”那一行 |
 
 ## 开发时定的，用户还没有确认（2026-11-07，Provider）
 
