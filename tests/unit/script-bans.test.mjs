@@ -78,6 +78,9 @@ test('stop signals a PID, not a name, and only after checking it', () => {
   const stop = /export function stopGateway[\s\S]*?\n}/.exec(life)[0];
   assert.match(stop, /'\/PID', String\(record\.pid\), '\/T', '\/F'/);
   assert.ok(stop.indexOf("state === 'mismatch'") < stop.indexOf('taskkill'), 'the identity check comes first');
+  // Off Windows the stop goes through one function, which takes the record and never a name.
+  assert.match(stop, /endRecordedTree\(record, env\b/);
+  assert.ok(stop.indexOf("state === 'mismatch'") < stop.indexOf('endRecordedTree'), 'the identity check comes first there too');
 });
 
 test('every PowerShell script is ASCII, since Windows PowerShell misreads UTF-8 with no BOM', () => {

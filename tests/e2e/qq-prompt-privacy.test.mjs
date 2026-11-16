@@ -3,7 +3,9 @@
 // what the host prompt leaves when the replacement is off.
 import assert from 'node:assert/strict';
 import { hostname, userInfo } from 'node:os';
+import { release, type } from 'node:os';
 import { describe, test } from 'node:test';
+import { IS_WINDOWS } from '../harness/platform.mjs';
 import { fullAt, nextId, plain, push } from '../fixtures/qq-events.mjs';
 import { decisionText } from '../harness/mock-openrouter.mjs';
 import { APP_ID, assertAgentRequest, BOT_MEMBER, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, MEMBER, ROOT, startStack, unexpectedNetAttempts } from '../harness/gateway.mjs';
@@ -22,6 +24,8 @@ const FORBIDDEN = (s) => [
   ['qq secret', FAKE_QQ_SECRET],
   ['display name', 'SENDER-DISPLAY-NAME'],
   ['windows nt', 'Windows_NT'],
+  // Off Windows the literal above matches nothing, so the same two facts are read from this machine.
+  ...(IS_WINDOWS ? [] : [['os type', type()], ['os release', release()]]),
 ];
 
 async function exercise(s) {

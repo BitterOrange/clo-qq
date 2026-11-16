@@ -5,7 +5,9 @@
 // On either provider kind: the body is read through the model view, and each kind's Key header is checked by name.
 import assert from 'node:assert/strict';
 import { hostname, userInfo } from 'node:os';
+import { release, type } from 'node:os';
 import { describe, test } from 'node:test';
+import { IS_WINDOWS } from '../harness/platform.mjs';
 import { fullAt, nextId, plain } from '../fixtures/qq-events.mjs';
 import { decisionText } from '../harness/model-view.mjs';
 import {
@@ -30,6 +32,8 @@ const FORBIDDEN = (s) => [
   ['display name', 'SENDER-DISPLAY-NAME'],
   ['bot display name', 'BOT-DISPLAY-NAME'],
   ['windows nt', 'Windows_NT'],
+  // Off Windows the literal above matches nothing, so the same two facts are read from this machine.
+  ...(IS_WINDOWS ? [] : [['os type', type()], ['os release', release()]]),
 ];
 // Header names a client library or the host would add to say who is calling. The bot sends none of them.
 const ATTRIBUTION = /^(http-referer|referer|x-title|x-stainless-.*|x-openclaw-.*|openai-.*|user-agent-openclaw)$/i;

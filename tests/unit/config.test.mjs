@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { buildEffective, ConfigError, createEffectiveReader, liveConfigProblems, livePreconditions, loadBusinessConfig, OPENROUTER_BASE_URL, resolvePaths, runtimeOf, validateBusinessConfig } from '../../src/clo-plugin/lib/core/config.js';
+import { IS_WINDOWS } from '../harness/platform.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
@@ -58,6 +59,14 @@ test('resolvePaths: CLO_TEST_ROOT moves all but repoRoot, and a path with spaces
 
 test('resolvePaths: test mode never resolves to the real .env, however it is spelled', () => {
   assert.throws(() => resolvePaths({ CLO_TEST_ROOT: ROOT }), /real project \.env/);
+  // Off Windows a path is spelled with '/' and its case counts, so the other spellings of the same folder differ.
+  if (!IS_WINDOWS) {
+    for (const spelled of [`${ROOT}/tests/..`, `${ROOT}/`, `${ROOT}//`, `${ROOT}/./`, `${ROOT}/tests/../`]) {
+      assert.throws(() => resolvePaths({ CLO_TEST_ROOT: spelled }), (e) => e instanceof ConfigError && /real project \.env/.test(e.message), spelled);
+    }
+    assert.equal(resolvePaths({ CLO_TEST_ROOT: `${ROOT}/tests` }).envFile, `${ROOT}/tests/.env`, 'positive control: a folder inside the repo is accepted');
+    return;
+  }
   assert.throws(() => resolvePaths({ CLO_TEST_ROOT: ROOT.toUpperCase() }), /real project \.env/);
   assert.throws(() => resolvePaths({ CLO_TEST_ROOT: `${ROOT}\\tests\\..` }), /real project \.env/);
   assert.throws(() => resolvePaths({ CLO_TEST_ROOT: `${ROOT}\\` }), ConfigError);
@@ -195,6 +204,13 @@ test('buildEffective holds what the design lists, no secret, and exact-case IDs'
   assert.equal(e.retention.decisionLineChars, 200);
   assert.equal(e.retention.decisionCurrentChars, 800);
   assert.equal(e.contentPolicy.sha256, 'f0ed566dc5f7b4e0b0c84111faf24d32f59c40cd8871ef0ba7bd23b938b70048');
+  // Off Windows the made-up Windows root is one path segment, and the parts under it are joined with '/'.
+  if (!IS_WINDOWS) {
+    assert.equal(e.contentPolicy.policyFile, 'C:\\repo/persona/CONTENT-POLICY.md');
+    assert.equal(e.paths.decisionPromptFile, 'C:\\repo/persona/decision-prompt.zh.md');
+    assert.ok(!/secret|sk-or/i.test(JSON.stringify({ ...e, qq: { ...e.qq } })), 'no secret field or value');
+    return;
+  }
   assert.equal(e.contentPolicy.policyFile, 'C:\\repo\\persona\\CONTENT-POLICY.md');
   assert.equal(e.paths.decisionPromptFile, 'C:\\repo\\persona\\decision-prompt.zh.md');
   assert.ok(!/secret|sk-or/i.test(JSON.stringify({ ...e, qq: { ...e.qq } })), 'no secret field or value');

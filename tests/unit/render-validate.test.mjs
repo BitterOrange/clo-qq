@@ -8,10 +8,10 @@ import { after, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildEffective } from '../../src/clo-plugin/lib/core/config.js';
 import { renderOpenclaw } from '../../src/clo-plugin/lib/core/render.js';
+import { NODE } from '../harness/platform.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
-const NODE = join(ROOT, '.runtime', 'node', 'node.exe');
 const OPENCLAW = join(ROOT, '.runtime', 'pkg', 'node_modules', 'openclaw', 'openclaw.mjs');
 const NET_GUARD = join(ROOT, 'tests', 'harness', 'net-guard.mjs');
 const tmp = mkdtempSync(join(tmpdir(), 'clo-render-validate-'));

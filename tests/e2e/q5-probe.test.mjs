@@ -11,6 +11,7 @@ import { buildPlan, createSpendTracker, FAKE_APP_ID, FIXED, HOST_ADDED, PRIMARY_
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { NODE, ROOT, sleep, until } from '../harness/gateway.mjs';
 import { decisionText, defaultCatalog, startMockOpenRouter } from '../harness/mock-openrouter.mjs';
+import { IS_WINDOWS } from '../harness/platform.mjs';
 
 const PROBE = join(ROOT, 'src', 'tools', 'q5-probe.mjs');
 const FAKE_KEY = 'sk-or-v1-CANARYKEY-Q5-E2E-NEVER-PRINT';
@@ -85,6 +86,7 @@ test('a whole run: direct calls, two Gateway turns on mock QQ, the lag, and sugg
     ? { text: answer, usage: { prompt_tokens: 3000, completion_tokens: 40, prompt_tokens_details: { cached_tokens: 0 }, total_tokens: 3040 } }
     : { text: answer, usage: { prompt_tokens: 200, completion_tokens: 60, completion_tokens_details: { reasoning_tokens: 25 }, cost: 0.0025 } }));
   let cmdLine = null;
+  let argv = null;
   let gatewayPid = null;
   const { child, done } = startProbe(root, model.base);
   try {
@@ -100,9 +102,31 @@ test('a whole run: direct calls, two Gateway turns on mock QQ, the lag, and sugg
         cmdLine = processInfo(gatewayPid)?.commandLine ?? null;
       }
     }, 500);
+    // Off Windows the lookup's command line is an identity, not text, and the host replaces the arguments /proc shows
+    // when it sets process.title early in its entry module. So the arguments are read here, as soon as the probe has
+    // written the PID, which it does once the spawn has returned and before the host's own code has run.
+    const argvWatcher = IS_WINDOWS ? null : setInterval(() => {
+      if (argv !== null) return;
+      const run = runRootOf(root);
+      const file = run && join(run, '.runtime', 'gateway.pid');
+      let pid = 0;
+      try {
+        pid = Number(readFileSync(file, 'utf8'));
+      } catch {
+        return;
+      }
+      if (!Number.isInteger(pid) || pid <= 1) return;
+      try {
+        argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0+$/, '').split('\0');
+      } catch {
+        argv = [];
+      }
+      clearInterval(argvWatcher);
+    }, 2);
     const r = await done;
     clearInterval(bumper);
     clearInterval(watcher);
+    if (argvWatcher) clearInterval(argvWatcher);
 
     assert.equal(r.status, 0, `${r.stdout.slice(-2000)}\n${r.stderr.slice(-1000)}`);
     assert.match(r.stdout, /Run finished\./);
@@ -171,8 +195,14 @@ test('a whole run: direct calls, two Gateway turns on mock QQ, the lag, and sugg
     const files = walk(root);
     assert.ok(files.length > 10);
     const contains = (needle) => files.filter((f) => readFileSync(f).includes(needle));
-    assert.deepEqual(contains(FAKE_KEY).map((f) => f.slice(root.length)), [`${join('\\', '.env')}`], 'the key is only in .env');
-    assert.deepEqual(contains(QQ_SECRET_CANARY).map((f) => f.slice(root.length)), [`${join('\\', '.env')}`], 'the real QQ secret never left .env');
+    if (IS_WINDOWS) {
+      assert.deepEqual(contains(FAKE_KEY).map((f) => f.slice(root.length)), [`${join('\\', '.env')}`], 'the key is only in .env');
+      assert.deepEqual(contains(QQ_SECRET_CANARY).map((f) => f.slice(root.length)), [`${join('\\', '.env')}`], 'the real QQ secret never left .env');
+    } else {
+      // The same two checks with this platform's separator.
+      assert.deepEqual(contains(FAKE_KEY).map((f) => f.slice(root.length)), ['/.env'], 'the key is only in .env');
+      assert.deepEqual(contains(QQ_SECRET_CANARY).map((f) => f.slice(root.length)), ['/.env'], 'the real QQ secret never left .env');
+    }
     assert.ok(contains('PARENT-KEY-MUST-NOT-PASS').length === 0);
     // The prompts and answers do sit in the host's session store, inside the temp root. That is why it gets deleted.
     for (const needle of ['CANARYMODELTEXT', FIXED.turns[0]]) {
@@ -201,10 +231,22 @@ test('a whole run: direct calls, two Gateway turns on mock QQ, the lag, and sugg
     assert.equal(lines.find((l) => l.kind === 'gateway').qqRouteAttempt, false);
 
     // Its own process, no secret on its command line, and gone at the end.
-    assert.ok(cmdLine, 'saw the Gateway command line');
-    assert.match(cmdLine, /q5-net-guard\.mjs/);
-    assert.match(cmdLine, /host-output-filter\.mjs/);
-    for (const secret of [FAKE_KEY, QQ_SECRET_CANARY]) assert.ok(!cmdLine.includes(secret), 'a secret on the command line');
+    if (IS_WINDOWS) {
+      assert.ok(cmdLine, 'saw the Gateway command line');
+      assert.match(cmdLine, /q5-net-guard\.mjs/);
+      assert.match(cmdLine, /host-output-filter\.mjs/);
+      for (const secret of [FAKE_KEY, QQ_SECRET_CANARY]) assert.ok(!cmdLine.includes(secret), 'a secret on the command line');
+    } else {
+      // The arguments as /proc showed them right after the spawn, before the host renamed itself. A read that came
+      // too late shows only the host's own name, and that fails here rather than passing on less.
+      assert.ok(cmdLine, 'saw the Gateway process');
+      assert.ok(Array.isArray(argv) && argv.length > 0, 'read the Gateway arguments');
+      assert.ok(argv.length > 1, `the arguments were read before the host renamed itself (saw ${JSON.stringify(argv)})`);
+      assert.ok(argv.some((a) => a.startsWith('--import=') && a.endsWith('q5-net-guard.mjs')), 'the guard is imported');
+      assert.ok(argv.some((a) => a.startsWith('--import=') && a.endsWith('host-output-filter.mjs')), 'the output filter is imported');
+      assert.ok(argv.includes('gateway') && argv.includes('run'), 'positive control: the Gateway command itself is there');
+      for (const secret of [FAKE_KEY, QQ_SECRET_CANARY]) assert.ok(!argv.some((a) => a.includes(secret)), 'a secret among the arguments');
+    }
     await until(() => processInfo(gatewayPid) === null, 'the Gateway to be gone', 15000);
 
     assert.equal(readFileSync(join(root, 'config.json'), 'utf8'), CONFIG_CANARY, 'config.json untouched');

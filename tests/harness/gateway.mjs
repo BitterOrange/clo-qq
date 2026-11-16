@@ -13,10 +13,12 @@ import { resolvePaths } from '../../src/clo-plugin/lib/core/config.js';
 import { hmacKey } from '../../src/clo-plugin/lib/core/ids.js';
 import { gatewayArgs, gatewayEnv } from '../../src/cli/lifecycle.mjs';
 import { cleanChildEnv } from './clean-env.mjs';
+import { endSpawnedChild } from '../../src/cli/platform.mjs';
+import { IS_WINDOWS, NODE, pidAliveLinux } from './platform.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const ROOT = resolve(HERE, '..', '..');
-export const NODE = join(ROOT, '.runtime', 'node', 'node.exe');
+export { NODE };
 export const OPENCLAW = join(ROOT, '.runtime', 'pkg', 'node_modules', 'openclaw', 'openclaw.mjs');
 export const PLUGIN_DIR = join(ROOT, 'src', 'clo-plugin');
 const NET_GUARD = join(HERE, 'net-guard.mjs');
@@ -103,6 +105,8 @@ export function e2eGatewayEnv(tmp, paths, extra = {}) {
     LOCALAPPDATA: join(tmp, 'appdata', 'Local'),
     TEMP: join(tmp, 'temp'),
     TMP: join(tmp, 'temp'),
+    // Off Windows this is the name the temp folder is read from.
+    ...(IS_WINDOWS ? {} : { TMPDIR: join(tmp, 'temp') }),
     ...extra,
   };
 }
@@ -132,6 +136,7 @@ export function readJsonl(path) {
 }
 
 export function pidAlive(pid) {
+  if (!IS_WINDOWS) return pidAliveLinux(pid);
   const r = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], { cwd: tmpdir(), env: cleanChildEnv(), encoding: 'utf8', windowsHide: true });
   return r.stdout.includes(`"${pid}"`);
 }
@@ -171,7 +176,9 @@ export async function startGateway({ tmp, env, port, label = 'gateway', waitRead
     async stop() {
       if (exited) return exited;
       // /T also ends any child the Gateway started. Only this handle's own process tree is touched.
-      spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true });
+      // Off Windows the tree is ended through the handle, which still owns the PID.
+      if (!IS_WINDOWS) endSpawnedChild(child);
+      else spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true });
       await until(() => exited, `gateway pid ${child.pid} to exit`, 15000);
       return exited;
     },

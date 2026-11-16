@@ -15,6 +15,7 @@ import {
 } from '../../src/tools/q5-anthropic.mjs';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { FAKE_ANTHROPIC_KEY, FAKE_ANTHROPIC_PROBE_KEY, FAKE_OPENROUTER_KEY } from '../harness/fake-keys.mjs';
+import { WINDOWS_ONLY } from '../harness/platform.mjs';
 import { ROOT } from './_cli-helper.mjs';
 
 const BASE = 'http://127.0.0.1:9';
@@ -535,7 +536,17 @@ function ps(args, root) {
   });
 }
 
-test('the wrapper is ASCII with LF, uses the private Node, and carries output and exit codes', () => {
+// The text checks need no PowerShell, so they run on every platform. The test below repeats them next to the runs.
+test('the wrapper text is ASCII with LF and uses the private Node', () => {
+  const bytes = readFileSync(join(ROOT, 'scripts', 'q5-anthropic.ps1'));
+  assert.ok(bytes.length > 0, 'positive control: the wrapper was read');
+  assert.ok(bytes.every((b) => b < 128), 'ASCII');
+  assert.ok(!bytes.includes(13), 'LF only');
+  const src = bytes.toString();
+  assert.ok(src.includes('_env.ps1') && src.includes('$NodeExe'));
+});
+
+test('the wrapper is ASCII with LF, uses the private Node, and carries output and exit codes', { skip: WINDOWS_ONLY }, () => {
   const bytes = readFileSync(join(ROOT, 'scripts', 'q5-anthropic.ps1'));
   assert.ok(bytes.every((b) => b < 128), 'ASCII');
   assert.ok(!bytes.includes(13), 'LF only');

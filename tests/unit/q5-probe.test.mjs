@@ -18,8 +18,10 @@ import { GATEWAY_NODE_FLAGS, gatewayArgs } from '../../src/cli/lifecycle.mjs';
 import { resolvePaths } from '../../src/clo-plugin/lib/core/config.js';
 import { DECISION_INPUT_TOKENS, replyHoldMicros } from '../../src/clo-plugin/lib/core/ledger.js';
 import { buildTurnRequest } from '../../src/clo-plugin/lib/core/turn.js';
+import { endSpawnedChild } from '../../src/cli/platform.mjs';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { decisionText, defaultCatalog, startMockOpenRouter } from '../harness/mock-openrouter.mjs';
+import { IS_WINDOWS, WINDOWS_ONLY } from '../harness/platform.mjs';
 import { NODE, ROOT } from './_cli-helper.mjs';
 
 const PROBE = join(ROOT, 'src', 'tools', 'q5-probe.mjs');
@@ -116,7 +118,11 @@ function cli(args, { root, base = 'http://127.0.0.1:9/api/v1', extra = {}, impor
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
     // None of these runs should get as far as starting a Gateway. If one does, fail and take its whole tree down.
-    const limit = setTimeout(() => spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true }), 45000);
+    const limit = setTimeout(() => {
+      // Off Windows the tree is ended through the child's own handle.
+      if (!IS_WINDOWS) return endSpawnedChild(child);
+      spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true });
+    }, 45000);
     child.on('error', rej);
     child.on('close', (status) => {
       clearTimeout(limit);
@@ -1421,7 +1427,17 @@ function ps(args, root) {
   });
 }
 
-test('the wrapper is ASCII, uses the private Node, and carries output and exit codes', () => {
+// The text checks need no PowerShell, so they run on every platform. The test below repeats them next to the runs.
+test('the wrapper text is ASCII and uses the private Node', () => {
+  const text = readFileSync(join(ROOT, 'scripts', 'q5-probe.ps1'));
+  assert.ok(text.length > 0, 'positive control: the wrapper was read');
+  assert.ok(text.every((b) => b < 128), 'scripts/q5-probe.ps1 must be ASCII');
+  const src = text.toString();
+  assert.ok(src.includes('_env.ps1'), 'clears proxy variables');
+  assert.ok(src.includes('$NodeExe'));
+});
+
+test('the wrapper is ASCII, uses the private Node, and carries output and exit codes', { skip: WINDOWS_ONLY }, () => {
   const text = readFileSync(join(ROOT, 'scripts', 'q5-probe.ps1'));
   assert.ok(text.every((b) => b < 128), 'scripts/q5-probe.ps1 must be ASCII');
   const src = text.toString();
@@ -1981,7 +1997,7 @@ test('the CLI: --runtime own reads CLO_TEST_API_KEY and nothing else, and refuse
   assert.deepEqual(PROBE_KEY_NAME, { openclaw: 'CLO_CHAT_API_KEY', own: 'CLO_TEST_API_KEY' });
 });
 
-test('the wrapper passes -Runtime through, and refuses a runtime it does not know', () => {
+test('the wrapper passes -Runtime through, and refuses a runtime it does not know', { skip: WINDOWS_ONLY }, () => {
   const root = cliRoot('psown');
   const own = ps(['-Runtime', 'own'], root);
   assert.equal(own.status, 0, own.stderr);

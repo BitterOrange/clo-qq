@@ -7,6 +7,7 @@ import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { buildEffective } from '../../src/clo-plugin/lib/core/config.js';
 import { DENY, renderOpenclaw, renderWorkspace, writeAtomic } from '../../src/clo-plugin/lib/core/render.js';
+import { IS_WINDOWS } from '../harness/platform.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
@@ -24,7 +25,16 @@ function render(cfg, { lock = LOCK, testMode = false, env = {} } = {}) {
   const effective = buildEffective(cfg, { paths: PATHS, modelsLock: lock, env, now: () => 0 });
   return renderOpenclaw(cfg, effective, PATHS, { testMode });
 }
-const golden = (name) => readFileSync(join(FIX, name), 'utf8');
+const goldenFile = (name) => readFileSync(join(FIX, name), 'utf8');
+// The goldens hold Windows paths. One of them is joined at render time, so off Windows it comes out with that
+// platform's separator: there the golden text gets that one path as path.join spells it here. The files are not changed.
+const PLUGIN_DIR_WINDOWS = JSON.stringify('C:\\fake repo\\src\\clo-plugin');
+function goldenHere(name) {
+  const text = goldenFile(name);
+  assert.equal(text.split(PLUGIN_DIR_WINDOWS).length, 2, 'positive control: the golden holds the Windows spelling exactly once');
+  return text.replace(PLUGIN_DIR_WINDOWS, () => JSON.stringify(join(PATHS.repoRoot, 'src', 'clo-plugin')));
+}
+const golden = IS_WINDOWS ? goldenFile : goldenHere;
 const pretty = (o) => `${JSON.stringify(o, null, 2)}\n`;
 
 test('golden: the real-provider render', () => {

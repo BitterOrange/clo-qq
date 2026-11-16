@@ -9,6 +9,7 @@ import { makeContext, readConfig } from '../../src/cli/common.mjs';
 import { createEffectiveReader, livePreconditions, validateBusinessConfig } from '../../src/clo-plugin/lib/core/config.js';
 import { createLedger } from '../../src/clo-plugin/lib/core/ledger.js';
 import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
+import { IS_WINDOWS, withheldCmdlinePid } from '../harness/platform.mjs';
 import { APP_ID, baseConfig, clo, configOf, dbOf, effectiveOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, markRunning, OWNER_ID, readJson, readyForLive, recordProvider, ROOT, testEnv, withDb, withProviders, writePriceBook } from './_cli-helper.mjs';
 
 const roots = [];
@@ -555,8 +556,38 @@ test('mode dry-run still stops when config.json cannot be read at all', async ()
   assert.equal(effectiveOf(r).mode, 'dry-run');
 });
 
-test('mode dry-run does not claim to have stopped when the effective file cannot be written', async () => {
+// Off Windows a read-only file is still replaced by a rename; what stops the write is a folder that takes no new
+// entry. A user who can write there all the same (root) cannot be stopped that way. True when the folder is shut.
+function shutFolder(folder) {
+  chmodSync(folder, 0o555);
+  const probe = join(folder, 'probe');
+  try {
+    writeFileSync(probe, '');
+  } catch {
+    return true;
+  }
+  rmSync(probe);
+  chmodSync(folder, 0o755);
+  return false;
+}
+
+test('mode dry-run does not claim to have stopped when the effective file cannot be written', async (t) => {
   const { r } = await liveRoot('forcedryro');
+  if (!IS_WINDOWS) {
+    if (!shutFolder(dirname(effectiveFile(r)))) return t.skip('this user can write into a read-only folder, so the write cannot be made to fail');
+    try {
+      const res = await clo(r, ['mode', 'dry-run']);
+      assert.equal(res.code, 1);
+      assert.match(res.err, /还是 live/);
+      assert.doesNotMatch(res.err, /已经进入/);
+      assert.equal(effectiveOf(r).mode, 'live');
+    } finally {
+      chmodSync(dirname(effectiveFile(r)), 0o755);
+    }
+    assert.equal((await clo(r, ['mode', 'dry-run'])).code, 0, 'positive control: writable again, it goes through');
+    assert.equal(effectiveOf(r).mode, 'dry-run');
+    return;
+  }
   chmodSync(effectiveFile(r), 0o444);
   try {
     const res = await clo(r, ['mode', 'dry-run']);
@@ -778,13 +809,16 @@ test('a start under way: another start and a stop both refuse and touch nothing;
   assert.equal(existsSync(pidFileOf(r)), false);
 });
 
-test('a Gateway whose command line the OS withholds: stop and start say to use the shell that started it', { timeout: 90000 }, async () => {
+test('a Gateway whose command line the OS withholds: stop and start say to use the shell that started it', { timeout: 90000 }, async (t) => {
+  // The System process shows a start time and no command line to every caller. Off Windows it is the first process
+  // whose exe link cannot be read.
+  const withheld = withheldCmdlinePid();
+  if (withheld === null) return t.skip('no process here withholds what it is from this user');
   const r = root('cmdlinehint', enabledConfig());
   await clo(r, ['apply']);
-  // The System process shows a start time and no command line to every caller.
-  const info = processInfo(4);
+  const info = processInfo(withheld);
   assert.ok(info?.startTime, 'positive control: the start time is readable');
-  writeInPids(pidFileOf(r), { pid: 4, startTime: info.startTime, commandDigest: 'digest' });
+  writeInPids(pidFileOf(r), { pid: withheld, startTime: info.startTime, commandDigest: 'digest' });
   const stop = await clo(r, ['stop']);
   assert.equal(stop.code, 1);
   assert.match(stop.out, /从启动它的 shell 里运行/);

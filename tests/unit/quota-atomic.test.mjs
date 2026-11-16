@@ -7,9 +7,9 @@ import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { openStore } from '../../src/clo-plugin/lib/core/store.js';
+import { NODE } from '../harness/platform.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const NODE = join(ROOT, '.runtime', 'node', 'node.exe');
 const core = (f) => pathToFileURL(join(ROOT, 'src', 'clo-plugin', 'lib', 'core', f)).href;
 const dir = mkdtempSync(join(tmpdir(), 'clo-quota-'));
 after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }));

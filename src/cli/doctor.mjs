@@ -11,6 +11,7 @@ import { CHILD_KEY, MODEL_ID_RULES } from '../clo-plugin/lib/core/providers/regi
 import { SCHEMA_VERSION } from '../clo-plugin/lib/core/store.js';
 import { isTestMode, lockMatches, readConfig, readModelsLock, readVersionsLock, renderAll } from './common.mjs';
 import { duplicateLinesHint, ensureGatewayEnvClean, ensureOwnEnvClean, forbiddenOwnArgs, gatewayEnvForCheck, hostCliEnv, inspectArgs, modelKeyNames, oldLinesHint, ownArgs, ownEntry, ownEnvForCheck, parseEnvFile, privateNode, renamedEnvNames, requireSecrets } from './lifecycle.mjs';
+import { IS_WINDOWS, sameBinary } from './platform.mjs';
 
 const FORBIDDEN = ['@tencent-connect/openclaw-qqbot', '@openclaw/qqbot', '@agent-wechat/agent-wechat', '@tencent-weixin/openclaw-weixin'];
 const FORBIDDEN_DIR = /qqbot|agent-wechat|openclaw-weixin/i;
@@ -164,6 +165,8 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
   });
 
   attempt('private_node', () => {
+    // Off Windows paths are case-sensitive and the running binary's path is already resolved, so real paths are compared.
+    if (!IS_WINDOWS) return sameBinary(privateNode(paths), process.execPath) || '没有用项目私有 Node 运行';
     const want = resolve(privateNode(paths)).toLowerCase();
     return resolve(process.execPath).toLowerCase() === want || '没有用项目私有 Node 运行';
   });

@@ -32,6 +32,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { isLoopback } from '../cli/common.mjs';
 import { GATEWAY_NODE_FLAGS, gatewayEnv, openclawEntry, parseEnvFile, privateNode } from '../cli/lifecycle.mjs';
+import { endSpawnedChild, IS_WINDOWS } from '../cli/platform.mjs';
 import { registerTools } from '../clo-plugin/lib/channels/qq/tools.js';
 import { buildEffective, OPENROUTER_BASE_URL, resolvePaths } from '../clo-plugin/lib/core/config.js';
 import { POLICY_V1_SHA256 } from '../clo-plugin/lib/core/contentPolicy.js';
@@ -788,6 +789,11 @@ export async function runGatewayStage({ plan, catalog, baseUrl, key, tracker, re
   const refused = () => [...new Set(readJsonlSafe(guardLog).map((v) => String(v.host)))];
   const killGateway = () => {
     if (!child || exited) return;
+    // Off Windows the tree is ended through the child's own handle; nothing is looked up by name.
+    if (!IS_WINDOWS) {
+      endSpawnedChild(child);
+      return;
+    }
     const systemRoot = parentEnv.SystemRoot ?? process.env.SystemRoot ?? 'C:\\Windows';
     spawnSync(join(systemRoot, 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, env: { SystemRoot: systemRoot } });
   };

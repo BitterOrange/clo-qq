@@ -13,6 +13,7 @@ import { fullAt, nextId, plain } from '../fixtures/qq-events.mjs';
 import { allocPort, GROUP_A, MEMBER, OWNER, pidAlive, readJsonl, until } from '../harness/gateway.mjs';
 import { startMockOpenRouter } from '../harness/mock-openrouter.mjs';
 import { startMockQq } from '../harness/mock-qq.mjs';
+import { IS_WINDOWS, linuxProcessList } from '../harness/platform.mjs';
 import { listeningPids } from '../harness/own.mjs';
 import { APP_ID, baseConfig, clo, configOf, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, readJson, withDb } from '../unit/_cli-helper.mjs';
 
@@ -36,6 +37,7 @@ const SYSTEM32 = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
 
 // Every process on the machine, with parent, command line and start time. Read only: nothing is signalled.
 function processList() {
+  if (!IS_WINDOWS) return linuxProcessList().map((p) => ({ pid: p.pid, ppid: p.ppid, cmd: p.cmd, start: p.start }));
   const script = "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
     + 'Get-CimInstance Win32_Process | ForEach-Object { @{ pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; cmd=$_.CommandLine; start=$_.CreationDate.ToUniversalTime().ToString("o") } } | ConvertTo-Json -Compress';
   const out = spawnSync(join(SYSTEM32, 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script], {

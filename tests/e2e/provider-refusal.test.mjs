@@ -4,10 +4,12 @@
 // Observed limit: the host's own session database still holds it. See DEPLOYMENT.md.
 import assert from 'node:assert/strict';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fullAt, nextId, push } from '../fixtures/qq-events.mjs';
 import { assertAgentRequest, assertEveryPostLegal, startStack, unexpectedNetAttempts, until } from '../harness/gateway.mjs';
+import { IS_WINDOWS } from '../harness/platform.mjs';
 
 const LINES = JSON.parse(readFileSync(new URL('../../persona/policy-lines.zh.json', import.meta.url), 'utf8'));
 const LEAK = 'PROVIDER-SECRET-TEXT';
@@ -27,7 +29,20 @@ const CASES = [
 
 let s;
 
+// Off Windows the pinned host prefers the fixed folder /tmp/openclaw (dist/logger: resolvePreferredOpenClawTmpDir) and
+// falls back to openclaw-<uid> under its temp folder. Both are read. The fixed folder is shared with other runs and
+// stays empty while logging is silent, so off Windows the host file log check below has no positive control: it
+// cannot show that this run's host wrote there. DECISIONS.md records that.
+function linuxHostLogDirs() {
+  const temp = join(s.tmp, 'temp');
+  const under = existsSync(temp) ? readdirSync(temp).filter((n) => n === 'openclaw' || n.startsWith('openclaw-')).map((n) => join(temp, n)) : [];
+  return ['/tmp/openclaw', ...under].filter((d) => existsSync(d) && statSync(d).isDirectory());
+}
+
 function hostFileLogs() {
+  if (!IS_WINDOWS) {
+    return linuxHostLogDirs().flatMap((d) => readdirSync(d).map((f) => join(d, f))).filter((f) => statSync(f).isFile()).map((f) => readFileSync(f, 'utf8')).join('\n');
+  }
   const dir = join(s.tmp, 'temp', 'openclaw');
   if (!existsSync(dir)) return '';
   return readdirSync(dir).map((f) => readFileSync(join(dir, f), 'utf8')).join('\n');

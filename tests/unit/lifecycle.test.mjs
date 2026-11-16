@@ -12,6 +12,8 @@ import { assertTestModeWired, digestOf, duplicateEnvNames, duplicateLinesHint, g
 import { makeContext } from '../../src/cli/common.mjs';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { e2eGatewayArgs, e2eGatewayEnv } from '../harness/gateway.mjs';
+import { endRecordedTree } from '../../src/cli/platform.mjs';
+import { brokenLookupEnv, IS_WINDOWS, killIfSame, otherStartTime, startTicksOf, WINDOWS_ONLY, withheldCmdlinePid } from '../harness/platform.mjs';
 import { APP_ID, baseConfig, clo, configOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, NODE, readJson, ROOT, testEnv, withDb, withProviders } from './_cli-helper.mjs';
 
 const roots = [];
@@ -27,6 +29,12 @@ const OLD_NAME_VALUE = 'sk-or-v1-OLD-NAME-VALUE-MUST-NOT-BE-USED';
 const POWERSHELL = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 const alive = (pid) => processInfo(pid) !== null;
+// Off Windows only: the process group, session and controlling terminal of a live PID, from /proc.
+function procStat(pid) {
+  const text = readFileSync(`/proc/${pid}/stat`, 'utf8');
+  const [, , pgrp, session, tty] = text.slice(text.lastIndexOf(')') + 1).trim().split(/\s+/).map(Number);
+  return { pgrp, session, tty };
+}
 async function until(cond, what, ms = 20000) {
   const end = Date.now() + ms;
   for (;;) {
@@ -89,6 +97,8 @@ async function stack(label, { config = enabledConfig(), host = FAKE_HOST, extraE
   assert.equal((await run(['model', 'refresh'], { fetch: fakeProvider().fetch })).code, 0);
   cleanups.push(() => {
     const rec = readPidRecord(makeContext({ env: testEnv(r.root), stdout: { write() {} }, stderr: { write() {} } }).paths);
+    // Off Windows the record goes to the stop the console itself uses, which matches it to the process first.
+    if (rec && !IS_WINDOWS) return endRecordedTree(rec, testEnv(r.root));
     if (rec) spawnSync('taskkill', ['/PID', String(rec.pid), '/T', '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true });
   });
   return { root: r.root, run, env };
@@ -195,9 +205,23 @@ test('start, status, a second start, stop: own PID only, secrets by env, bystand
 
   const cmd = processInfo(rec.pid).commandLine;
   for (const raw of [FAKE_KEY, FAKE_SECRET, info.env.OPENCLAW_GATEWAY_TOKEN]) assert.ok(!cmd.includes(raw), 'a secret on the command line');
-  // No console window for the Gateway: no main window handle at all.
-  const handle = spawnSync(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${rec.pid}).MainWindowHandle.ToInt64()`], { cwd: tmpdir(), env: cleanChildEnv({ PSModulePath: process.env.PSModulePath }), encoding: 'utf8', windowsHide: true });
-  assert.equal(handle.stdout.trim(), '0', 'the Gateway has a visible window');
+  // Off Windows that text is an identity and holds no argument, so the same is asked of the arguments themselves.
+  if (!IS_WINDOWS) {
+    const { argv } = processInfo(rec.pid);
+    assert.ok(argv.includes('gateway run') && argv.includes('loopback'), 'positive control: these are the arguments it was started with');
+    for (const raw of [FAKE_KEY, FAKE_SECRET, info.env.OPENCLAW_GATEWAY_TOKEN]) assert.ok(!argv.includes(raw), 'a secret among the arguments');
+  }
+  if (IS_WINDOWS) {
+    // No console window for the Gateway: no main window handle at all.
+    const handle = spawnSync(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${rec.pid}).MainWindowHandle.ToInt64()`], { cwd: tmpdir(), env: cleanChildEnv({ PSModulePath: process.env.PSModulePath }), encoding: 'utf8', windowsHide: true });
+    assert.equal(handle.stdout.trim(), '0', 'the Gateway has a visible window');
+  } else {
+    // Off Windows there is no window to have. The Gateway leads a session of its own with no terminal, so nothing
+    // sent to the terminal that ran `clo start` reaches it.
+    const stat = procStat(rec.pid);
+    assert.deepEqual({ pgrp: stat.pgrp, session: stat.session, tty: stat.tty }, { pgrp: rec.pid, session: rec.pid, tty: 0 }, 'the Gateway is not detached');
+    assert.notEqual(procStat(process.pid).session, rec.pid, 'positive control: this process is in another session');
+  }
 
   const tokenFile = readFileSync(join(s.root, '.runtime', 'clo', 'gateway.token'), 'utf8');
   assert.ok(!started.out.includes(tokenFile), 'token not printed');
@@ -438,7 +462,7 @@ const psEnv = (root, extra = {}) => {
   return { ...keep, PATH: join(process.env.SystemRoot ?? 'C:\\Windows', 'System32'), CLO_TEST_ROOT: root, CLO_TEST_NODE_IMPORT: NET_GUARD, ...extra };
 };
 
-test('the PowerShell wrappers carry output and exit codes, with a temp root that has spaces', { timeout: 180000 }, async () => {
+test('the PowerShell wrappers carry output and exit codes, with a temp root that has spaces', { timeout: 180000, skip: WINDOWS_ONLY }, async () => {
   const r = makeRoot('ps', baseConfig());
   roots.push(r);
   const scripts = join(ROOT, 'scripts');
@@ -472,7 +496,7 @@ test('the PowerShell wrappers carry output and exit codes, with a temp root that
   assert.match(stop.stdout, /没有 PID 文件/);
 });
 
-test('start.ps1 returns promptly and leaves the Gateway up after PowerShell exits; stop.ps1 ends it', { timeout: 180000 }, async () => {
+test('start.ps1 returns promptly and leaves the Gateway up after PowerShell exits; stop.ps1 ends it', { timeout: 180000, skip: WINDOWS_ONLY }, async () => {
   const s = await stack('pswrap');
   const scripts = join(ROOT, 'scripts');
   const env = psEnv(s.root, { CLO_TEST_GATEWAY_ENTRY: join(s.root, 'fake-host.mjs'), CLO_NET_GUARD_LOG: join(s.root, 'net-guard.jsonl') });
@@ -498,7 +522,7 @@ test('start.ps1 returns promptly and leaves the Gateway up after PowerShell exit
   await until(() => !alive(info.childPid), 'the child to go', 10000);
 });
 
-test('_env.ps1 clears proxy variables and moves only project state in test mode', { timeout: 60000 }, () => {
+test('_env.ps1 clears proxy variables and moves only project state in test mode', { timeout: 60000, skip: WINDOWS_ONLY }, () => {
   const r = makeRoot('psenv', null);
   roots.push(r);
   const probe = join(r.root, 'probe.ps1');
@@ -513,7 +537,7 @@ test('_env.ps1 clears proxy variables and moves only project state in test mode'
   assert.ok(v.state.startsWith(r.root));
 });
 
-test('the scripts work from a folder whose path has spaces', { timeout: 60000 }, () => {
+test('the scripts work from a folder whose path has spaces', { timeout: 60000, skip: WINDOWS_ONLY }, () => {
   const base = mkdtempSync(join(tmpdir(), 'clo-spaced-'));
   cleanups.push(() => rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }));
   const repo = join(base, 'my project (copy)');
@@ -603,7 +627,7 @@ test('a failed process lookup is not read as gone: the record stays, nothing is 
   const ctx = makeContext({ env: testEnv(s.root), stdout: { write() {} }, stderr: { write() {} } });
   assert.equal(inspectGateway(ctx.paths, ctx.env).state, 'running', 'positive control: the lookup works');
 
-  const broken = { SystemRoot: join(s.root, 'no-such-windows') };
+  const broken = brokenLookupEnv(s.root);
   assert.equal(lookupProcess(other.pid, broken).outcome, 'unknown');
   assert.equal(inspectGateway(ctx.paths, broken).state, 'unknown');
   const stopped = await s.run(['stop'], { env: { ...s.env, ...broken } });
@@ -637,6 +661,12 @@ test('the Gateway is started with the output filter loaded', { timeout: 60000 },
   const s = await stack('filterarg');
   assert.equal((await s.run(['start'])).code, 0);
   const rec = readJson(pidFileOf(s.root));
+  // Off Windows the command line in the lookup is an identity, not text; the arguments are read as argv.
+  if (!IS_WINDOWS) {
+    assert.match(processInfo(rec.pid).argv, /host-output-filter\.mjs/);
+    assert.equal((await s.run(['stop'])).code, 0);
+    return;
+  }
   assert.match(processInfo(rec.pid).commandLine, /host-output-filter\.mjs/);
   assert.equal((await s.run(['stop'])).code, 0);
 });
@@ -658,16 +688,19 @@ async function endedPid() {
   return gone.pid;
 }
 
-test('a process whose command line the OS withholds is unknown: the record stays and nothing is signalled', { timeout: 90000 }, async () => {
+test('a process whose command line the OS withholds is unknown: the record stays and nothing is signalled', { timeout: 90000 }, async (t) => {
+  // The System process is the one every caller can see only partly: a start time and no command line. Off Windows
+  // it is the first process whose exe link cannot be read.
+  const withheld = withheldCmdlinePid();
+  if (withheld === null) return t.skip('no process here withholds what it is from this user');
   const s = await stack('cmdline');
   const ctx = makeContext({ env: testEnv(s.root), stdout: { write() {} }, stderr: { write() {} } });
-  // The System process is the one every caller can see only partly: a start time and no command line.
-  const info = processInfo(4);
+  const info = processInfo(withheld);
   assert.ok(info?.startTime, 'positive control: the start time is readable');
   assert.equal(info.commandLine, null, 'positive control: the command line is withheld');
   mkdirSync(dirname(pidFileOf(s.root)), { recursive: true });
 
-  writeFileSync(pidFileOf(s.root), JSON.stringify({ pid: 4, startTime: info.startTime, commandDigest: 'digest-from-when-it-could-be-read' }));
+  writeFileSync(pidFileOf(s.root), JSON.stringify({ pid: withheld, startTime: info.startTime, commandDigest: 'digest-from-when-it-could-be-read' }));
   const seen = inspectGateway(ctx.paths, ctx.env);
   assert.equal(seen.state, 'unknown');
   assert.equal(seen.cause, 'cmdline_unreadable');
@@ -676,7 +709,7 @@ test('a process whose command line the OS withholds is unknown: the record stays
   assert.equal(stopped.cause, 'cmdline_unreadable');
   assert.equal(existsSync(pidFileOf(s.root)), true, 'the record is kept');
 
-  writeFileSync(pidFileOf(s.root), JSON.stringify({ pid: 4, startTime: '2001-01-01T00:00:00.0000000Z', commandDigest: 'x' }));
+  writeFileSync(pidFileOf(s.root), JSON.stringify({ pid: withheld, startTime: otherStartTime(), commandDigest: 'x' }));
   assert.equal(inspectGateway(ctx.paths, ctx.env).state, 'mismatch', 'another start time still proves the PID changed hands');
 });
 
@@ -833,6 +866,15 @@ test('start lock across real processes: one wins, the rest are refused, and a ki
 // Registered before anything is asserted, so a failing run still ends both processes and the test file can exit.
 async function cleanUpStandIn(root) {
   const { pid, childPid } = await fakeInfo(root);
+  // Off Windows these are bare PIDs with no record and no handle, so each is ended only if it still has the start
+  // time it has now.
+  if (!IS_WINDOWS) {
+    for (const p of [childPid, pid]) {
+      const ticks = startTicksOf(p);
+      cleanups.push(() => killIfSame(p, ticks));
+    }
+    return pid;
+  }
   for (const p of [childPid, pid]) cleanups.push(() => spawnSync('taskkill', ['/PID', String(p), '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true }));
   return pid;
 }

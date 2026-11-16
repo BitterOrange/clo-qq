@@ -9,6 +9,7 @@ import { activeKindOf } from '../clo-plugin/lib/core/config.js';
 import { CHILD_KEY, DEFAULT_BASE, KEY_ENV } from '../clo-plugin/lib/core/providers/registry.js';
 import { writeAtomic } from '../clo-plugin/lib/core/render.js';
 import { CliError, isLoopback, isTestMode } from './common.mjs';
+import { endRecordedTree, endSpawnedChild, IS_WINDOWS, linuxChildEnv, lookupProcessLinux, privateNodePath } from './platform.mjs';
 
 // .env name -> the name the Gateway child gets. The host's openrouter provider and the plugin read OPENROUTER_API_KEY,
 // so that is the child's name for the key. CLO_CHAT_API_KEY itself never reaches the child.
@@ -34,7 +35,7 @@ const START_LOOKUP_TRIES = 3;
 const START_LOCK_TRIES = 5;
 const START_LOCK_RETRY_MS = 100;
 
-export const privateNode = (paths) => join(paths.repoRoot, '.runtime', 'node', 'node.exe');
+export const privateNode = (paths) => privateNodePath(paths.repoRoot);
 export const openclawEntry = (paths) => join(paths.repoRoot, '.runtime', 'pkg', 'node_modules', 'openclaw', 'openclaw.mjs');
 const systemExe = (env, ...rest) => join(env.SystemRoot ?? process.env.SystemRoot ?? 'C:\\Windows', 'System32', ...rest);
 
@@ -127,6 +128,9 @@ export function gatewayEnv(paths, parentEnv, { secrets = {}, token = null } = {}
     NODE_DISABLE_COMPILE_CACHE: '1',
     NODE_NO_WARNINGS: '1',
   };
+  // Off Windows the Windows-named keys above mean nothing to the child. PATH and the temp folder are set the way
+  // that platform reads them.
+  if (!IS_WINDOWS) Object.assign(base, linuxChildEnv(paths, privateNode(paths)));
   if (token) base.OPENCLAW_GATEWAY_TOKEN = token;
   for (const [fileName, childName] of Object.entries(CHILD_ENV_NAMES)) {
     if (secrets[fileName]) base[childName] = secrets[fileName];
@@ -242,6 +246,7 @@ export const digestOf = (text) => createHash('sha256').update(String(text), 'utf
 // 'gone' only when the lookup itself worked and found nothing. A lookup that failed says nothing.
 export function lookupProcess(pid, env = process.env) {
   if (!Number.isInteger(pid) || pid <= 0) return { outcome: 'gone' };
+  if (!IS_WINDOWS) return lookupProcessLinux(pid, env);
   const script = `$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.Encoding]::UTF8;$p=Get-CimInstance Win32_Process -Filter "ProcessId=${pid}";`
     + 'if($p){@{commandLine=$p.CommandLine;startTime=$p.CreationDate.ToUniversalTime().ToString("o")}|ConvertTo-Json -Compress}';
   const r = spawnSync(systemExe(env, 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script], {
@@ -424,6 +429,12 @@ async function spawnRecorded(ctx, { runtime, args, childEnv, port, lookup }) {
   // With no PID record, nothing could stop it later. This is the child we just spawned, by its handle.
   // Unref too, or a child that survived the kill would hold this command open until it exits.
   const endChild = () => {
+    // Off Windows child.kill() sends a signal the bot traps, and it would leave behind whatever the child started.
+    if (!IS_WINDOWS) {
+      const sent = endSpawnedChild(child, env);
+      child.unref();
+      return sent ? '已结束刚启动的进程。' : `进程 ${child.pid} 可能还在运行，请手动结束。`;
+    }
     const ended = child.kill();
     child.unref();
     return ended ? '已结束刚启动的进程。' : `进程 ${child.pid} 可能还在运行，请手动结束。`;
@@ -580,7 +591,9 @@ export function stopGateway(ctx) {
     rmSync(paths.pidFile, { force: true });
     return { stopped: false, reason: 'pid_mismatch' };
   }
-  spawnSync(systemExe(env, 'taskkill.exe'), ['/PID', String(record.pid), '/T', '/F'], { env: osToolEnv(env), windowsHide: true });
+  if (IS_WINDOWS) spawnSync(systemExe(env, 'taskkill.exe'), ['/PID', String(record.pid), '/T', '/F'], { env: osToolEnv(env), windowsHide: true });
+  // Matches the record against the process once more, then signals that PID's own group and what it started.
+  else endRecordedTree(record, env, { log: ctx.log });
   if (!waitForGone(record.pid, env)) throw new CliError(`进程 ${record.pid} 没有退出。PID 文件保留，可以再试一次。`);
   rmSync(paths.pidFile, { force: true });
   ctx.log('gateway_stopped', { count: record.pid, kind: recordRuntime(record) });

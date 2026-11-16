@@ -7,10 +7,11 @@ import { main } from '../../src/cli/clo.mjs';
 import { providerOfConfig } from '../../src/clo-plugin/lib/core/config.js';
 import { ACTIVE_PROVIDER_CONTROL, providerRecord } from '../../src/clo-plugin/lib/core/providers/registry.js';
 import { openStore } from '../../src/clo-plugin/lib/core/store.js';
+import { NODE } from '../harness/platform.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const ROOT = resolve(HERE, '..', '..');
-export const NODE = join(ROOT, '.runtime', 'node', 'node.exe');
+export { NODE };
 export const NET_GUARD = join(ROOT, 'tests', 'harness', 'net-guard.mjs');
 
 export const FAKE_KEY = 'sk-or-v1-FAKE-KEY-FOR-LOCAL-MOCK-ONLY';

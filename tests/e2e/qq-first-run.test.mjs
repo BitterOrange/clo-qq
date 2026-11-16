@@ -12,6 +12,7 @@ import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { allocPort, GROUP_A, MEMBER, OWNER, pidAlive, readJsonl, until } from '../harness/gateway.mjs';
 import { startMockOpenRouter } from '../harness/mock-openrouter.mjs';
 import { startMockQq } from '../harness/mock-qq.mjs';
+import { IS_WINDOWS, linuxProcessList, linuxSockets } from '../harness/platform.mjs';
 import { APP_ID, baseConfig, clo, configOf, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, openclawOf, readJson, withDb } from '../unit/_cli-helper.mjs';
 
 let qq;
@@ -37,6 +38,11 @@ const SYSTEM32 = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
 // PIDs that hold a listening TCP socket on the port. A listening row has a foreign address of port 0, which reads
 // the same whatever language the OS shows its state column in.
 function listenerPids(port) {
+  if (!IS_WINDOWS) {
+    const { sockets, unreadable } = linuxSockets();
+    assert.deepEqual(unreadable, [], 'every process could be asked which sockets it holds');
+    return [...new Set(sockets.filter((s) => s.proto === 'tcp' && s.port === Number(port)).flatMap((s) => s.pids))];
+  }
   const out = spawnSync(join(SYSTEM32, 'NETSTAT.EXE'), ['-ano'], { cwd: tmpdir(), env: cleanChildEnv(), encoding: 'utf8', windowsHide: true, timeout: 60000 });
   assert.equal(out.status, 0, 'netstat ran');
   const pids = new Set();
@@ -50,6 +56,7 @@ function listenerPids(port) {
 
 // Every process on the machine, with parent, command line and start time. Read only: nothing is signalled.
 function processList() {
+  if (!IS_WINDOWS) return linuxProcessList().map((p) => ({ pid: p.pid, ppid: p.ppid, cmd: p.cmd, start: p.start }));
   const script = "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
     + 'Get-CimInstance Win32_Process | ForEach-Object { @{ pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; cmd=$_.CommandLine; start=$_.CreationDate.ToUniversalTime().ToString("o") } } | ConvertTo-Json -Compress';
   const out = spawnSync(join(SYSTEM32, 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script], {
@@ -144,7 +151,10 @@ test('starts with no model lock and no model key, and connects', { timeout: 3000
   // and nothing under it runs the same command line.
   assert.deepEqual(listenerPids(rec.port), [rec.pid], 'the recorded process alone listens on the Gateway port');
   const { root, tree } = processTree(rec.pid);
-  assert.ok(root.cmd?.includes('gateway run'), 'positive control: the command line was readable');
+  // Off Windows the host replaces what the OS shows as its command line with its process title, and it sets this
+  // title only on the path that runs the Gateway. A relaunched child would carry the same title.
+  if (!IS_WINDOWS) assert.ok(root.cmd?.includes('openclaw-gateway'), 'positive control: the command line was readable, and it is the Gateway');
+  else assert.ok(root.cmd?.includes('gateway run'), 'positive control: the command line was readable');
   assert.deepEqual(tree.filter((p) => p.cmd === root.cmd).map((p) => p.pid), [], 'no child relaunched with the same command line');
   gatewayRoot = root;
   gatewayTree = tree;

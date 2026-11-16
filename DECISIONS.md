@@ -241,6 +241,33 @@
 | 401 和 404 | 和其他错误一样计入连败，不立刻暂停 | 要不要改成立刻暂停没有定 |
 | 价格表 | Anthropic 接口不返回价格。价格是手抄进 `versions.lock.json` 的价格表（来源和核对日期写在里面），`clo model lock --provider anthropic` 从这份表锁定，第一次和涨价时都要 `--confirm-price` | 抄错了，本地估算就跟着错，而 Anthropic 上没有对账能发现 |
 
+## Linux 上跑离线测试（2026-11-16，用户定的）
+
+用户决定：在 Windows 切换之前，先让离线测试能在 Linux x64 上跑，只当作以后做 Linux 的铺垫。具体怎么做（下一节）是开发时定的，用户还没有逐项确认。“去掉 OpenClaw，改用自己的运行时”一节里“Linux 和 VPS：以后单独做，在 Windows 切换之后”那一行不变，Linux 部署仍然没有做，也不支持。
+
+现状：代码里加了不是 Windows 时走的分支，Windows 执行的语句原样留在原处。**改完之后 Windows 上一次都没有跑过**，这里没有 Windows 可以跑。Linux 这边只有离线测试（mock QQ、mock 模型），只在一个以 root 运行的容器里跑过；没有连过真实 QQ、OpenRouter 或 Anthropic。
+
+## 开发时定的，用户还没有确认（2026-11-16，Linux）
+
+都只在上面说的那一个容器里用离线测试验证过，Windows 上没有验证。用户不同意的话，按用户的决定改代码。实现在 `src/cli/platform.mjs`，测试在 `tests/unit/platform-linux.test.mjs`。
+
+| 项目 | 现在的值或行为 | 说明 |
+|---|---|---|
+| Linux 上怎么认一个进程 | 启动标识（`/proc/sys/kernel/random/boot_id`）、PID、启动时刻（`/proc/<pid>/stat` 里的 tick 数）。不比较程序路径，也不比较命令行。PID 记录的格式没有变 | Linux 上命令行不固定：宿主会改 `process.title`，`/proc` 里的命令行跟着变；私有 Node 的目录换掉后程序路径也变。拿它们比，活着的 Gateway 会被判成“不是同一个”，PID 记录被删掉。PID 被别的进程重用由这三项排除。查不到（`/proc` 读不了、不是自己的 PID 命名空间、读不到启动标识）一律算“不知道”，不算“没了” |
+| 已退出但没被回收的进程 | 状态是 Z 或 X 的算已经结束 | `clo stop` 等进程结束时自己不回收子进程，这个容器的 1 号进程也不及时回收，不这样就永远等不到。这种 PID 不会被重新分配，丢掉它的记录是安全的。没有测过：主线程退出而其他线程还在的进程也显示 Z |
+| 消费者租约里的同一条规则 | `lease.js` 在不是 Windows 时多查一步：`/proc` 显示这个 PID 是 Z 或 X 就算不在了；读不到或看不懂仍算还在。Windows 的路径没有动 | 不加的话，被杀掉又没被回收的机器人进程会挡住 `clo start`，按 `LEASE_STALE_MS`（3 倍心跳间隔）推算最多约 90 秒，这个时长没有实际观察过；`clo stop` 还会说“已请它自己停下”。测试在 `tests/unit/lease-alive.test.mjs` |
+| 怎么停 | 只发 SIGKILL，没有先发 SIGTERM 的阶段。先重新核对记录里的进程，再对它自己的进程组发信号，再逐个结束事先记下、启动时刻没变的子孙进程。PID 不大于 1、自己的 PID、自己的进程组一律不发。测试用的假 `/proc` 下从不发信号 | 和 Windows 上 `taskkill /T /F` 对应。Gateway 收到 SIGTERM 会怎样没有量过，被强杀之后费用怎么算的规则也只按强杀想过。已知缺口：在记下子孙之后才生出来、又离开了这个会话的进程会漏掉；列不出子孙时仍然杀进程组，日志记一条（不含 PID） |
+| 子进程的 PATH | 只有私有 Node 的 `bin` 目录，另加 `TMPDIR` 指向 `.runtime/temp`。不带 `/usr/bin`、`/bin` | 离线测试里真实 Gateway 用这个 PATH 跑通了。真实运行里宿主如果要找系统工具会找不到，那时再加 |
+| Windows 名字的环境变量 | `USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP`、`TMP` 在 Linux 的子进程里照样设，没有作用 | 少一处分支，原有的测试不用改。设计 Linux 部署时再清理 |
+| 共用的 `.runtime` | 不做防护 | 一个 `.runtime` 在 Windows 和 WSL 之间、或两个容器之间共用时，活着的进程可能被判成“没了”。Linux 这边加防护管不了 Windows 那边。README 写了一个 `.runtime` 只给一个系统、一个容器用 |
+| 私有 Node 的位置 | `.runtime/node/bin/node`。`doctor` 在 Linux 上比较解析符号链接之后的真实路径，Windows 上仍是原来不分大小写的比较 | |
+| 跳过的测试 | 不是 Windows 时跳过 8 个：7 个运行 `.ps1` 包装脚本的，1 个检查 Windows 环境变量形状的（它有两个 Linux 对应的测试，在 Windows 上跳过）。读 `/proc` 的测试在 Windows 上跳过。另有 3 个在运行时看机器决定：2 个要找一个系统不让看身份的进程，1 个要让写文件失败（root 下做不到，所以在这个容器里是跳过的。开发时换成普通用户手动跑过一次，只是开发者自己报告的，完整运行里没有它）。找“系统不让看身份的进程”时跳过 1 号进程，这个容器里找到的是内核线程 | 每一处跳过都列在 `tests/unit/platform-skips.test.mjs`，没列的跳过会让这个文件失败 |
+| 宿主的日志目录在 `.runtime` 之外 | 没有处理，只记在这里。锁定版本的宿主在 Linux 上优先用固定的 `/tmp/openclaw`（源码 `dist/logger`），不看 `TMPDIR`，这个目录所有运行共用。离线测试里日志级别是 `silent`，这个目录是空的 | 这和“OpenClaw 状态和项目运行数据都放在 `.runtime/`”不一致，只在 Linux 上。`tests/e2e/provider-refusal.test.mjs` 在 Linux 上改读这个目录（和 `TMPDIR` 下的 `openclaw-*`）。这条检查在 Linux 上没有正向对照，等于空检查：目录是所有运行共用的，日志级别 `silent` 时一直是空的，证明不了这次运行的宿主往哪里写 |
+| 动到的“不能改”的文件 | `docs/provider-contract.md` 第 0 节列为不能改的 `tests/harness/gateway.mjs`、`tests/e2e/` 下的几个测试和 `src/tools/q5-probe.mjs` 都加了只在不是 Windows 时走的分支，Windows 执行的语句逐字没变。契约第 0 节已经注明这个例外 | 这个例外是开发时定的，用户还没有确认 |
+| 需要 root 的 e2e | `tests/e2e/qq-first-run.test.mjs` 在 Linux 上要读每个进程的 `fd` 目录，确认只有记录里的进程在听 Gateway 端口。普通用户读不了别人的进程，这个断言会失败，所以这个文件在 Linux 上要以 root 跑 | 只在 root 下跑过 |
+| `clo stop` 在 Linux 上查不到进程时 | 离线测试里“查不到就不发信号”只能在测试用的假 `/proc` 下造出来，而假 `/proc` 下本来就不发信号，所以那条测试在 Linux 上分不出 `stopGateway` 有没有在“不知道”时发信号，有分量的只有“记录保留”和退出码。真实 `/proc` 下造不出“不知道”，又不能为此改 Windows 也执行的 `stopGateway` | 已知缺口 |
+| 故意没做的 | `scripts/*.ps1` 的 shell 版本；Linux 的安装脚本；`versions.lock.json` 里 Linux Node 的条目和校验值；这个容器里没有运行的 npm 安装脚本怎么处理；SIGTERM 停止；`doctor` 在启动失败时打印的“退出码 timeout”；`CMDLINE_HINT` 的措辞（Linux 上“用更高权限启动”不一定是原因）；Linux 上的内存和时长；任何真实 QQ、OpenRouter、Anthropic 调用 | 这些要么改了会动 Windows 的输出，要么属于 Linux 部署，等用户决定做 Linux 时再做 |
+
 ## 待定（决策点 D）
 
 | 编号 | 问题 | 依据 |

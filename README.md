@@ -378,6 +378,8 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 
 单元和接缝要几分钟，机器忙时更久，没有可靠的时长记录。e2e 串行有记录的一次约 88 分钟。这些测试证明的是接线，不是平台行为。最近的结果和没跑的部分见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
+这些离线测试也可以在 Linux x64 上跑，命令相同，Node 换成 `.runtime/node/bin/node`，一个文件一个文件跑。那里因为平台不同跳过 8 个测试：7 个要用 `powershell.exe` 运行 `.ps1` 包装脚本的（`lifecycle.test.mjs` 4 个，`q5-probe.test.mjs` 2 个，`q5-anthropic.test.mjs` 1 个），和 1 个检查 Windows 环境变量形状的（`test-spawn-env.test.mjs`）。两个 Q5 包装脚本的文本检查（ASCII、换行、用私有 Node）拆成了单独的测试，在 Linux 上照样跑。另有几个测试在运行时看机器条件决定跳不跳（比如用 root 跑时有一个跳过）。反过来，`tests/e2e/qq-first-run.test.mjs` 在 Linux 上要以 root 跑：它要读每个进程打开的文件，确认只有记录里的 Gateway 在听端口，普通用户读不了别人的进程，会失败。每一处跳过和它的条件都列在 `tests/unit/platform-skips.test.mjs` 里。**这不等于支持在 Linux 上部署：** 没有 Linux 的安装脚本，也没有 shell 包装脚本；`versions.lock.json` 只锁了 Windows 的 Node，Linux 的 Node 没有校验值；一个 `.runtime` 只能给一个系统、一个容器用，不能在 Windows 和 WSL 之间或两个容器之间共用；内存和时长在 Linux 上没有量过；Linux 上没有做过真实 QQ 验收。Linux 上的测试只在一个以 root 运行的容器里跑过。
+
 ## 排错
 
 下表里 `openrouter_key_limit`、`openrouter_credits`、`residual`、判定熔断、`/stop`、失败句上限这几行只用模拟环境验证过，真实 QQ 和真实模型没有测。

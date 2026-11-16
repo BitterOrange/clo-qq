@@ -17,7 +17,9 @@ import { hmacKey } from '../../src/clo-plugin/lib/core/ids.js';
 import { renderWorkspace, writeAtomic } from '../../src/clo-plugin/lib/core/render.js';
 import { hardCapPauseKey, KEY_ENV, LIVE_CODES, providerRulesRecorded } from '../../src/clo-plugin/lib/core/providers/registry.js';
 import { ownArgs, ownEnv } from '../../src/cli/lifecycle.mjs';
+import { endSpawnedChild } from '../../src/cli/platform.mjs';
 import { cleanChildEnv } from './clean-env.mjs';
+import { IS_WINDOWS, linuxProcessList, linuxSockets } from './platform.mjs';
 import { FAKE_ANTHROPIC_KEY } from './fake-keys.mjs';
 import {
   allocPort, APP_ID, cleanupTmp, deepMerge, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, makeTmp, NODE, OWNER, pidAlive,
@@ -136,6 +138,15 @@ for (const name of ['bind', 'send', 'connect']) {
 // PIDs that hold a listening TCP socket or a bound UDP socket, from netstat. A listening TCP row has a foreign address
 // of port 0 and a UDP row has *:*, which read the same whatever language the OS shows its state column in.
 export function listeningPids() {
+  if (!IS_WINDOWS) {
+    // The same map from /proc. A PID whose sockets could not be read gets an entry saying so, so that "this PID
+    // holds no socket" is never concluded from a folder that could not be opened.
+    const { sockets, unreadable } = linuxSockets();
+    const found = new Map();
+    for (const s of sockets) for (const pid of s.pids) found.set(pid, [...(found.get(pid) ?? []), `${s.proto} ${s.address}`]);
+    for (const pid of unreadable) found.set(pid, [...(found.get(pid) ?? []), 'unreadable']);
+    return found;
+  }
   const out = spawnSync(join(SYSTEM32, 'NETSTAT.EXE'), ['-ano'], { cwd: tmpdir(), env: cleanChildEnv(), encoding: 'utf8', windowsHide: true, timeout: 60000 });
   if (out.status !== 0) throw new Error(`netstat failed with status ${out.status}`);
   const pids = new Map();
@@ -149,6 +160,7 @@ export function listeningPids() {
 
 // pid itself and the processes whose parent is pid, as { pid, ppid, name }. Read only: nothing is signalled.
 export function processTree(pid) {
+  if (!IS_WINDOWS) return linuxProcessList().filter((p) => p.pid === Number(pid) || p.ppid === Number(pid)).map((p) => ({ pid: p.pid, ppid: p.ppid, name: p.name }));
   const script = "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
     + `@(Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)} OR ParentProcessId=${Number(pid)}" | ForEach-Object { @{ pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; name=[string]$_.Name } }) | ConvertTo-Json -Compress`;
   const env = {};
@@ -179,6 +191,8 @@ export function e2eOwnEnv(tmp, paths, extra = {}, kind = 'openrouter') {
     LOCALAPPDATA: join(tmp, 'appdata', 'Local'),
     TEMP: join(tmp, 'temp'),
     TMP: join(tmp, 'temp'),
+    // Off Windows this is the name the temp folder is read from.
+    ...(IS_WINDOWS ? {} : { TMPDIR: join(tmp, 'temp') }),
     ...extra,
   };
 }
@@ -211,7 +225,9 @@ export async function startBot({ tmp, env, args, label = 'bot', cwd }) {
     /** Hard kill of this handle's own process tree, as clo stop's taskkill fallback does. */
     async kill() {
       if (exited) return exited;
-      spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true });
+      // Off Windows the tree is ended through the handle, which still owns the PID.
+      if (!IS_WINDOWS) endSpawnedChild(child);
+      else spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true });
       await until(() => exited, `bot pid ${child.pid} to exit`, 15000);
       return exited;
     },

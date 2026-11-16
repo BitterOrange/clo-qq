@@ -10,8 +10,10 @@ import { after, test } from 'node:test';
 import { makeContext } from '../../src/cli/common.mjs';
 import { botEntry, ensureGatewayEnvClean, ensureOwnEnvClean, forbiddenOwnArgs, gatewayEnv, GATEWAY_NODE_FLAGS, modelKeyNames, ownArgs, ownEnv, processInfo, readPidRecord, startLockFile } from '../../src/cli/lifecycle.mjs';
 import { CONSUMER_LEASE_KEY, STOP_REQUEST_KEY } from '../../src/clo-plugin/lib/channels/qq/lease.js';
+import { endRecordedTree } from '../../src/cli/platform.mjs';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
+import { IS_WINDOWS } from '../harness/platform.mjs';
 import { clo, configOf, dbOf, effectiveOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, NODE, readJson, testEnv, withDb, withProviders, writePriceBook } from './_cli-helper.mjs';
 
 const roots = [];
@@ -99,6 +101,8 @@ async function stack(label, { runtime = 'own' } = {}) {
   assert.equal((await run(['model', 'refresh'], { fetch: fakeProvider().fetch })).code, 0);
   cleanups.push(() => {
     const rec = readPidRecord(makeContext({ env: testEnv(r.root), stdout: { write() {} }, stderr: { write() {} } }).paths);
+    // Off Windows the record goes to the stop the console itself uses, which matches it to the process first.
+    if (rec && !IS_WINDOWS) return endRecordedTree(rec, testEnv(r.root));
     if (rec) spawnSync('taskkill', ['/PID', String(rec.pid), '/T', '/F'], { cwd: tmpdir(), env: cleanChildEnv(), windowsHide: true });
   });
   return { root: r.root, run, env };

@@ -1,5 +1,6 @@
 // The own runtime's consumer lease and stop request: rows in clo.db, readable with no SDK or host loaded, so the
 // console can read them as well as both runtimes.
+import { readFileSync } from 'node:fs';
 
 export const HEARTBEAT_MS = 30000;
 
@@ -10,9 +11,29 @@ export const LEASE_REFRESH_MS = HEARTBEAT_MS;
 // A lease, or a heartbeat, older than this belongs to a process that is gone or no longer running its timers.
 export const LEASE_STALE_MS = 3 * HEARTBEAT_MS;
 
+// Field 3 of a /proc stat line, counted from the last ')' since the command name may hold one. Null if it has none.
+const statState = (text) => /^\s*([A-Za-z])(\s|$)/.exec(text.slice(text.lastIndexOf(')') + 1))?.[1] ?? null;
+
+// Off Windows a process that has exited keeps its PID until its parent collects it, and signal 0 still reaches it.
+// True only when /proc is this process's own view and shows the PID in that state. Anything unreadable is false, so
+// the PID then counts as alive, as it always did. read is replaced only by tests.
+export function exitedUncollected(pid, read = readFileSync) {
+  try {
+    const self = read('/proc/self/stat', 'utf8');
+    if (Number(self.slice(0, self.indexOf(' '))) !== process.pid) return false;
+    const text = read(`/proc/${pid}/stat`, 'utf8');
+    if (Number(text.slice(0, text.indexOf(' '))) !== pid) return false;
+    const state = statState(text);
+    return state === 'Z' || state === 'X';
+  } catch {
+    return false;
+  }
+}
+
 /** Whether a process with this PID exists. A PID that cannot be probed counts as alive. */
 export function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (process.platform !== 'win32' && exitedUncollected(pid)) return false;
   try {
     process.kill(pid, 0);
     return true;
