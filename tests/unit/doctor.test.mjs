@@ -9,6 +9,7 @@ import { makeContext } from '../../src/cli/common.mjs';
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, insideDir, inspectHooks, runDoctor } from '../../src/cli/doctor.mjs';
 import { ensureGatewayEnvClean, gatewayEnv, gatewayEnvForCheck } from '../../src/cli/lifecycle.mjs';
 import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
+import { IS_WINDOWS } from '../harness/platform.mjs';
 import { APP_ID, baseConfig, clo, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, NET_GUARD, openclawOf, OWNER_ID, ROOT, testEnv, withProviders, writePriceBook } from './_cli-helper.mjs';
 
 const roots = [];
@@ -112,7 +113,9 @@ test('insideDir: strictly inside, by resolved path; without case only where aske
   assert.equal(insideDir(dir, 42), false);
   const upper = join(dir.toUpperCase(), 'logs', 'a.log');
   assert.equal(insideDir(dir, upper, { caseless: true }), true, 'Windows: case does not matter');
-  assert.equal(insideDir(dir, upper, { caseless: false }), false, 'elsewhere it does');
+  // Off Windows, case matters unless asked otherwise. On Windows, Node's path.relative itself compares without case,
+  // so caseless: false cannot make it matter there, and the default there is caseless anyway.
+  assert.equal(insideDir(dir, upper, { caseless: false }), IS_WINDOWS, IS_WINDOWS ? 'Windows: path.relative ignores case itself' : 'elsewhere it does');
 });
 
 test('doctor catches an edited workspace: policy section, persona and system prompt', async () => {

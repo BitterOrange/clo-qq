@@ -10,7 +10,9 @@ import { buildPlan as buildAnthropicPlan } from '../../src/tools/q5-anthropic.mj
 import { KEY_ENV, PROBE_KEY_ENV, providerRulesRecorded } from '../../src/clo-plugin/lib/core/providers/registry.js';
 import { makeRoot, ROOT } from './_cli-helper.mjs';
 
-const read = (name) => readFileSync(join(ROOT, name), 'utf8');
+// The docs are checked by what they say, not by their line ends: a Windows clone with core.autocrlf (the default
+// there) has CRLF in every file .gitattributes does not pin, and these patterns are written with \n.
+const read = (name) => readFileSync(join(ROOT, name), 'utf8').replace(/\r\n/g, '\n');
 const README = read('README.md');
 const DEPLOYMENT = read('DEPLOYMENT.md');
 const plan = buildPlan(ROOT);

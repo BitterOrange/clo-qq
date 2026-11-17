@@ -63,11 +63,16 @@ jobs:
         run: .runtime/node/bin/node tests/run-files.mjs --timeout 1800 --shard ${{ matrix.shard }}/4 --exclude tests/e2e/qq-first-run.test.mjs tests/e2e
       # qq-first-run reads every process's open files to confirm that only the recorded Gateway listens. Another
       # user's processes are unreadable to the runner account, so this one file runs as root, with an environment
-      # that holds only PATH, HOME and the locale. It runs last, so nothing root-owned is left for a later step. It
-      # still runs when another file in this shard failed, but not after a failed install or a cancelled run.
+      # that holds only PATH, HOME and the locale. OpenClaw refuses to load a plugin whose files belong to a user other
+      # than the one running it or root, and the checkout belongs to the runner account, so root runs it from a copy
+      # that root owns. It runs last, so nothing root-owned is left for a later step. It still runs when another file
+      # in this shard failed, but not after a failed install or a cancelled run.
       - name: Run qq-first-run as root
         if: ${{ !cancelled() && matrix.shard == 1 && steps.setup.outcome == 'success' }}
-        run: sudo env -i PATH=/usr/bin:/bin HOME=/root LANG=C.UTF-8 "$GITHUB_WORKSPACE/.runtime/node/bin/node" tests/run-files.mjs --timeout 1800 --out "$RUNNER_TEMP/root-results" tests/e2e/qq-first-run.test.mjs
+        run: |
+          sudo rm -rf /opt/clo-root
+          sudo cp -r "$GITHUB_WORKSPACE" /opt/clo-root
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LANG=C.UTF-8 /opt/clo-root/.runtime/node/bin/node /opt/clo-root/tests/run-files.mjs --timeout 1800 --out "$RUNNER_TEMP/root-results" tests/e2e/qq-first-run.test.mjs
 
   windows:
     name: Windows (${{ matrix.suite }} ${{ matrix.shard }}/3)
@@ -99,6 +104,22 @@ jobs:
           git ls-files --eol CLAUDE.md persona scripts/setup.sh
       - name: Install the private Node and the locked packages
         run: ./scripts/setup.ps1 -Runtime
+      # The project and lookups are slow on this runner: the first run took minutes for steps that take seconds on
+      # Linux. This shows what one process lookup (powershell.exe with Get-CimInstance, as the console does) costs.
+      - name: Time a process lookup
+        continue-on-error: true
+        run: |
+          foreach ($i in 1..3) {
+            $t = Measure-Command { & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=$PID' | Out-Null" }
+            "lookup ${i}: $([int]$t.TotalMilliseconds) ms"
+          }
+          # The same through the console's own code, with the few variables a test gives it.
+          .\.runtime\node\node.exe --input-type=module -e 'const m = await import("./src/cli/lifecycle.mjs"); const env = { SystemRoot: process.env.SystemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP }; for (let i = 1; i <= 3; i += 1) { const t = Date.now(); const r = m.lookupProcess(process.pid, env); console.log(`console lookup ${i}: ${r.outcome}, ${Date.now() - t} ms`); }'
       - name: Run the test files one at a time
+        # The checkout is on D: and the image's temp folder on C:. Some tests hard-link the private Node into a temp
+        # folder, which cannot cross volumes, so temp goes on the same volume, as it usually is on a user's machine.
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         # Windows has never been timed under this runner; 30 minutes per file, as for the e2e shards on Linux.
         run: .\.runtime\node\node.exe tests/run-files.mjs --timeout 1800 --shard ${{ matrix.shard }}/3 ${{ matrix.paths }}

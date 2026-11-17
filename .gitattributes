@@ -6,3 +6,7 @@ tests/fixtures/render/*.json -text
 
 # Shell scripts run under bash on Linux. A CRLF breaks them.
 *.sh text eol=lf
+
+# PowerShell scripts are written and tested with LF, and both PowerShell versions read LF. Pinned so a Windows clone
+# with core.autocrlf has the same bytes as the repository.
+*.ps1 text eol=lf

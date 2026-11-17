@@ -99,6 +99,7 @@ test('every PowerShell script is ASCII, since Windows PowerShell misreads UTF-8 
     const bytes = readFileSync(join(ROOT, 'scripts', name));
     assert.ok(bytes.every((x) => x < 128), name);
   }
+  assert.match(readFileSync(join(ROOT, '.gitattributes'), 'utf8'), /^\*\.ps1 text eol=lf$/m, 'checked out with LF on every platform');
 });
 
 test('wrappers stay thin and use the private Node', () => {
