@@ -138,6 +138,7 @@ function liveHint(code, failed, hasKey, keyName = KEY_ENV.openrouter, facts = {}
     return own ? '这次没有对账：可洛进程用的 Key 和 .env 对不上时不对账，先解决 gateway_key' : '这次没有对账：Gateway 用的 Key 和 .env 对不上时不对账，先解决 gateway_key';
   }
   if (code === 'gateway_key' && (own || keyName !== KEY_ENV.openrouter)) return `运行中的可洛进程还没有记录 .env 里这个 ${keyName}。刚启动的进程要先连接完成，等 clo status 显示已连接再试。如果已经连上，它用的就不是这个 Key：进程的环境在启动时固定，改过 .env 要先 clo stop 再 clo start`;
+  if (code === 'heartbeat' && own) return '可洛进程没有在运行，或还没收到过 READY（先在 dry-run 下 clo start）';
   // The checker's problems are short codes it made itself, never provider text.
   if (code === 'key_valid' && facts.providerRulesRecorded === false) return '没有检查：这个接口进入 live 的项目规则还没有记录，记录之前不把 Key 发给接口';
   if (code === 'key_valid' && facts.keyProblems?.length) return `${LIVE_HINTS.key_valid}（${facts.keyProblems.join('、')}）`;

@@ -732,6 +732,22 @@ test('under own, the gateway_key and reconciled hints name the bot process, not 
   assert.equal(effectiveOf(r).mode, 'dry-run');
 });
 
+test('under own, the heartbeat hint names the bot process; openclaw keeps the Gateway words', async () => {
+  const r = root('ownheartbeat');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  markRunning(r, Date.now() - 91000);
+  const gw = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(gw.code, 1);
+  assert.match(gw.out, /heartbeat：Gateway 没有在运行/, 'positive control: openclaw names the Gateway');
+  editConfig(r, (c) => { c.runtime = 'own'; });
+  const own = await clo(r, ['mode', 'live'], { fetch: provider.fetch, env: ownEntryEnv(r) });
+  assert.equal(own.code, 1, `${own.out}${own.err}`);
+  assert.match(own.out, /heartbeat：可洛进程没有在运行，或还没收到过 READY/);
+  assert.doesNotMatch(own.out.split('\n').find((l) => /heartbeat：/.test(l)), /Gateway/);
+  assert.equal(effectiveOf(r).mode, 'dry-run');
+});
+
 test('without config.json the error names the copy command of this platform', async () => {
   const r = root('noconfig');
   const shown = await clo(r, ['mode', 'show']);
