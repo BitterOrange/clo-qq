@@ -125,9 +125,10 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
   let liveStarted = false;
   let lastReadAt = 0;
 
-  function localMicros(day) {
+  // where: an extra condition on the rows, fixed text from this file only.
+  function localMicros(day, where = '1=1') {
     return q(`SELECT COALESCE(SUM(CASE status WHEN 'settled' THEN actual_micros WHEN 'released' THEN 0 ELSE held_micros END), 0) AS m
-              FROM reservations WHERE local_day=?`).get(day).m;
+              FROM reservations WHERE local_day=? AND ${where}`).get(day).m;
   }
 
   // Lifetime usage now, minus lifetime usage at the start of the Shanghai day.
@@ -143,11 +144,14 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
   function spent(at = now()) {
     const day = shanghaiDay(at);
     const local = localMicros(day);
+    // Search rows have a Key of their own, and the chat Key's figure says nothing about them: the larger of the chat
+    // rows and the chat Key's figure, plus the search rows. Before search every row was the chat Key's.
+    const searchLocal = localMicros(day, `provider='${SEARCH_ROW_PROVIDER}'`);
     const provider = providerMicros(at);
     const tiers = store.spendByTier(day);
     const unsettled = q("SELECT COUNT(*) AS n, COALESCE(SUM(held_micros), 0) AS m FROM reservations WHERE status='unsettled'").get();
     return {
-      effectiveMicros: Math.max(local, provider),
+      effectiveMicros: Math.max(local - searchLocal, provider) + searchLocal,
       localMicros: local,
       providerMicros: provider,
       byTier: { interject: tiers.interject, named: tiers.named, addressed: tiers.addressed, search: tiers.search ?? 0 },
@@ -661,7 +665,10 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
 
   // Whether a search could be claimed now, read without writing: what buys the decision for a real @ (decision D1)
   // asks this first, so no decision is bought for a search that would be refused. The claim itself decides.
-  function searchRoom(at = now()) {
+  // extraMicros: holds the caller will take before the search is claimed (the decision and the reply), so the total is
+  // read as the claim will find it.
+  function searchRoom({ extraMicros = 0, at = now() } = {}) {
+    if (!Number.isInteger(extraMicros) || extraMicros < 0) return false;
     try {
       const eff = getEffective();
       const search = runtime === 'own' ? searchOfEffective(eff) : null;
@@ -674,7 +681,7 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
         if (at - store.controlUpdatedAt(SEARCH_PAUSE_KEY) < wait) return false;
       }
       if (store.peekCounter(searchDayCounter(shanghaiDay(at))) >= search.perDay) return false;
-      return spent(at).effectiveMicros + holdMicros('search') <= usdToMicros(eff.budget.searchUsd);
+      return spent(at).effectiveMicros + extraMicros + holdMicros('search') <= usdToMicros(eff.budget.searchUsd);
     } catch {
       return false;
     }

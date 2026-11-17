@@ -1,20 +1,19 @@
 // OpenRouter's Sonar search, as an adapter for modelChat.js: the request body and the classification of every response
 // shape. Pure: no fetch, no cost, no pause. docs/search-contract.md section 4 is the contract.
 // What leaves it: the answer text cut to a limit, up to MAX_SOURCES source names, usage, the HTTP status and the same
-// short error scalars the chat adapter gives. Provider error text never leaves, and URLs never leave: a source with no
-// usable title is named by its host's main label, which carries no dot, so it cannot read as a URL either.
+// short error scalars the chat adapter gives. Provider error text never leaves, and URLs never leave: a source is named
+// by its host's main label, which carries no dot, so it cannot read as a URL either. Titles are never used: they are
+// free web text that no model judges before the program posts the source line (CLAUDE.md 8.4 leaves political
+// content to the model alone), while a host label is a bare [a-z0-9-] word.
 // The field names of the citations are unverified (section 9): all three shapes seen in documentation are read.
-import { findUrls } from '../urls.js';
 import { mapUsage, openrouterAdapter } from './openrouterAdapter.js';
 import { SEARCH_CEILINGS, SEARCH_DEFAULTS } from './searchRegistry.js';
 
 export const MAX_SOURCES = 5;
-export const SOURCE_NAME_MAX = 30;
 
 // The one instruction sent with every query. Fixed text: nothing from the group, the turn or the config is in it.
 export const SEARCH_INSTRUCTION = '用简体中文简要回答这个检索问题，只写来源支持的事实，说明信息的时间。纯文本，不要 Markdown，不要网址。';
 
-const CONTROL = /[\p{Cc}\p{Cf}]/gu;
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 // Labels under which a country's registrable names sit (news.bbc.co.uk -> bbc).
@@ -40,16 +39,6 @@ export function hostLabel(url) {
   return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label) && !label.startsWith('xn--') ? label : null;
 }
 
-// A title as a source name: one line, no control or format characters, no URL in it, no mark-up brackets, at most
-// SOURCE_NAME_MAX code points. Null when nothing usable is left.
-export function cleanTitle(title) {
-  if (typeof title !== 'string') return null;
-  const text = title.normalize('NFKC').replace(CONTROL, ' ').replace(/\s+/gu, ' ').trim();
-  if (!text || findUrls(text).length > 0 || /[<>[\]{}]/u.test(text)) return null;
-  const cut = [...text].slice(0, SOURCE_NAME_MAX).join('').trim();
-  return cut || null;
-}
-
 // Every citation the body carries, in its order, as { title, url }. Unknown shapes are skipped.
 function citationsOf(body, message) {
   const out = [];
@@ -67,12 +56,13 @@ function citationsOf(body, message) {
   return out;
 }
 
-// Source names, each once, at most MAX_SOURCES. A citation with no usable name is dropped.
+// Source names, each once, at most MAX_SOURCES: the host label of each citation's URL. A citation with no usable host
+// is dropped; its title is not read.
 export function sourceNames(body, message) {
   const names = [];
   const seen = new Set();
   for (const c of citationsOf(body, message)) {
-    const name = cleanTitle(c.title) ?? hostLabel(c.url);
+    const name = hostLabel(c.url);
     if (!name) continue;
     const key = name.toLowerCase();
     if (seen.has(key)) continue;

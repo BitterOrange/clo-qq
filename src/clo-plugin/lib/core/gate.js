@@ -8,7 +8,7 @@ import { checkDisplayName, speakerLabel } from './displayName.js';
 import { crashpoint, hourBucket, isQuietHours, shanghaiDay } from './ids.js';
 import { refShape } from './log.js';
 import { settleMicros } from './providers/cost.js';
-import { HARD_CAP_PAUSE, PRICE_ALERT, PRICE_PAUSE, providerOfEffective } from './providers/registry.js';
+import { HARD_CAP_PAUSE, hardCapPauseKey, PRICE_ALERT, PRICE_PAUSE, providerOfEffective } from './providers/registry.js';
 import { groupSearchOn } from './providers/searchRegistry.js';
 import { CRISIS_ELIGIBLE, evaluateOrdinary, extractUrls, pickRepresentative, selectNameRecords } from './rules.js';
 import { searchRequestOf } from './search.js';
@@ -493,33 +493,41 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     // The host may have ended its run with the whole reply while dispatchTurn still drains usage. A /stop in that gap
     // aborts nothing for a person in danger: their reply goes out as it would once delivery had begun.
     const stopAborts = () => flight.aborted && !(flight.replyBeforeStop && inDanger(rec, turn.cls));
+    let refusal = null;
     try {
-      // Own runtime, a search asked for: before the primary call, under the turn's own signal.
-      if (flight.own && rec.search && turn.cls !== 'command') await runSearch(rec, turn, flight);
-      exit.beginTurn(turn);
-      try {
-        // The host path calls straight through, at the same moment it always has.
-        result = flight.own ? await callDispatch(turn, flight) : await dispatchTurn(turn, { signal: flight.controller.signal });
-      } catch {
-        // Whether the model ran is unknown, so settlement treats it as having run.
-        log('dispatch_error', { eventKey: rec.eventKey });
-        result = { started: true, hostError: true, aborted: false, usage: null };
+      // Own runtime, a search asked for: before the primary call, under the turn's own signal. The search may take a
+      // while, so what approveAndRun checked is checked again before the primary call is paid for.
+      if (flight.own && rec.search && turn.cls !== 'command') {
+        await runSearch(rec, turn, flight);
+        if (!flight.aborted) refusal = refusalNow(rec, turn.cls);
       }
-      hostRefused = result?.started === false;
-      try {
-        fin = await exit.finishTurn(turn.turnId, {
-          hostError: !hostRefused && result?.hostError === true,
-          // A turn the host refused has nothing to send. This also clears it from the exit.
-          aborted: hostRefused || result?.aborted === true || stopAborts(),
-          ownerStopped,
-        });
-      } catch {
-        fin = { state: 'failed', reason: 'exit_refused' };
+      if (!refusal) {
+        exit.beginTurn(turn);
+        try {
+          // The host path calls straight through, at the same moment it always has.
+          result = flight.own ? await callDispatch(turn, flight) : await dispatchTurn(turn, { signal: flight.controller.signal });
+        } catch {
+          // Whether the model ran is unknown, so settlement treats it as having run.
+          log('dispatch_error', { eventKey: rec.eventKey });
+          result = { started: true, hostError: true, aborted: false, usage: null };
+        }
+        hostRefused = result?.started === false;
+        try {
+          fin = await exit.finishTurn(turn.turnId, {
+            hostError: !hostRefused && result?.hostError === true,
+            // A turn the host refused has nothing to send. This also clears it from the exit.
+            aborted: hostRefused || result?.aborted === true || stopAborts(),
+            ownerStopped,
+          });
+        } catch {
+          fin = { state: 'failed', reason: 'exit_refused' };
+        }
       }
     } finally {
       // A /stop arriving after this point finds the reply already out.
       flights.get(rec.groupKey)?.delete(flight);
     }
+    if (refusal) return endAfterSearch(rec, turn, holdId, refusal);
     if (hostRefused) fin = { state: 'skipped', reason: result.reason ?? 'ingress' };
     rec.spoke = fin?.state === 'completed' || wentOut(rec.eventKey);
     rec.contentDropped = fin?.state === 'policy_dropped' || fin?.reason === 'platform_violation';
@@ -534,6 +542,38 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       if (await noteHostRefused(rec, turn, reason, ownerStopped())) rec.spoke = true;
     } else if (inDanger(rec, turn.cls) && !flight.droppedOnStop && await noteDangerLost(rec, turn, reason, stopAborts())) {
       rec.spoke = true;
+    }
+  }
+
+  // What approveAndRun refuses a turn for, read again now: null when the turn may go on, else { state, reason } as
+  // approveAndRun would end it. A failed read refuses.
+  function refusalNow(rec, cls) {
+    try {
+      const eff = getEffective();
+      if (!eff) return { state: 'skipped', reason: 'no_effective' };
+      if (!stillAdmitted(eff, rec.evt.conversationId)) return { state: 'ignored', reason: 'admission' };
+      if (eff.mode !== 'live') return { state: 'dry_run', reason: WOULD[cls] ?? 'dry_run' };
+      const p = store.pauseState(rec.groupKey);
+      if (p.global || p.group || p.terminal) return { state: 'paused', reason: 'paused' };
+      const prov = providerOfEffective(eff);
+      if (p.paid || !prov || store.getControl(hardCapPauseKey(prov.kind)) !== null) return { state: 'skipped', reason: 'paid_paused' };
+      return null;
+    } catch {
+      return { state: 'skipped', reason: 'no_effective' };
+    }
+  }
+
+  // A turn refused after its search, before the primary call: the reply's hold is given back, as when approveAndRun
+  // refuses one, and a paid pause gets the same failure line and alert.
+  async function endAfterSearch(rec, turn, holdId, { state, reason }) {
+    tryQuietly(() => ledger.release(holdId));
+    end(rec, 'dispatching', state, reason);
+    if (reason !== 'paid_paused') return;
+    if (inDanger(rec, turn.cls)) alertRefused(rec, reason);
+    if (turn.required && exit) {
+      const fixed = await exit.sendFixed(refOf(rec), 'modelFailed');
+      log('fixed_line', { eventKey: rec.eventKey, kind: 'modelFailed', reason: fixed?.reason ?? null });
+      if (fixed?.sent === true) rec.spoke = true;
     }
   }
 
@@ -558,6 +598,8 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
         displayNames: [...(context?.displayNames(rec.groupKey) ?? []), rec.displayName].filter(Boolean),
         signal: flight.controller.signal,
         deadlineAt: turn.deadlineAt,
+        // Before each call: a pause, dry-run or the group's switch that came during the search stops it.
+        mayGoOn: () => refusalNow(rec, turn.cls) === null && groupSearchOn(getEffective(), turn.groupId),
       });
     } catch {
       log('search_error', { eventKey: rec.eventKey });
@@ -824,18 +866,28 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
 
   // Whether a decision may ask about search for this message: the own runtime with its step, search on in this group,
   // live, and a search that could be claimed now. Not for a person in danger: their answer is not held up for it.
-  function searchable(rec, eff) {
+  // cls: the class the reply will have. Its hold and the decision's are taken before the search is claimed, so the
+  // search tier is read with both in it.
+  function searchable(rec, eff, cls) {
     if (!searchStep || !eff || eff.mode !== 'live' || !groupSearchOn(eff, rec.evt.conversationId)) return false;
     if (isCrisis(rec) || !rec.evt.hasUserText) return false;
-    return ledger.searchRoom?.() === true;
+    let extraMicros;
+    try {
+      extraMicros = ledger.holdMicros('search_decision') + ledger.holdMicros(REPLY_PLANS[cls].hold);
+    } catch {
+      return false;
+    }
+    return ledger.searchRoom?.({ extraMicros }) === true;
   }
 
   // A real @ or a reply to her buys one decision that only asks whether to search (decision D1). Not while the group
-  // is paused, where the reply would be refused anyway.
+  // is paused, where the reply would be refused anyway. Not for a line that hit a local rule either: the step would
+  // refuse its search anyway, and the decision would send the line and its context out once more for nothing.
   function wantsSearchDecision(rec, eff) {
+    if (rec.prerule === true) return false;
     const p = store.pauseState(rec.groupKey);
     if (p.global || p.group || p.terminal) return false;
-    return searchable(rec, eff);
+    return searchable(rec, eff, rec.cls);
   }
 
   // Claim, caps and hold commit together, as for any decision. It counts against the decision caps, pays from the
@@ -931,10 +983,11 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
   }
 
   // G12: claim, caps and hold commit together, or none of them do.
-  function claimDecision(rec, trigger, eff, group, crisisRefusal) {
+  // withSearch: the decision asks about search too, and is held at that request's worst case.
+  function claimDecision(rec, trigger, eff, group, crisisRefusal, withSearch = false) {
     let heldMicros;
     try {
-      heldMicros = ledger.holdMicros('decision');
+      heldMicros = ledger.holdMicros(withSearch ? 'search_decision' : 'decision');
     } catch {
       return { ok: false, reason: 'budget' };
     }
@@ -1013,7 +1066,10 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
   }
 
   async function decideAndRun(rec, trigger, eff, group, crisisRefusal) {
-    const claim = claimDecision(rec, trigger, eff, group, crisisRefusal);
+    // A name in a group with search on asks about search in the decision it buys anyway, and holds for that request.
+    // Interjections never search.
+    const withSearch = trigger === 'name' && searchable(rec, eff, 'name_addressed');
+    const claim = claimDecision(rec, trigger, eff, group, crisisRefusal, withSearch);
     if (!claim.ok) {
       // A spent tier or decision cap is no reason to miss a person in danger. The crisis route pays from its own tier,
       // on its own caps, and answers nothing but crisis.
@@ -1029,8 +1085,6 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     rec.claimId = claim.value.claimId;
     crashpoint('deciding');
 
-    // A name in a group with search on asks about search in the decision it buys anyway. Interjections never search.
-    const withSearch = trigger === 'name' && searchable(rec, eff);
     const d = await askDecision(rec, trigger, eff, { search: withSearch });
     settleDecision(claim.value.holdId, d);
     noteDecisionHealth(d);

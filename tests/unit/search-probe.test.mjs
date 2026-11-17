@@ -167,7 +167,7 @@ test('a full run: each body as planned, the probe Key only, and results with nam
   assert.equal(sonar.class, 'ok');
   assert.deepEqual(sonar.citationShapes, ['search_results', 'citations']);
   assert.equal(sonar.titlesPresent, true);
-  assert.equal(sonar.sourceCount, 2, 'the title, and the host label of the bare citation');
+  assert.equal(sonar.sourceCount, 1, 'one host, cited twice: one name (titles are never names)');
   assert.equal(sonar.modelMatches, true);
   assert.equal(sonar.costPresent, true);
   assert.equal(sonar.promptTokens, 900);

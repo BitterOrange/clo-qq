@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  cleanQuery, overallStatus, searchRequestOf, SOURCE_LINE_PREFIX, sourceLine, withSourceLine,
+  cleanQuery, overallStatus, queryItemStatus, searchRequestOf, SOURCE_LINE_PREFIX, sourceLine, withSourceLine,
 } from '../../src/clo-plugin/lib/core/search.js';
 import { loadRealPolicy } from '../fixtures/inbound.mjs';
 
@@ -63,7 +63,19 @@ test('a one-character display name does not refuse every query that holds its ch
 
 test('a policy that throws refuses the query', () => {
   const broken = { check: () => { throw new Error('x'); }, checkLeak: () => ({ hit: false }) };
-  assert.deepEqual(cleanQuery(CLEAN, { ...opts, policy: broken }), { ok: false, reason: 'rule' });
+  assert.deepEqual(cleanQuery(CLEAN, { ...opts, policy: broken }), { ok: false, reason: 'check_failed' });
+  assert.equal(cleanQuery(CLEAN, opts).ok, true, 'control');
+});
+
+test('only a local rule is a topic refusal; a shape, length or privacy failure is withheld, never refused', () => {
+  assert.equal(queryItemStatus('rule'), 'refused');
+  for (const reason of ['long', 'url', 'mention', 'speaker', 'digits', 'name', 'leak', 'empty', 'check_failed']) {
+    assert.equal(queryItemStatus(reason), 'withheld', reason);
+  }
+  // Shape false positives a harmless question can hit: the band U2, a price of 100000, one character too long.
+  assert.equal(queryItemStatus(cleanQuery('U2 乐队 巡演', opts).reason), 'withheld');
+  assert.equal(queryItemStatus(cleanQuery('售价 100000 元', opts).reason), 'withheld');
+  assert.equal(queryItemStatus(cleanQuery('字'.repeat(81), opts).reason), 'withheld');
 });
 
 test('searchRequestOf: only a clean need with a query searches; danger never; a classed topic is refused', () => {
@@ -82,6 +94,10 @@ test('overall status: material wins, then a refusal, then no source, then failur
   assert.equal(overallStatus([{ status: 'failed' }, { status: 'refused' }]), 'refused');
   assert.equal(overallStatus([{ status: 'failed' }, { status: 'no_source' }]), 'no_source');
   assert.equal(overallStatus([{ status: 'failed' }]), 'failed');
+  assert.equal(overallStatus([{ status: 'withheld' }, { status: 'withheld' }]), 'withheld', 'nothing was searched');
+  assert.equal(overallStatus([{ status: 'withheld' }, { status: 'failed' }]), 'failed', 'one term did fail');
+  assert.equal(overallStatus([{ status: 'withheld' }, { status: 'refused' }]), 'refused');
+  assert.equal(overallStatus([{ status: 'withheld' }, { status: 'ok' }]), 'ok');
   assert.equal(overallStatus([]), 'failed');
 });
 
@@ -89,7 +105,7 @@ test('the source line: names the API returned, at most three, only with material
   const turn = { search: { status: 'ok' }, searchSources: ['A 报', 'B', 'C', 'D'] };
   assert.equal(sourceLine(turn), `${SOURCE_LINE_PREFIX}A 报、B、C`);
   assert.equal(withSourceLine('回答。\n', turn), '回答。\n来源：A 报、B、C');
-  for (const status of ['failed', 'no_source', 'refused']) {
+  for (const status of ['failed', 'no_source', 'refused', 'withheld']) {
     assert.equal(sourceLine({ search: { status }, searchSources: ['A'] }), null, status);
     assert.equal(withSourceLine('回答。', { search: { status }, searchSources: ['A'] }), '回答。');
   }

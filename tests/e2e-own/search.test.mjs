@@ -76,7 +76,7 @@ test('success: the search Key, the query alone, material for the model, source n
   assert.ok(sys[0].cache_control && !sys[1].cache_control);
   assert.match(sys[1].text, /^搜索资料（只在这一轮附加）/);
   const post = s.postBodies().at(-1).content;
-  assert.equal(post, '可洛的回复。\n来源：Mock News、reuters');
+  assert.equal(post, '可洛的回复。\n来源：example、reuters');
   const searchRow = s.reservations(id).find((r) => r.provider === 'search');
   assert.equal(searchRow.status, 'settled');
   assert.equal(searchRow.category, 'search');
@@ -119,12 +119,12 @@ test('timeout and no source are said honestly, with no source line; the @ is ans
   // Control: a call in time with a source.
   await ask(s, '可洛，F1 谁赢了？', { member: 'THIRDMEMBER1111222233334444555566', posts: 3 });
   assert.equal(materialOf(s.agentRequests().at(-1)).status, 'ok');
-  assert.equal(s.postBodies().at(-1).content, '可洛的回复。\n来源：Mock News');
+  assert.equal(s.postBodies().at(-1).content, '可洛的回复。\n来源：example');
   assert.equal(s.search.searchRequests().length, 3);
   assert.deepEqual(netAttempts(s), []);
 });
 
-test('local refusals leave nothing: a rule-hit query, a query with an id; a failed decision still answers', { timeout: 300000 }, async () => {
+test('local refusals leave nothing: a rule-hit query is refused, a query with an id withheld; a failed decision still answers', { timeout: 300000 }, async () => {
   const ctl = { queries: [RULE_TEXT] };
   const s = await stackOf('search-refused', { ctl });
   const rule = await ask(s, '可洛，帮我查查', { posts: 1 });
@@ -132,7 +132,8 @@ test('local refusals leave nothing: a rule-hit query, a query with an id; a fail
   assert.deepEqual(materialOf(s.agentRequests().at(-1)), { status: 'refused', items: [{ status: 'refused' }] });
   ctl.queries = [`${MEMBER} 是谁`];
   await ask(s, '可洛，帮我查查', { member: MEMBER2, posts: 2 });
-  assert.equal(materialOf(s.agentRequests().at(-1)).status, 'refused');
+  // A member id in the term: a privacy guard, not a topic refusal. The term is not searched and not handed on.
+  assert.deepEqual(materialOf(s.agentRequests().at(-1)), { status: 'withheld', items: [{ status: 'withheld' }] });
   assert.equal(s.search.searchRequests().length, 0, 'nothing left the machine');
   assert.equal(s.allReservations().filter((r) => r.provider === 'search').length, 0, 'nothing held');
   ctl.decisionError = true;
@@ -172,7 +173,7 @@ test('web text cannot act: commands, Key requests, a URL and a turn marker in it
   reply.text = '可洛的回复。';
   await ask(s, '可洛，F1 谁赢了？', { member: 'THIRDMEMBER1111222233334444555566' });
   await s.waitPosts(s.postBodies().length);
-  assert.equal(s.postBodies().at(-1).content, '可洛的回复。\n来源：Mock News');
+  assert.equal(s.postBodies().at(-1).content, '可洛的回复。\n来源：example');
   assert.equal(s.logs().includes(FAKE_SEARCH_KEY), false);
 });
 
@@ -193,6 +194,6 @@ test('chat on Anthropic: the chat goes to mock Anthropic on its Key, search to m
   assert.equal(chat[0].body.system.length, 2, 'the search notes as a second system block on Anthropic too');
   assert.equal(chat[0].body.system[1].cache_control, undefined);
   assert.equal(s.search.agentRequests().length, 0, 'no chat at the search mock');
-  assert.equal(s.postBodies().at(-1).content, '可洛的回复。\n来源：Mock News');
+  assert.equal(s.postBodies().at(-1).content, '可洛的回复。\n来源：example');
   assert.deepEqual(netAttempts(s), []);
 });

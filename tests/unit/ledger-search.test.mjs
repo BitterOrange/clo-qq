@@ -163,6 +163,34 @@ test('tier order: spend at searchUsd stops search while names and @ still reserv
   h.store.close();
 });
 
+test('the chat Key\'s figure stands for chat rows only: the day\'s search rows are added on top, never hidden by it', () => {
+  const h = setup();
+  const snap = (at, usd) => h.store.q('INSERT INTO key_snapshots(taken_at, usage_micros, usage_daily_micros, limit_micros, remaining_micros, limit_reset) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(at, usdToMicros(usd), usdToMicros(usd), usdToMicros(3.25), usdToMicros(3.25 - usd), 'daily');
+  // Chat rows $1.00 and search rows $0.50 locally.
+  assert.equal(h.ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: usdToMicros(1), eventKey: 'C' }).ok, true);
+  const s1 = h.ledger.claimSearch({ eventKey: 'S' });
+  assert.equal(s1.ok, true);
+  h.ledger.settleSearch(s1.id, { actualMicros: HOLD, source: 'usage.cost', model: 'perplexity/sonar-pro' });
+  // The day's search spend as $0.50, for round figures (one settled row stands for many calls).
+  h.store.q('UPDATE reservations SET actual_micros=? WHERE id=?').run(usdToMicros(0.5), s1.id);
+  // Control: no Key figure yet, the local total.
+  assert.equal(h.ledger.spent().effectiveMicros, usdToMicros(1.5));
+  // The chat Key read $1.60 today: chat is the larger of $1.00 and $1.60, and search's $0.50 comes on top.
+  snap(T0 - 2 * 3600000, 0);
+  snap(T0 - MIN, 1.6);
+  const s = h.ledger.spent();
+  assert.equal(s.providerMicros, usdToMicros(1.6));
+  assert.equal(s.localMicros, usdToMicros(1.5), 'local is every row, as before');
+  assert.equal(s.effectiveMicros, usdToMicros(2.1), 'not max($1.50, $1.60)');
+  // So the search tier at $2.10 is full, and a further search is refused.
+  assert.deepEqual(h.ledger.claimSearch({ eventKey: 'S2' }), { ok: false, reason: 'total' });
+  // Control: a chat figure below the chat rows leaves the local total.
+  snap(T0, 0.4);
+  assert.equal(h.ledger.spent().effectiveMicros, usdToMicros(1.5));
+  h.store.close();
+});
+
 test('search is off without the block, on the OpenClaw runtime, and under the global and hard-cap pauses', () => {
   const on = setup();
   assert.equal(on.ledger.claimSearch({ eventKey: 'E' }).ok, true, 'control');

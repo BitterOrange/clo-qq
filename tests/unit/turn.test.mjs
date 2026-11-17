@@ -747,7 +747,7 @@ test('search: the source line follows the reply with material, and nothing else'
   const ok = runner({ respond: async () => json(completion('北京明天晴。')) });
   await ok.dispatchTurn(turnOf({ search: SEARCHED, searchSources: ['Mock News', 'B', 'C', 'D'] }));
   assert.equal(ok.collected[0][1].text, '北京明天晴。\n来源：Mock News、B、C');
-  for (const status of ['failed', 'no_source', 'refused']) {
+  for (const status of ['failed', 'no_source', 'refused', 'withheld']) {
     const r = runner({ respond: async () => json(completion('这次没查到。')) });
     await r.dispatchTurn(turnOf({ search: { status, items: [{ status }] }, searchSources: [] }));
     assert.equal(r.collected[0][1].text, '这次没查到。', status);

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createChatClient } from '../../src/clo-plugin/lib/core/providers/modelChat.js';
 import {
-  cleanTitle, createSearchAdapter, hostLabel, MAX_SOURCES, SEARCH_INSTRUCTION, searchAdapter, sourceNames,
+  createSearchAdapter, hostLabel, MAX_SOURCES, SEARCH_INSTRUCTION, searchAdapter, sourceNames,
 } from '../../src/clo-plugin/lib/core/providers/searchAdapter.js';
 import { SEARCH_CEILINGS, SEARCH_DEFAULTS, SEARCH_MODEL } from '../../src/clo-plugin/lib/core/providers/searchRegistry.js';
 import { liveSecrets, searchBaseOf, searchKeyOf } from '../../src/bot/services.mjs';
@@ -52,13 +52,13 @@ test('success: text and source names from any of the three citation shapes, and 
   const viaResults = classify(answer());
   assert.equal(viaResults.kind, 'ok');
   assert.equal(viaResults.text, '一条检索结果。');
-  assert.deepEqual(viaResults.sources, [{ name: 'Mock News' }]);
+  assert.deepEqual(viaResults.sources, [{ name: 'example' }], 'the host label of news.example.com');
   assert.equal(viaResults.message, null, 'the raw message never leaves');
   assert.deepEqual(viaResults.usage, { input: 20, output: 40, cacheRead: 0, cacheWrite: 0, costUsd: 0.0056, model: MODEL });
   assert.ok(noUrl(viaResults));
 
   const viaAnnotations = classify(answer({ search_results: undefined }, { annotations: [{ type: 'url_citation', url_citation: { title: '新华网报道', url: 'https://www.xinhuanet.com/x' } }] }));
-  assert.deepEqual(viaAnnotations.sources, [{ name: '新华网报道' }]);
+  assert.deepEqual(viaAnnotations.sources, [{ name: 'xinhuanet' }]);
   const viaCitations = classify(answer({ search_results: undefined, citations: ['https://www.reuters.com/world/x', 'https://news.bbc.co.uk/y'] }));
   assert.deepEqual(viaCitations.sources, [{ name: 'reuters' }, { name: 'bbc' }], 'with no title, the host\'s main label');
   for (const r of [viaAnnotations, viaCitations]) {
@@ -67,20 +67,20 @@ test('success: text and source names from any of the three citation shapes, and 
   }
 });
 
-test('source names: one each, at most five, titles cleaned, a title that reads as a URL falls back to the host', () => {
-  const many = Array.from({ length: 8 }, (_, i) => ({ title: `来源 ${i}`, url: `https://s${i}.example.org/` }));
+test('source names: host labels only, one each, at most five; a title is never posted, whatever it says', () => {
+  const many = Array.from({ length: 8 }, (_, i) => ({ title: `来源 ${i}`, url: `https://s${i}.site${i}.org/` }));
   assert.equal(classify(answer({ search_results: many })).sources.length, MAX_SOURCES);
-  const dup = classify(answer({ search_results: [{ title: 'Same', url: 'https://a.example.com/1' }, { title: 'same', url: 'https://b.example.com/2' }] }));
-  assert.deepEqual(dup.sources, [{ name: 'Same' }]);
-  const urlTitle = classify(answer({ search_results: [{ title: 'www.example.com/page', url: 'https://www.wikipedia.org/wiki/x' }] }));
-  assert.deepEqual(urlTitle.sources, [{ name: 'wikipedia' }]);
-  assert.equal(cleanTitle('Node.js 24 发布'), 'Node.js 24 发布', 'control: a dotted word that is not a URL stays');
-  assert.equal(cleanTitle('a\u0000b​c\n d'), 'a b c d');
-  assert.equal(cleanTitle('<@U123> 标题'), null, 'mark-up brackets');
-  assert.equal(cleanTitle('[clo-turn x]'), null);
-  assert.equal([...cleanTitle('长'.repeat(50))].length, 30);
-  assert.equal(cleanTitle(''), null);
-  assert.equal(cleanTitle(5), null);
+  const dup = classify(answer({ search_results: [{ title: 'Same', url: 'https://a.example.com/1' }, { title: 'Other', url: 'https://b.example.com/2' }] }));
+  assert.deepEqual(dup.sources, [{ name: 'example' }], 'one host, one name');
+  // Free web text in a title (an advert, a slogan, a topic the content scope leaves to the model) never reaches the line.
+  const TITLE = '限时优惠加微信 TITLE-MARKER 立即领取';
+  const titled = classify(answer({ search_results: [{ title: TITLE, url: 'https://www.wikipedia.org/wiki/x' }] }));
+  assert.deepEqual(titled.sources, [{ name: 'wikipedia' }]);
+  assert.equal(JSON.stringify(titled).includes('TITLE-MARKER'), false);
+  // A title with no usable URL gives no source at all.
+  const titleOnly = classify(answer({ search_results: [{ title: 'Mock News', url: null }] }));
+  assert.equal(titleOnly.kind, 'no_source');
+  assert.equal(classify(answer()).kind, 'ok', 'control: the same answer with a URL has a source');
 });
 
 test('host labels: the registrable label, never a dot, an IP, punycode or another scheme', () => {
@@ -178,7 +178,7 @@ test('through the one send loop: the search Key in its header, the answer classi
   const body = searchAdapter.searchBody({ model: MODEL, maxTokens: 600, query: '查一下' });
   const r = await client.post(body, { deadlineAt: Date.now() + 5000 });
   assert.equal(r.kind, 'ok');
-  assert.deepEqual(r.sources, [{ name: 'Mock News' }]);
+  assert.deepEqual(r.sources, [{ name: 'example' }]);
   assert.equal(seen.length, 1);
   assert.equal(seen[0].url, 'http://127.0.0.1:9/api/v1/chat/completions');
   assert.equal(seen[0].init.headers.Authorization, `Bearer ${FAKE_SEARCH_KEY}`);

@@ -65,10 +65,15 @@ export function cleanQuery(raw, { maxChars = SEARCH_CEILINGS.queryMaxChars, poli
     if (policy.checkLeak(query, { secrets, rawIds }).hit) return { ok: false, reason: 'leak' };
     if (policy.check(query).hit) return { ok: false, reason: 'rule' };
   } catch {
-    return { ok: false, reason: 'rule' };
+    return { ok: false, reason: 'check_failed' };
   }
   return { ok: true, query };
 }
+
+// Only a local rule is a refusal of the topic ("这个我不查", CLAUDE.md section 6). Every other reason a term fails
+// cleaning is its shape, its length or a privacy guard: that term was not searched this time, which is neither a topic
+// refusal nor a network failure.
+export const queryItemStatus = (reason) => (reason === 'rule' ? 'refused' : 'withheld');
 
 /**
  * What a decision asks of search: null for nothing, { refused: true } for a search on a topic the decision classed
@@ -84,12 +89,14 @@ export function searchRequestOf(d) {
   return queries.length > 0 ? { refused: false, queries } : null;
 }
 
-// The status the turn sees as a whole: material if any call gave some, else the plainest reason for none.
+// The status the turn sees as a whole: material if any call gave some, else the plainest reason for none. withheld
+// only when no term was searched for any other reason.
 export function overallStatus(items) {
   const has = (status) => items.some((i) => i.status === status);
   if (has('ok')) return 'ok';
   if (has('refused')) return 'refused';
   if (has('no_source')) return 'no_source';
+  if (items.length > 0 && items.every((i) => i.status === 'withheld')) return 'withheld';
   return 'failed';
 }
 
@@ -211,9 +218,11 @@ export function createSearchStep({ client, ledger, policy, getEffective, log = (
   /**
    * request: searchRequestOf's answer. prerule: the inbound text hit a local rule. rawIds: the turn's raw ids.
    * displayNames: names known in the group. signal: the turn's own (a /stop, a shutdown or the deadline aborts it).
-   * deadlineAt: the passive window's end. -> null (no search) or { status, items, sources }.
+   * deadlineAt: the passive window's end. mayGoOn: () => whether the turn may still go on (no pause, live, the group's
+   * switch on), asked before each call; false stops the search there.
+   * -> null (no search) or { status, items, sources }.
    */
-  async function run({ eventKey, groupKey = null, request, prerule = false, rawIds = [], displayNames = [], signal, deadlineAt }) {
+  async function run({ eventKey, groupKey = null, request, prerule = false, rawIds = [], displayNames = [], signal, deadlineAt, mayGoOn = null }) {
     if (!request) return null;
     const eff = getEffective();
     const search = searchOfEffective(eff);
@@ -233,18 +242,34 @@ export function createSearchStep({ client, ledger, policy, getEffective, log = (
     const perAnswer = Math.min(search.perAnswer, SEARCH_CEILINGS.perAnswer);
     const items = [];
     const sources = [];
+    let halted = false;
+    const goesOn = () => {
+      if (typeof mayGoOn !== 'function') return true;
+      try {
+        return mayGoOn() === true;
+      } catch {
+        return false;
+      }
+    };
     for (const raw of request.queries.slice(0, perAnswer)) {
       if (signal?.aborted) break;
       const c = cleanQuery(raw, { maxChars: search.queryMaxChars, policy, rawIds, secrets: held, displayNames });
       if (!c.ok) {
-        log('search_call', { eventKey, status: 'refused', reason: c.reason });
-        items.push({ status: 'refused' });
+        // The term itself is never handed on: it failed the very checks that keep it on this machine.
+        const status = queryItemStatus(c.reason);
+        log('search_call', { eventKey, status, reason: c.reason });
+        items.push({ status });
         continue;
       }
       if (now() + search.searchMs + MIN_TURN_MS + DELIVERY_RESERVE_MS > deadlineAt) {
         log('search_call', { eventKey, status: 'failed', reason: 'time' });
         items.push({ status: 'failed', query: c.query });
         continue;
+      }
+      if (!goesOn()) {
+        log('search_call', { eventKey, status: 'stopped', reason: 'turn_refused' });
+        halted = true;
+        break;
       }
       const item = await oneCall({ eventKey, groupKey, query: c.query, search, signal, rawIds, held });
       if (item.status === 'ok') {
@@ -254,6 +279,8 @@ export function createSearchStep({ client, ledger, policy, getEffective, log = (
         items.push(item.status === 'refused' ? { status: 'refused' } : { status: item.status, query: c.query });
       }
     }
+    // Stopped before anything was decided: the caller ends or goes on without search, and nothing is claimed of it.
+    if (items.length === 0 && halted) return null;
     if (items.length === 0) items.push({ status: 'failed' });
     return { status: overallStatus(items), items, sources };
   }
