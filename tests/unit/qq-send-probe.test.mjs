@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
+import { IS_WINDOWS } from '../harness/platform.mjs';
 import { startMockQq } from '../harness/mock-qq.mjs';
 import { buildRequest, CASES, isTrigger, runProbe, TRIGGER } from '../../src/tools/qq-send-probe.mjs';
 import { hashId } from '../../src/tools/qq-shape.mjs';
 
+const NOT_WINDOWS = IS_WINDOWS ? 'not Windows: Windows has no mode bits, and its writes are unchanged' : false;
 const SALT = 'test-salt';
 const GROUP = 'GROUPALLOWED';
 const ALLOW = hashId(SALT, GROUP);
@@ -29,9 +31,10 @@ const groupEvent = (over = {}) => ({
 
 const sends = (mock) => mock.requests.filter((r) => r.method === 'POST' && r.path.startsWith('/v2/'));
 
-async function withProbe(fn, caseName = 'passive-text') {
+async function withProbe(fn, caseName = 'passive-text', prepare = () => {}) {
   const mock = await startMockQq();
   const dir = mkdtempSync(join(tmpdir(), 'clo-q0b-'));
+  prepare(join(dir, 'r.jsonl'));
   const ac = new AbortController();
   const said = [];
   const run = runProbe({
@@ -126,4 +129,20 @@ test('source allows no free-text send', () => {
   assert.ok(!/arg\('(text|content|message|target)'\)/.test(src));
   assert.ok(!/OPENROUTER|CLO_CHAT_API_KEY|CLO_SEARCH_API_KEY/i.test(src));
   assert.ok(!/FULL_INTENTS/.test(src));
+});
+
+// q0b-results.jsonl is appended across runs: off Windows one an earlier run left 0644 is narrowed before the first line.
+test('an existing wider result file is narrowed to 0600 off Windows, and keeps its earlier lines', { skip: NOT_WINDOWS }, async () => {
+  let control = null;
+  await withProbe(async ({ mock, resultPath }) => {
+    mock.push('GROUP_MESSAGE_CREATE', groupEvent());
+    await until(() => sends(mock).length === 1, 'send');
+    await until(() => readFileSync(resultPath, 'utf8').split('\n').filter(Boolean).length > 1, 'a result line');
+    assert.equal(statSync(resultPath).mode & 0o777, 0o600);
+    assert.ok(readFileSync(resultPath, 'utf8').startsWith('{"earlier":true}\n'), 'the earlier run is kept');
+  }, 'passive-text', (p) => {
+    writeFileSync(p, '{"earlier":true}\n', { mode: 0o644 });
+    control = statSync(p).mode & 0o777;
+  });
+  assert.equal(control, 0o644, 'control: the file started 0644');
 });

@@ -1,7 +1,7 @@
 // TQ18: passive window, part cap, interjection cap, and that there is no path without msg_id.
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
-import { createExit } from '../../src/clo-plugin/lib/channels/qq/exit.js';
+import { createExit, SEND_MARGIN_MS } from '../../src/clo-plugin/lib/channels/qq/exit.js';
 import { clipToSentence, guardUrls, removeUrls, splitParts, stripForQq, URL_REMOVED } from '../../src/clo-plugin/lib/channels/qq/text.js';
 import { makeEffective, makeHarness, MEMBER2, T0, USAGE } from '../fixtures/inbound.mjs';
 
@@ -54,9 +54,18 @@ test('at 285 s the reply is dropped, never converted to proactive', async () => 
   assert.equal(h.posts.length, 0);
 });
 
-test('just inside 285 s it still posts', async () => {
+test('the margin: a reply that would start within SEND_MARGIN_MS of 285 s is dropped', async () => {
+  assert.equal(SEND_MARGIN_MS, 1000);
   const h = stack();
-  h.delayMs = 284000;
+  h.delayMs = 285000 - SEND_MARGIN_MS;
+  const e = await h.sendAndFlush(h.at());
+  assert.equal(h.state(e), 'failed:deadline');
+  assert.equal(h.posts.length, 0);
+});
+
+test('just before the margin it still posts', async () => {
+  const h = stack();
+  h.delayMs = 285000 - SEND_MARGIN_MS - 1;
   const e = await h.sendAndFlush(h.at());
   assert.equal(h.state(e), 'completed:sent');
   assert.equal(h.posts.length, 1);
@@ -76,8 +85,34 @@ test('the fixed line respects the same window', async () => {
   h.clock.t = T0 + 285000;
   assert.deepEqual(await h.exit.sendFixed(ref, 'modelFailed'), { sent: false, reason: 'deadline' });
   assert.equal(h.posts.length, 0);
-  h.clock.t = T0 + 1000;
+  h.clock.t = T0 + 285000 - SEND_MARGIN_MS;
+  assert.deepEqual(await h.exit.sendFixed(ref, 'modelFailed'), { sent: false, reason: 'deadline' }, 'inside the margin too');
+  assert.equal(h.posts.length, 0);
+  h.clock.t = T0 + 285000 - SEND_MARGIN_MS - 1;
   assert.equal((await h.exit.sendFixed(ref, 'modelFailed')).sent, true, 'positive control');
+});
+
+test('the window is read again right before the POST: time spent after the checks still stops it', async () => {
+  const h = stack();
+  const ref = { eventKey: 'k', groupKey: h.store.key('GROUPAAAA11112222333344445555'), groupId: 'GROUPAAAA11112222333344445555', messageId: 'M', receivedAt: T0, msgTs: T0 };
+  const check = h.policy.check.bind(h.policy);
+  // The policy check runs after the line's own deadline check and before the part is posted.
+  let jumpTo = null;
+  h.policy.check = (text) => {
+    if (jumpTo !== null) h.clock.t = jumpTo;
+    return check(text);
+  };
+  h.clock.t = T0 + 1000;
+  jumpTo = T0 + 285000 - SEND_MARGIN_MS;
+  assert.deepEqual(await h.exit.sendFixed(ref, 'modelFailed'), { sent: false, reason: 'deadline' });
+  assert.equal(h.posts.length, 0, 'nothing was posted');
+  assert.deepEqual(h.store.sendsForEvent('k').map((r) => r.state), ['aborted'], 'the row says it never left');
+  assert.ok(h.logs.some((l) => l.event === 'exit_post' && l.state === 'deadline'), 'and the log says why');
+  // Positive control: the same path with the jump still before the margin posts.
+  h.clock.t = T0 + 1000;
+  jumpTo = T0 + 285000 - SEND_MARGIN_MS - 1;
+  assert.equal((await h.exit.sendFixed(ref, 'modelFailed')).sent, true);
+  assert.equal(h.posts.length, 1);
 });
 
 test('a required answer is at most 5 parts of at most maxPartChars, in order, with seq per part', async () => {

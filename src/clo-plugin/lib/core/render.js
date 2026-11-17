@@ -1,8 +1,9 @@
 // Renders openclaw.json and the workspace files. Pure, apart from reading persona files and writeAtomic.
 import { randomBytes } from 'node:crypto';
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { closeSync, fchmodSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { checkSentinels, sha256Hex } from './contentPolicy.js';
+import { mkdirPrivate, PRIVATE_FILE_MODE, PRIVATE_MODES } from './private-fs.js';
 
 // Enumerated on purpose. `group:*` here leaves no callable tool and fails every turn (observed).
 export const DENY = [
@@ -12,6 +13,13 @@ export const DENY = [
 const FAKE_TEST_KEY = 'sk-or-v1-FAKE-KEY-FOR-LOCAL-MOCK-ONLY';
 // The native window is host metadata. contextTokens is what actually caps input.
 const NATIVE_CONTEXT_WINDOW = 200000;
+// The host's file log. Its default is /tmp/openclaw on Linux and the temp folder on Windows; logging.file moves it.
+// This name keeps the host's daily rolling and its 24 h prune of openclaw-*.log in that folder.
+export const HOST_LOG_NAME = 'openclaw-YYYY-MM-DD.log';
+export function hostLogFile(paths) {
+  if (typeof paths.logsDir !== 'string' || !paths.logsDir) throw new Error('render: paths.logsDir is required');
+  return join(paths.logsDir, 'host', HOST_LOG_NAME);
+}
 
 function providerBlock(effective, testMode) {
   const { primary } = effective.models;
@@ -78,7 +86,8 @@ export function renderOpenclaw(cfg, effective, paths, { testMode = false } = {})
     gateway,
     // At error level the host still writes provider error text to its console and file logs (observed).
     // Silent stops the file log and subsystem lines; src/cli/host-output-filter.mjs takes its direct console writes.
-    logging: { level: 'silent', consoleLevel: 'silent' },
+    // The file is named anyway, so a raised level (OPENCLAW_LOG_LEVEL outranks this) still writes inside .runtime.
+    logging: { level: 'silent', consoleLevel: 'silent', file: hostLogFile(paths) },
     update: { checkOnStart: false, auto: { enabled: false } },
     discovery: { mdns: { mode: 'off' } },
     cron: { enabled: false },
@@ -142,11 +151,17 @@ export function renderWorkspace(repoRoot, effective) {
   };
 }
 
+// Off Windows the file is always 0600 once written, whatever the umask and whatever mode the file it replaces had: it
+// may hold a token, a raw ID or a key name. A stricter mode such as 0400 is not kept, since the project must still be
+// able to read and rewrite the file. A folder it has to create is 0700. Windows is unchanged.
 export function writeAtomic(path, text) {
-  mkdirSync(dirname(path), { recursive: true });
+  if (PRIVATE_MODES) mkdirPrivate(dirname(path));
+  else mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  const fd = openSync(tmp, 'w');
+  const fd = PRIVATE_MODES ? openSync(tmp, 'wx', PRIVATE_FILE_MODE) : openSync(tmp, 'w');
   try {
+    // The umask can only take bits away; this makes the mode exact before any byte is written.
+    if (PRIVATE_MODES) fchmodSync(fd, PRIVATE_FILE_MODE);
     writeSync(fd, text);
     fsyncSync(fd);
   } finally {

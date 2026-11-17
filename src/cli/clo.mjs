@@ -8,10 +8,11 @@ import { createLedger } from '../clo-plugin/lib/core/ledger.js';
 import { anthropicModelChecks, callWorstMicros, checkAnthropicModels, fetchCatalog, lockFromCatalog, lockFromPriceBook, resolveSelector, validateModels } from '../clo-plugin/lib/core/models.js';
 import { ACTIVE_PROVIDER_CONTROL, hardCapAckProblems, hardCapAckRefusal, hardCapControlKey, KEY_ENV, liveStartCheck, providerRecord, providerRulesRecorded } from '../clo-plugin/lib/core/providers/registry.js';
 import { extractPolicySection, writeAtomic } from '../clo-plugin/lib/core/render.js';
-import { apply as applyRender, assertApplicable as checkApplicable, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, readPriceBook, renderAll, requiredHoldMicros, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock } from './common.mjs';
+import { apply as applyRender, assertApplicable as checkApplicable, assertNoEnvProxy, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, readPriceBook, renderAll, requiredHoldMicros, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock } from './common.mjs';
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, runDoctor } from './doctor.mjs';
 import { assertRuntimeSwitchAllowed, assertTestModeWired, inspectGateway, inspectStartLock, parseEnvFile, readPidRecord, recordRuntime, renamedEnvNames, renamedKeyHint, requireSecrets, RUNTIME_LABEL, startLockFile, startRuntime, stopGateway, withStartLock } from './lifecycle.mjs';
 import { collectStatus, formatStatus, RESIDUAL_EXIT, residualBehind } from './status.mjs';
+import { IS_WINDOWS, isEntryPath } from './platform.mjs';
 import { liveBotLease, releaseLeaseOfPid, STOP_REQUEST_KEY } from '../clo-plugin/lib/channels/qq/lease.js';
 
 const USAGE = `用法：clo <命令>
@@ -129,10 +130,14 @@ const LIVE_HINTS = {
 };
 
 // keyName: the .env name of the active kind's Key. facts: what gatherLiveFacts found, for short codes only.
-function liveHint(code, failed, hasKey, keyName = KEY_ENV.openrouter, facts = {}) {
+// runtime: config.json's. The own runtime has no Gateway, so its Key hints name the bot process instead.
+function liveHint(code, failed, hasKey, keyName = KEY_ENV.openrouter, facts = {}, runtime = 'openclaw') {
+  const own = runtime === 'own';
   if ((code === 'key_readable' || code === 'key_valid') && !hasKey) return `.env 里没有 ${keyName}`;
-  if (code === 'reconciled' && failed.includes('gateway_key')) return '这次没有对账：Gateway 用的 Key 和 .env 对不上时不对账，先解决 gateway_key';
-  if (code === 'gateway_key' && keyName !== KEY_ENV.openrouter) return `运行中的可洛进程还没有记录 .env 里这个 ${keyName}。刚启动的进程要先连接完成，等 clo status 显示已连接再试。如果已经连上，它用的就不是这个 Key：进程的环境在启动时固定，改过 .env 要先 clo stop 再 clo start`;
+  if (code === 'reconciled' && failed.includes('gateway_key')) {
+    return own ? '这次没有对账：可洛进程用的 Key 和 .env 对不上时不对账，先解决 gateway_key' : '这次没有对账：Gateway 用的 Key 和 .env 对不上时不对账，先解决 gateway_key';
+  }
+  if (code === 'gateway_key' && (own || keyName !== KEY_ENV.openrouter)) return `运行中的可洛进程还没有记录 .env 里这个 ${keyName}。刚启动的进程要先连接完成，等 clo status 显示已连接再试。如果已经连上，它用的就不是这个 Key：进程的环境在启动时固定，改过 .env 要先 clo stop 再 clo start`;
   // The checker's problems are short codes it made itself, never provider text.
   if (code === 'key_valid' && facts.providerRulesRecorded === false) return '没有检查：这个接口进入 live 的项目规则还没有记录，记录之前不把 Key 发给接口';
   if (code === 'key_valid' && facts.keyProblems?.length) return `${LIVE_HINTS.key_valid}（${facts.keyProblems.join('、')}）`;
@@ -156,11 +161,19 @@ export function policyPasses(ctx, cfg) {
 // each check runs by its kind's capabilities: OpenRouter reads its Key; a kind whose Key cannot be read checks the
 // attested hard cap's Key binding and that the Key can read both locked models, the last only once the kind's
 // project rules are recorded. rulesRecorded: the registry's record; a test passes its own to reach the recorded branch.
+// Warnings a passing doctor report would not print, shown by start and mode live.
+const SHOWN_WARNINGS = ['env_old_names', 'env_duplicates', 'parent_proxy'];
+export function shownNotes(report) {
+  return report.checks.filter((c) => !c.ok && SHOWN_WARNINGS.includes(c.id)).map((c) => `提醒：${c.detail}`);
+}
+
 export async function gatherLiveFacts(ctx, cfg, { rulesRecorded = providerRulesRecorded } = {}) {
   const facts = { now: ctx.now(), env: ctx.env };
   const provider = providerOfConfig(cfg);
   const kind = provider?.kind ?? null;
-  facts.doctorOk = runDoctor(ctx, { level: CONFIG_LEVEL }).ok;
+  const report = runDoctor(ctx, { level: CONFIG_LEVEL });
+  facts.doctorOk = report.ok;
+  facts.doctorNotes = shownNotes(report);
   facts.policyOk = policyPasses(ctx, cfg);
   facts.modelsLocked = Boolean(kind && usableLock(cfg, readModelsLock(ctx.paths, kind), kind));
   // From the registry by kind, never from a file.
@@ -219,6 +232,8 @@ async function cmdModeLive(ctx) {
     ctx.out('已经是 live。');
     return 0;
   }
+  // Before anything is written: the checks below read the Key over the network.
+  assertNoEnvProxy(ctx);
   const dry = { ...cfg, mode: 'dry-run' };
   assertValid(ctx, dry);
   assertRuntimeSwitchAllowed(ctx, runtimeOf(dry));
@@ -227,12 +242,13 @@ async function cmdModeLive(ctx) {
   // Fresh render first, so doctor and the ledger read this config and not a stale one.
   apply(ctx, dry);
   const facts = await gatherLiveFacts(ctx, cfg);
+  for (const line of facts.doctorNotes) ctx.out(line);
   const result = livePreconditions(cfg, facts);
   if (!result.ok) {
     ctx.out('拒绝进入 live，以下条件未满足：');
     const keyName = KEY_ENV[activeKindOf(cfg)] ?? KEY_ENV.openrouter;
     const hasKey = Boolean(parseEnvFile(ctx.paths.envFile)[keyName]);
-    for (const code of result.failed) ctx.out(`  ${code}：${liveHint(code, result.failed, hasKey, keyName, facts)}`);
+    for (const code of result.failed) ctx.out(`  ${code}：${liveHint(code, result.failed, hasKey, keyName, facts, runtimeOf(cfg))}`);
     const hint = hasKey ? '' : renamedKeyHint(renamedEnvNames(ctx.paths.envFile), [keyName]);
     if (hint) ctx.out(hint);
     ctx.log('cli_mode_refused', { count: result.failed.length });
@@ -1112,10 +1128,8 @@ async function startLocked(ctx) {
     ctx.out(formatDoctor(report));
     throw new CliError('doctor 没有通过，不启动。');
   }
-  // A passing report is not printed, and these two would otherwise go unseen until mode live or a separate doctor.
-  for (const c of report.checks) {
-    if (!c.ok && ['env_old_names', 'env_duplicates'].includes(c.id)) ctx.out(`提醒：${c.detail}`);
-  }
+  // A passing report is not printed, and these would otherwise go unseen until mode live or a separate doctor.
+  for (const line of shownNotes(report)) ctx.out(line);
   const { pid, port } = await startRuntime(ctx, cfg, { secrets });
   if (runtime === 'own') ctx.out(`可洛进程已启动（own 运行时）：进程 ${pid}，不监听端口，模式 ${cfg.mode}。`);
   else ctx.out(`Gateway 已启动：进程 ${pid}，端口 ${port}（仅 loopback），模式 ${cfg.mode}。`);
@@ -1228,6 +1242,8 @@ export async function main(rawArgv, rawIo = {}) {
 }
 
 const invoked = process.argv[1] ? resolve(process.argv[1]).toLowerCase() : '';
-if (invoked === fileURLToPath(import.meta.url).toLowerCase()) {
+// Windows keeps its case-insensitive comparison; elsewhere both paths go through realpath, so a symlink still runs.
+const isMain = IS_WINDOWS ? invoked === fileURLToPath(import.meta.url).toLowerCase() : isEntryPath(process.argv[1], import.meta.url);
+if (isMain) {
   process.exitCode = await main(process.argv.slice(2));
 }

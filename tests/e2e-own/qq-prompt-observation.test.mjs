@@ -1,6 +1,8 @@
-// The own runtime counterpart of tests/e2e/qq-prompt-observation.test.mjs. Observation, not a gate: writes what the
-// model is shown to prompt.json in a fresh temp directory and prints the path. It asserts only the facts the build
-// depends on: the request the bot builds is the whole of what the model sees, with no host text or tool in it.
+// The own runtime counterpart of tests/e2e/qq-prompt-observation.test.mjs. Observation, not a gate: prints what the
+// model is shown, as JSON. Nothing is left on disk by default; with CLO_KEEP_PROMPT_OBSERVATION=1 the JSON also goes to
+// prompt.json in a fresh clo-prompt-observation-own-* temp folder, whose path is printed and which is left there to
+// read (delete it by hand). It asserts only the facts the build depends on: the request the bot builds is the whole of
+// what the model sees, with no host text or tool in it.
 // The wire shape is each provider's own; the facts asserted are the same on both.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -53,9 +55,13 @@ after(async () => {
   await s?.stop();
   s?.cleanup();
   if (report) {
-    const file = join(mkdtempSync(join(tmpdir(), 'clo-prompt-observation-own-')), 'prompt.json');
-    writeFileSync(file, JSON.stringify({ own: report }, null, 2));
-    console.log(`prompt observation: ${file}`);
+    const json = JSON.stringify({ own: report }, null, 2);
+    console.log(`prompt observation:\n${json}`);
+    if (process.env.CLO_KEEP_PROMPT_OBSERVATION === '1') {
+      const file = join(mkdtempSync(join(tmpdir(), 'clo-prompt-observation-own-')), 'prompt.json');
+      writeFileSync(file, json);
+      console.log(`prompt observation kept: ${file}`);
+    }
   }
 });
 

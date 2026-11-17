@@ -152,6 +152,7 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 |---|---|---|
 | `dispatch-stalled.test.mjs` | `dispatch-stalled.test.mjs` | 改写：回合程序自己提前截断，gate 在被动窗口结束时中止 |
 | `fix2-stop-host.test.mjs` | `fix2-stop-host.test.mjs` | 改写：`/stop` 不出 gate，同一秒的消息跳过 |
+| `host-log-dir.test.mjs` | 没有 | 只检查 OpenClaw 宿主的文件日志放在 `.runtime/logs/host`、不写 `/tmp/openclaw`；own 运行时不启动宿主，没有这个日志 |
 | `policy-sentinel.test.mjs` | `policy-sentinel.test.mjs` | 移植；宿主的后备提示词那几行没有对应 |
 | `provider-refusal.test.mjs` | `provider-refusal.test.mjs` | 改写：不流式的响应形状，加上对进程写的所有文件的扫描；宿主日志那部分不再有 |
 | `q5-probe.test.mjs` | 没有 | own 模式在 `tests/unit/q5-probe.test.mjs` 里，不启动进程 |

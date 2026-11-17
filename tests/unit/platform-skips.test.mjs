@@ -42,7 +42,14 @@ function skipsIn(text) {
 // - WINDOWS_ONLY: everywhere but Windows. The test runs a .ps1 through powershell.exe.
 // - WINDOWS_ENV_SHAPE: everywhere but Windows. It asserts the Windows shape of the clean environment; NOT_WINDOWS marks
 //   its twins, which are skipped on Windows.
-// - LINUX_ONLY: everywhere but Linux. The test reads /proc.
+// - NOT_WINDOWS in entry-symlink.test.mjs: skipped on Windows, where a folder symlink needs admin rights and the
+//   console keeps its own entry check.
+// - NOT_WINDOWS in private-modes.test.mjs and qq-send-probe.test.mjs: skipped on Windows, which has no mode bits; its
+//   writes are unchanged.
+// - NOT_WINDOWS in env-proxy.test.mjs: skipped on Windows, where the console keeps its earlier behaviour and never
+//   refuses for Node's env proxy.
+// - LINUX_ONLY: everywhere but Linux. The test reads /proc, or runs a .sh through bash (the Linux install and the
+//   console wrappers, whose start and stop look processes up in /proc).
 // - t.skip(...): at run time, only when the machine cannot show the case (the reason is the text).
 // - OPENROUTER_ONLY, ANTHROPIC_ONLY, PROVIDER: by the provider the run was started for, on every platform.
 // - existsSync(...), seam: only while a file the test needs is not on disk.
@@ -64,15 +71,29 @@ const INVENTORY = [
   ['tests/unit/cli-mode.test.mjs', 'mode dry-run does not claim to have stopped when the effective file cannot be written', "t.skip('this user can write into a read-only folder, so the write cannot be made to fail')"],
   ['tests/unit/cli-mode.test.mjs', 'a Gateway whose command line the OS withholds: stop and start say to use the shell that started it', "t.skip('no process here withholds what it is from this user')"],
   ['tests/unit/doc-status.test.mjs', 'public docs hold none of the local private terms', "!existsSync(PRIVATE_TERMS) && 'no local list'"],
+  ['tests/unit/entry-symlink.test.mjs', 'called through a symlink', 'NOT_WINDOWS'],
+  ['tests/unit/env-proxy.test.mjs', 'the console run directly with NODE_USE_ENV_PROXY=1', 'NOT_WINDOWS'],
   ['tests/unit/lease-alive.test.mjs', 'an exited process nobody collected is not alive, though signal 0 still reaches it', 'LINUX_ONLY'],
   ['tests/unit/lease-alive.test.mjs', 'a PID with no process is not alive, and a running one that is not ours is', 'LINUX_ONLY'],
   ['tests/unit/lifecycle.test.mjs', 'the PowerShell wrappers carry output and exit codes, with a temp root that has spaces', 'WINDOWS_ONLY'],
   ['tests/unit/lifecycle.test.mjs', 'start.ps1 returns promptly and leaves the Gateway up after PowerShell exits; stop.ps1 ends it', 'WINDOWS_ONLY'],
   ['tests/unit/lifecycle.test.mjs', '_env.ps1 clears proxy variables and moves only project state in test mode', 'WINDOWS_ONLY'],
   ['tests/unit/lifecycle.test.mjs', 'the scripts work from a folder whose path has spaces', 'WINDOWS_ONLY'],
+  ['tests/unit/lifecycle.test.mjs', 'the bash wrappers carry output and exit codes, with a temp root that has spaces', 'LINUX_ONLY'],
+  ['tests/unit/lifecycle.test.mjs', 'clo.sh start returns promptly and leaves the Gateway up after bash exits; stop.sh ends it', 'LINUX_ONLY'],
+  ['tests/unit/lifecycle.test.mjs', '_env.sh clears proxy variables and moves only project state in test mode', 'LINUX_ONLY'],
+  ['tests/unit/lifecycle.test.mjs', 'the bash scripts work from a folder whose path has spaces, called by any path', 'LINUX_ONLY'],
   ['tests/unit/lifecycle.test.mjs', 'a process whose command line the OS withholds is unknown: the record stays and nothing is signalled', "t.skip('no process here withholds what it is from this user')"],
   ['tests/unit/platform-linux.test.mjs', 'lookup against a /proc built for the test', 'LINUX_ONLY'],
   ['tests/unit/platform-linux.test.mjs', 'live processes: identity, and ending only what was started', 'LINUX_ONLY'],
+  ['tests/unit/setup-sh.test.mjs', 'setup.sh removes a tarball whose checksum differs and installs nothing; one that matches is installed', 'LINUX_ONLY'],
+  ['tests/unit/setup-sh.test.mjs', 'setup.sh is repeatable, and --runtime installs the host packages from runtime-lock', 'LINUX_ONLY'],
+  ['tests/unit/setup-sh.test.mjs', 'setup.sh stops when an installed lockfile entry differs from versions.lock.json', 'LINUX_ONLY'],
+  ['tests/unit/setup-sh.test.mjs', 'setup.sh refuses a malformed or inconsistent Node entry before any download', 'LINUX_ONLY'],
+  ['tests/unit/setup-sh.test.mjs', 'setup.sh verifies the Node it extracted against what the JSON entry says', 'LINUX_ONLY'],
+  ['tests/unit/setup-sh.test.mjs', 'setup.sh creates a missing .env and config.json owner-only, and never touches existing ones', 'LINUX_ONLY'],
+  ['tests/unit/private-modes.test.mjs', 'owner-only modes off Windows', 'NOT_WINDOWS'],
+  ['tests/unit/qq-send-probe.test.mjs', 'an existing wider result file is narrowed to 0600 off Windows, and keeps its earlier lines', 'NOT_WINDOWS'],
   ['tests/unit/provider-golden.test.mjs', 'the OpenRouter adapter turnBody is byte-identical to the goldens', "!existsSync(ADAPTER) && 'openrouterAdapter.js is not there yet'"],
   ['tests/unit/q5-anthropic.test.mjs', 'the wrapper is ASCII with LF, uses the private Node, and carries output and exit codes', 'WINDOWS_ONLY'],
   ['tests/unit/q5-probe.test.mjs', 'the wrapper is ASCII, uses the private Node, and carries output and exit codes', 'WINDOWS_ONLY'],
@@ -125,12 +146,14 @@ test('every skip in tests/ is in the inventory, with its test and its condition'
   assert.deepEqual(seen, INVENTORY.map(row).sort());
 });
 
-test('the platform skips are the ones counted: seven PowerShell wrapper tests, and the /proc tests', () => {
+test('the platform skips are the ones counted: seven PowerShell wrapper tests, the /proc tests and nine bash script tests', () => {
   const count = (when) => INVENTORY.filter((r) => r[2] === when).length;
   assert.equal(count('WINDOWS_ONLY'), 7);
-  assert.equal(count('LINUX_ONLY'), 4);
+  assert.equal(count('LINUX_ONLY'), 14);
   assert.equal(count('WINDOWS_ENV_SHAPE'), 1);
-  assert.equal(count('NOT_WINDOWS'), 2);
+  // Two in test-spawn-env, the symlink group in entry-symlink, the owner-only modes group in private-modes, the
+  // direct-launch group in env-proxy, the result-file mode test in qq-send-probe.
+  assert.equal(count('NOT_WINDOWS'), 6);
 });
 
 test('on its own platform a platform skip is off, and elsewhere it gives a reason', () => {

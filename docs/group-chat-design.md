@@ -858,7 +858,7 @@ Generated only by `clo apply` and `clo mode`, never hand-edited. `tests/unit/ren
  'sessions_*','subagents','secrets','tts','cron','gateway','openclaw','session_status','tool_call','tool_describe','tool_search']
 ```
 
-CHANNEL verifies the final tool list on the real Gateway (`e2e/tool-list`) and the deny list includes everything the "deny only" run in `prompt.json` showed. `e2e/qq-prompt-observation` writes that file under a fresh `clo-prompt-observation-*` folder in the temp directory and prints the path. Secrets are only env: `CLO_QQ_APP_SECRET` read by `resolveAccount` from `process.env`; `CLO_CHAT_API_KEY`, mapped at start to the `OPENROUTER_API_KEY` that the host provider and `getKey()` read. `PERPLEXITY_API_KEY` is never set.
+CHANNEL verifies the final tool list on the real Gateway (`e2e/tool-list`) and the deny list includes everything the "deny only" run in `prompt.json` showed. `e2e/qq-prompt-observation` prints that JSON to the test output and leaves nothing on disk; with `CLO_KEEP_PROMPT_OBSERVATION=1` it also writes `prompt.json` under a fresh `clo-prompt-observation-*` folder in the temp directory, prints the path and leaves the folder there to read. Secrets are only env: `CLO_QQ_APP_SECRET` read by `resolveAccount` from `process.env`; `CLO_CHAT_API_KEY`, mapped at start to the `OPENROUTER_API_KEY` that the host provider and `getKey()` read. `PERPLEXITY_API_KEY` is never set.
 
 The real-provider half of this render (no `baseUrl`, env key, native OpenRouter route, attribution headers, cache markers) cannot be exercised offline; the trial's mock URL does not take that route. Q5 verifies it, and until then it is read, not observed.
 

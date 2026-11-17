@@ -3,6 +3,7 @@
 // starts no process. A platform with no /proc gets 'unknown' from every lookup, and then nothing is signalled.
 import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const IS_WINDOWS = process.platform === 'win32';
 
@@ -15,6 +16,17 @@ export const privateNodePath = (repoRoot) => (IS_WINDOWS ? join(repoRoot, '.runt
 export function sameBinary(want, execPath) {
   try {
     return realpathSync(want) === realpathSync(execPath);
+  } catch {
+    return false;
+  }
+}
+
+// The non-Windows test for "this file was run directly": both sides go through realpath, so a symlinked folder or
+// file still counts (src/bot/main.mjs does the same). Callers keep their own Windows comparison unchanged.
+export function isEntryPath(argv1, metaUrl) {
+  if (!argv1) return false;
+  try {
+    return realpathSync(resolve(argv1)) === realpathSync(fileURLToPath(metaUrl));
   } catch {
     return false;
   }
@@ -194,17 +206,28 @@ function killSnapshot(kill, root, snapshot) {
   }
 }
 
-// Ends the recorded process and what it started. The caller has already matched the record; it is matched again here,
+// The snapshotted descendants that are still the same, unexited process. A SIGKILL is delivered at once but the
+// process can take a moment to exit, so stop waits on this as well as on the recorded PID.
+export function snapshotLeft(snapshot, env = process.env) {
+  const root = procRootOf(env);
+  if (root !== REAL_PROC) return [];
+  return (snapshot ?? []).filter((d) => {
+    const { stat } = readStat(root, d.pid);
+    return !!stat && stat.startTicks === d.startTicks && !isDead(stat.state);
+  });
+}
+
+// Ends the recorded process and what it started, and returns the descendants it listed. The caller has already matched the record; it is matched again here,
 // and nothing is sent unless the PID still has the recorded start time. Nothing is sent either when the lookup ran
 // against a test folder instead of the real /proc: what such a folder says about a PID proves nothing about the
 // process that holds it.
 export function endRecordedTree(record, env = process.env, { log = () => {}, kill = process.kill, descendants = descendantsOf } = {}) {
   const root = procRootOf(env);
-  if (root !== REAL_PROC) return;
+  if (root !== REAL_PROC) return [];
   const pid = record?.pid;
-  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return;
+  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return [];
   const seen = readProcess(pid, env);
-  if (seen.outcome !== 'found' || !record.startTime || seen.info.startTime !== record.startTime) return;
+  if (seen.outcome !== 'found' || !record.startTime || seen.info.startTime !== record.startTime) return [];
   // Listed while the leader is still known to be ours.
   const snapshot = descendants(pid, root);
   // The group kill below still reaches what stayed in the group. The event carries no PID.
@@ -213,6 +236,8 @@ export function endRecordedTree(record, env = process.env, { log = () => {}, kil
   const leadsGroup = seen.stat.pgrp === pid && seen.stat.session === pid;
   sendKill(kill, leadsGroup ? -pid : pid);
   killSnapshot(kill, root, snapshot);
+  // For the caller to wait on: what was listed, matched by PID and start time.
+  return snapshot ?? [];
 }
 
 // Ends a child by its handle, with whatever it started. A handle that has not seen the child exit keeps the PID from

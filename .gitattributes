@@ -3,3 +3,6 @@ CLAUDE.md -text
 
 # Golden files are compared byte for byte.
 tests/fixtures/render/*.json -text
+
+# Shell scripts run under bash on Linux. A CRLF breaks them.
+*.sh text eol=lf

@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { buildEffective } from '../../src/clo-plugin/lib/core/config.js';
-import { DENY, renderOpenclaw, renderWorkspace, writeAtomic } from '../../src/clo-plugin/lib/core/render.js';
+import { DENY, HOST_LOG_NAME, renderOpenclaw, renderWorkspace, writeAtomic } from '../../src/clo-plugin/lib/core/render.js';
 import { IS_WINDOWS } from '../harness/platform.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -20,19 +20,26 @@ const LOCK = {
   primary: { id: 'anthropic/claude-opus-5.5', selector: 'opus-latest', price: { inputPerM: 5, outputPerM: 20, cacheReadPerM: 0.5, cacheWritePerM: 6.25 } },
   decision: { id: 'anthropic/claude-haiku-5.5', price: { inputPerM: 1, outputPerM: 5, cacheReadPerM: 0.1, cacheWritePerM: 1.25 } },
 };
-const PATHS = { repoRoot: 'C:\\fake repo', workspace: 'C:\\fake repo\\.runtime\\workspace', effectiveJson: 'C:\\fake repo\\.runtime\\clo\\effective.json', db: 'db', eventLog: 'log', systemPromptFile: 'sp' };
+const PATHS = { repoRoot: 'C:\\fake repo', logsDir: 'C:\\fake repo\\.runtime\\logs', workspace: 'C:\\fake repo\\.runtime\\workspace', effectiveJson: 'C:\\fake repo\\.runtime\\clo\\effective.json', db: 'db', eventLog: 'log', systemPromptFile: 'sp' };
 function render(cfg, { lock = LOCK, testMode = false, env = {} } = {}) {
   const effective = buildEffective(cfg, { paths: PATHS, modelsLock: lock, env, now: () => 0 });
   return renderOpenclaw(cfg, effective, PATHS, { testMode });
 }
 const goldenFile = (name) => readFileSync(join(FIX, name), 'utf8');
-// The goldens hold Windows paths. One of them is joined at render time, so off Windows it comes out with that
-// platform's separator: there the golden text gets that one path as path.join spells it here. The files are not changed.
-const PLUGIN_DIR_WINDOWS = JSON.stringify('C:\\fake repo\\src\\clo-plugin');
+// The goldens hold Windows paths. Two of them are joined at render time, so off Windows they come out with that
+// platform's separator: there the golden text gets each of them as path.join spells it here. The files are not changed.
+const JOINED_PATHS = [
+  ['C:\\fake repo\\src\\clo-plugin', () => join(PATHS.repoRoot, 'src', 'clo-plugin')],
+  ['C:\\fake repo\\.runtime\\logs\\host\\openclaw-YYYY-MM-DD.log', () => join(PATHS.logsDir, 'host', 'openclaw-YYYY-MM-DD.log')],
+];
 function goldenHere(name) {
-  const text = goldenFile(name);
-  assert.equal(text.split(PLUGIN_DIR_WINDOWS).length, 2, 'positive control: the golden holds the Windows spelling exactly once');
-  return text.replace(PLUGIN_DIR_WINDOWS, () => JSON.stringify(join(PATHS.repoRoot, 'src', 'clo-plugin')));
+  let text = goldenFile(name);
+  for (const [windows, here] of JOINED_PATHS) {
+    const spelled = JSON.stringify(windows);
+    assert.equal(text.split(spelled).length, 2, `positive control: the golden holds the Windows spelling of ${windows} exactly once`);
+    text = text.replace(spelled, () => JSON.stringify(here()));
+  }
+  return text;
 }
 const golden = IS_WINDOWS ? goldenFile : goldenHere;
 const pretty = (o) => `${JSON.stringify(o, null, 2)}\n`;
@@ -75,6 +82,21 @@ test('the corrections from the wiring trial are all present', () => {
   assert.equal(r.models.catalogRefresh.enabled, false);
   assert.equal(r.tools.elevated.enabled, false);
   assert.equal(r.plugins.slots.memory, 'none');
+});
+
+test('the host file log is named inside .runtime/logs/host, with both levels silent', () => {
+  const r = render(sample());
+  assert.deepEqual(Object.keys(r.logging).sort(), ['consoleLevel', 'file', 'level']);
+  assert.equal(r.logging.level, 'silent');
+  assert.equal(r.logging.consoleLevel, 'silent');
+  assert.equal(r.logging.file, join(PATHS.logsDir, 'host', HOST_LOG_NAME));
+  // The host keeps daily rolling and its prune only for this exact name (dist/logger-*.mjs, isLegacyRollingLogFilePath).
+  assert.equal(HOST_LOG_NAME, 'openclaw-YYYY-MM-DD.log');
+  // Without the folder the render refuses instead of letting the host fall back to its own default.
+  const { logsDir, ...noLogs } = PATHS;
+  assert.equal(typeof logsDir, 'string', 'positive control: the render above had the folder');
+  const effective = buildEffective(sample(), { paths: noLogs, modelsLock: LOCK, env: {}, now: () => 0 });
+  assert.throws(() => renderOpenclaw(sample(), effective, noLogs), /paths\.logsDir is required/);
 });
 
 test('the deny list covers everything the observed deny-only run offered, except the one allowed tool', () => {

@@ -93,8 +93,9 @@ export function deepMerge(a, b) {
 // The environment clo start builds, from the same builder, so a Gateway here runs the way the console starts it.
 // Only the temp folders stay in the test root, where tests look for them. Built from an allowlist, so no proxy
 // variable or real key in the parent can reach the child.
-export function e2eGatewayEnv(tmp, paths, extra = {}) {
-  const parent = { CLO_TEST_ROOT: tmp, CLO_NET_GUARD_LOG: join(tmp, 'net-guard.jsonl') };
+// parentExtra goes into the parent env that gatewayEnv reads, so a test-mode seam is reached the way clo start reaches it.
+export function e2eGatewayEnv(tmp, paths, extra = {}, parentExtra = {}) {
+  const parent = { CLO_TEST_ROOT: tmp, CLO_NET_GUARD_LOG: join(tmp, 'net-guard.jsonl'), ...parentExtra };
   for (const k of ['SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS']) {
     if (process.env[k]) parent[k] = process.env[k];
   }
@@ -225,7 +226,7 @@ function businessConfig({ qq, model, port, groups, mode, over }) {
 }
 
 /** Mocks, temp state and the real Gateway for one test file. */
-export async function startStack({ label, groups = { [GROUP_A]: {} }, mode = 'live', config = {}, effective = {}, overrides = {}, script, decision, env = {}, ready = true, start = true, editWorkspace } = {}) {
+export async function startStack({ label, groups = { [GROUP_A]: {} }, mode = 'live', config = {}, effective = {}, overrides = {}, script, decision, env = {}, parentEnv = {}, ready = true, start = true, editWorkspace } = {}) {
   const tmp = makeTmp(label);
   const { startMockQq } = await import('./mock-qq.mjs');
   const { startMockOpenRouter } = await import('./mock-openrouter.mjs');
@@ -251,7 +252,7 @@ export async function startStack({ label, groups = { [GROUP_A]: {} }, mode = 'li
   const openclaw = deepMerge(renderOpenclaw(cfg, eff, paths, { testMode: { apiKey: FAKE_MODEL_KEY } }), overrides);
   writeAtomic(paths.openclawJson, JSON.stringify(openclaw, null, 2));
 
-  const environment = e2eGatewayEnv(tmp, paths, env);
+  const environment = e2eGatewayEnv(tmp, paths, env, parentEnv);
   let gw = null;
   let generations = 0;
   let readyBase = 0;
@@ -275,6 +276,8 @@ export async function startStack({ label, groups = { [GROUP_A]: {} }, mode = 'li
     config: openclaw,
     cfg,
     paths,
+    /** The env the Gateway child gets. Holds only fake keys. */
+    childEnv: environment,
     eff,
     get gw() { return gw; },
     key,

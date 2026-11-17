@@ -1,11 +1,17 @@
 {
-  "$comment": "Exact versions used by this project. setup.ps1 verifies these; do not upgrade silently.",
+  "$comment": "Exact versions used by this project. setup.ps1 (Windows) and setup.sh (Linux x64) verify these; do not upgrade silently.",
   "checkedOn": "2026-11-02",
   "node": {
     "version": "24.22.2",
     "file": "node-v24.22.2-win-x64.zip",
     "url": "https://nodejs.org/dist/v24.22.2/node-v24.22.2-win-x64.zip",
     "sha256": "ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2"
+  },
+  "nodeLinuxX64": {
+    "version": "24.22.2",
+    "file": "node-v24.22.2-linux-x64.tar.xz",
+    "url": "https://nodejs.org/dist/v24.22.2/node-v24.22.2-linux-x64.tar.xz",
+    "sha256": "48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75"
   },
   "npm": {
     "@tencent-connect/qqbot-nodejs": {

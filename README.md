@@ -59,6 +59,25 @@ if (-not (Test-Path config.json)) { Copy-Item config.example.json config.json }
 
 **项目路径要短。** 路径太长时，`start` 的 doctor 报 `hook_registered：插件 clo 没有加载`，不启动，看不出原因在路径。在测试模式下量过：状态目录的路径 130 个字符能过，140 个字符不行。没有在真实部署上量过，放在 `C:\clo` 这样的短路径最稳。
 
+#### 在 Linux（Ubuntu x64）上安装
+
+用自己的普通用户运行，不要用 root，也不要加 sudo。脚本只往项目目录下的 `.runtime/` 和 `node_modules/` 写东西，不改系统的 Node、PATH 和 shell 配置文件。要能访问 nodejs.org 和 npm 源，还要有 bash、curl、tar、xz、sha256sum（Ubuntu 默认都有）。不需要 Python。
+
+```bash
+cd <项目目录>
+bash scripts/setup.sh --runtime
+```
+
+`.env` 或 `config.json` 不存在时，`setup.sh` 从 `.env.example`、`config.example.json` 复制一份，只有自己能读写（0600），然后自己填写。已有的不覆盖，权限也不改；以前自己复制的，用 `chmod 600 .env config.json` 收紧（git 只记可执行位，模板本身带不了 0600，所以由脚本复制时设）。`.env` 必须只有自己能读写：组或其他用户能访问它时，`start` 的 doctor 报 `secret_modes` 失败，不启动。`.runtime/clo/gateway.token` 和 `clo.db` 同样算在这一项里，但它们是项目建的，项目自己建成 0600，`clo apply` 和 `clo start` 也会把旧版本留下的收紧。`config.json` 不是密钥，组或其他用户能读时 doctor 只提醒（`file_modes`）。在 Linux 上，项目在 `.runtime/` 下建的文件夹是 0700，写的状态文件、日志、`clo.db`、Q0 的盐和采集文件、Q0b 和 Q5 的结果文件是 0600，和 umask 无关，旧版本留下的更宽的结果文件在下一次写入前收紧；Gateway 自己写的文件模式不归项目管，靠所在文件夹是 0700 挡住别人。Windows 上不改任何权限。这些只在离线测试里验证过。
+
+**Linux 上项目路径也要短，只用 ASCII。** OpenClaw 运行时下，宿主每次启动建一个 `oc-br-*` 套接字目录，放在 `.runtime/temp` 下，`stop` 之后不删。Linux 上套接字路径有长度上限，项目路径超过约 62 字节时（中文字符每个占 3 字节），这个目录改放到 `/tmp`，同样留在那里。项目路径最好不超过约 60 字节、只用 ASCII，比如 `~/clo`。这个界限是开发时在测试模式下看到的，没有在真实部署上量过；程序现在不检查也不清理这些目录。
+
+`setup.sh` 先按 `versions.lock.json` 里的 `nodeLinuxX64` 下载私有 Node，核对 SHA-256；对不上就删掉下载的文件并停下，什么都不装。之后用 `npm ci` 按锁文件安装，再核对每个包的版本和完整性。不带 `--runtime` 时只装 QQ SDK，不装 OpenClaw。重复运行是安全的：私有 Node 已经是锁定版本时不再下载。
+
+之后的命令把 `.\scripts\clo.ps1` 换成 `bash scripts/clo.sh`，其他不变，例如 `bash scripts/clo.sh apply`、`bash scripts/clo.sh start`、`bash scripts/clo.sh status`、`bash scripts/clo.sh stop`。`start.sh`、`stop.sh`、`status.sh`、`doctor.sh` 和对应的 `.ps1` 一样，是更短的写法。`clo.sh start` 在 Gateway 起来后就返回，Gateway 在后台继续运行，输出写进日志。Q0 和 Q5 的探测脚本没有 Linux 版本。包装脚本可以经由链接到项目文件夹（或 `scripts/` 文件夹）的符号链接运行；从别的文件夹链接到脚本文件本身（比如 `~/bin/clo` 指向 `scripts/clo.sh`）不支持，脚本会报错退出，什么都不运行，这时改用链接文件夹或 shell 别名。`clo.sh` 运行前清掉代理变量、`NODE_USE_ENV_PROXY` 和 `NODE_OPTIONS`。不经它、直接用私有 Node 运行 `src/cli/clo.mjs` 时，如果启动时带了 `NODE_USE_ENV_PROXY`（或 `--use-env-proxy`，命令行或 `NODE_OPTIONS` 里；带引号、带 `=值`、写成下划线的都算，只写了 `--no-use-env-proxy` 不算），Node 会让控制台的请求走代理，启动后改不掉，所以控制台拒绝联网：`clo mode live` 一开始就拒绝，`clo model refresh` 等联网的命令报错。只设了 `HTTP_PROXY` 这类变量时，控制台的请求不走代理（Node 不认），`clo start` 和 `clo mode live` 会显示一行提醒。
+
+**Linux 上验证到哪一步：** 安装脚本和包装脚本只用离线测试验证过（假的 Node 压缩包、假的 node、mock QQ、mock 模型），没有真的从 nodejs.org 下载过，也没有在 Ubuntu 26.04 上真的跑过一次 `npm ci`。Linux 上没有做过真实 QQ 验收，Linux 部署也还不算支持。
+
 ### 2. 填 `.env`
 
 用编辑器在本机填。**不要把这些值贴到聊天里，也不要写进配置或命令行。**
@@ -149,7 +168,7 @@ dry-run 不调用模型，也不发消息。
 .\scripts\clo.ps1 mode live
 ```
 
-`mode live` 会逐条检查预算、目标、Key 限额、对账、心跳、运行中的 Gateway 是否拿到了这个 Key、身份、告知、Q0、D3、内容策略、doctor，不满足就列出来并拒绝。D3 没有记录时它一定拒绝，也不会去访问 OpenRouter。日预算低于一次必答预留时报 `daily_hold`。退回：`.\scripts\clo.ps1 mode dry-run`，不用重启。它先切到 dry-run 再改配置，后面出错时会说“已经进入 dry-run”，这时机器人已经不调模型、不发送。
+`mode live` 会逐条检查预算、目标、Key 限额、对账、心跳、运行中的 Gateway（own 运行时是可洛进程）是否拿到了这个 Key、身份、告知、Q0、D3、内容策略、doctor，不满足就列出来并拒绝。D3 没有记录时它一定拒绝，也不会去访问 OpenRouter。日预算低于一次必答预留时报 `daily_hold`。退回：`.\scripts\clo.ps1 mode dry-run`，不用重启。它先切到 dry-run 再改配置，后面出错时会说“已经进入 dry-run”，这时机器人已经不调模型、不发送。
 
 这里和命令输出里的几个编号：**Q0** 是只监听、不回复的实测，看你的群能收到什么（见 [docs/q0a-guide.zh.md](docs/q0a-guide.zh.md)）；**D3** 是 QQ 协议 §4.2（模型资质）的决定；**D5** 是告知和同意的决定，包括每个群是否打开显示名开关。
 
@@ -301,10 +320,12 @@ Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度�
 | 内存上下文 | 近期群消息，用化名。开了显示名开关的群，每行还带清洗后的显示名，随这一行过期和清除，也随 `/new`、`/reset` 清除；开关关掉后，这个群下一条任何消息（命令、过期、暂停时的消息也算）或每小时的清理时丢掉；群从名单移除后也一样。关了又马上打开，中间这个群没有任何消息，也没赶上每小时的清理，旧名字还会留着，直到这些行过期。一个成员的所有行共用最新的名字：最新的名字被拒绝时，他之前的行也退回代号 | 最多 40 条或 24 小时，重启即丢 |
 | `.runtime/logs/events.jsonl` | 事件 ID、判定、耗时、费用、错误分类，无正文和显示名。显示名被拒绝或缺失时只记 `display_name` 和一个不分类的原因，不记值。引用回复只记匹配结果、散列、长度和格式前缀，不记原值 | 不自动清理 |
 | `.runtime/logs/gateway.log` | 宿主直接写到控制台的内容。宿主日志级别是 `silent`，已知会带模型服务方文字的行由 `src/cli/host-output-filter.mjs` 整条拦下，只留一行说明。这是按已知行写的名单，不保证没有别的路径 | 超过 20 MB 时启动轮换一次，只留一份旧的 |
-| `.runtime/temp/openclaw/*.log` | 宿主文件日志。`silent` 时不写 | 由宿主管理 |
+| `.runtime/logs/host/openclaw-<日期>.log` | 宿主文件日志。`openclaw.json` 用 `logging.file` 指到这里，Windows 和 Linux 都一样。日志级别是 `silent`，不写。级别一旦高于 `silent`，这里会记下模型服务方的错误原文（Linux 离线测试在 `info` 级别看到过），`trace` 级别还会写 `session_id`；正常回合里开发时没有看到消息正文，但没有查遍宿主的每条路径，不能当作不会写。所以真实运行不要调高级别（包括 `OPENCLAW_LOG_LEVEL` 环境变量，`clo start` 不传它，`doctor` 看到它会报错） | 按日期分文件，宿主写新文件时删掉这个目录里超过 24 小时的 `openclaw-*.log` |
 | OpenClaw 会话库（`.runtime/state/agents/main/agent/openclaw-agent.sqlite`） | **被派发的回合正文在这里，模型的思考文字、每回合的提示词副本和全文搜索索引也在这里，模型服务方的错误原文也在这里，包括审核返回的 `flagged_input`** | 由宿主管理，这一版**没有**删除接口，`/new` 也不会删除旧内容（Q6 核对过） |
 | OpenRouter、模型提供方 | 收到的消息。开了显示名开关的群，主模型（Opus）的回答请求还带当前发言人和近期发言人的显示名；判定模型（Haiku）只收代号 | 以它们的政策为准，本项目控制不了 |
 | Anthropic（新运行时直连时） | 收到的消息，和上一行一样，只是不经过 OpenRouter | 以 Anthropic 的政策为准，本项目控制不了 |
+
+**Linux 上的已知缺口：** 锁定版本的宿主在 Linux 上仍把 `/tmp/openclaw` 当作临时目录（权限 0700，本机所有运行共用），用来放媒体和上下文映射之类的临时文件，`clo` 不清理它。日志已经不写这里。没有受支持的配置项能把这个目录挪进 `.runtime`，我们也不改上游代码。
 
 **换到自己的运行时，这张表还不能改。** 按代码，`runtime: "own"` 下没有 OpenClaw 会话库，也不访问 `clawhub.ai`，她的回复只在内存里；但这只在离线测试里看过，真实运行里还没有确认，以前跑出来的会话库也不会因为切换而删除。所以上面的会话库和 `clawhub.ai` 两条照样成立，告知草稿也不改。见 [docs/own-runtime.md](docs/own-runtime.md)。
 
@@ -378,7 +399,7 @@ OpenClaw Gateway 回合（只绑 loopback）→ OpenRouter → Claude
 
 单元和接缝要几分钟，机器忙时更久，没有可靠的时长记录。e2e 串行有记录的一次约 88 分钟。这些测试证明的是接线，不是平台行为。最近的结果和没跑的部分见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
-这些离线测试也可以在 Linux x64 上跑，命令相同，Node 换成 `.runtime/node/bin/node`，一个文件一个文件跑。那里因为平台不同跳过 8 个测试：7 个要用 `powershell.exe` 运行 `.ps1` 包装脚本的（`lifecycle.test.mjs` 4 个，`q5-probe.test.mjs` 2 个，`q5-anthropic.test.mjs` 1 个），和 1 个检查 Windows 环境变量形状的（`test-spawn-env.test.mjs`）。两个 Q5 包装脚本的文本检查（ASCII、换行、用私有 Node）拆成了单独的测试，在 Linux 上照样跑。另有几个测试在运行时看机器条件决定跳不跳（比如用 root 跑时有一个跳过）。反过来，`tests/e2e/qq-first-run.test.mjs` 在 Linux 上要以 root 跑：它要读每个进程打开的文件，确认只有记录里的 Gateway 在听端口，普通用户读不了别人的进程，会失败。每一处跳过和它的条件都列在 `tests/unit/platform-skips.test.mjs` 里。**这不等于支持在 Linux 上部署：** 没有 Linux 的安装脚本，也没有 shell 包装脚本；`versions.lock.json` 只锁了 Windows 的 Node，Linux 的 Node 没有校验值；一个 `.runtime` 只能给一个系统、一个容器用，不能在 Windows 和 WSL 之间或两个容器之间共用；内存和时长在 Linux 上没有量过；Linux 上没有做过真实 QQ 验收。Linux 上的测试只在一个以 root 运行的容器里跑过。
+这些离线测试也可以在 Linux x64 上跑，命令相同，Node 换成 `.runtime/node/bin/node`，一个文件一个文件跑。那里因为平台不同跳过 8 个测试：7 个要用 `powershell.exe` 运行 `.ps1` 包装脚本的（`lifecycle.test.mjs` 4 个，`q5-probe.test.mjs` 2 个，`q5-anthropic.test.mjs` 1 个），和 1 个检查 Windows 环境变量形状的（`test-spawn-env.test.mjs`）。在 Windows 上则跳过 14 个只在 Linux 上跑的测试：4 个读 `/proc` 的，10 个用 bash 运行 `.sh` 脚本的（`lifecycle.test.mjs` 4 个，`setup-sh.test.mjs` 6 个）。`entry-symlink.test.mjs` 里经由符号链接运行 `clo.mjs` 的一组测试、`private-modes.test.mjs` 里检查文件模式的一组测试和 `qq-send-probe.test.mjs` 里检查结果文件模式的 1 个测试、`env-proxy.test.mjs` 里直接启动控制台的一组测试在 Windows 上也跳过。两个 Q5 包装脚本的文本检查（ASCII、换行、用私有 Node）拆成了单独的测试，在 Linux 上照样跑。另有几个测试在运行时看机器条件决定跳不跳（比如用 root 跑时有一个跳过）。反过来，`tests/e2e/qq-first-run.test.mjs` 在 Linux 上要以 root 跑：它要读每个进程打开的文件，确认只有记录里的 Gateway 在听端口，普通用户读不了别人的进程，会失败。每一处跳过和它的条件都列在 `tests/unit/platform-skips.test.mjs` 里。**这不等于支持在 Linux 上部署：** Linux 的安装脚本和 shell 包装脚本只用离线测试验证过；`versions.lock.json` 里 Linux Node 的校验值和 nodejs.org 的 `SHASUMS256.txt` 对过，压缩包本身还没有下载核对过；一个 `.runtime` 只能给一个系统、一个容器用，不能在 Windows 和 WSL 之间或两个容器之间共用；内存和时长在 Linux 上没有量过；Linux 上没有做过真实 QQ 验收。Linux 上的测试只在一个以 root 运行的容器里跑过。
 
 ## 排错
 

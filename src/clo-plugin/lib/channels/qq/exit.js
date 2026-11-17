@@ -11,6 +11,9 @@ import { checkFormForQq, clipToSentence, removeUrls, shapeForQq, splitParts } fr
 // and shaping can reveal one from inside backticks, tildes or a code block.
 const SILENT = /^[\s\p{P}\p{S}]*(?:NO_REPLY|HEARTBEAT_OK|ANNOUNCE_SKIP|REPLY_SKIP)[\s\p{P}\p{S}]*$/iu;
 const PASSIVE_WINDOW_MS = 285000;
+// Room kept before every deadline. A check that passes with a few ms left still has the POST ahead of it, and the
+// clocks that set msgTs and decide the window are not this one, so nothing starts closer to the end than this.
+export const SEND_MARGIN_MS = 1000;
 const HOUR = 3600000;
 const VIOLATIONS_TO_LATCH = 2;
 // Read-only, for the liveness probe.
@@ -101,6 +104,8 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
   function endOfWindow(ref) {
     return Math.min(ref.msgTs ?? ref.receivedAt, ref.receivedAt) + PASSIVE_WINDOW_MS;
   }
+  // True when a send, or a wait of waitMs before one, would start inside the margin before the deadline.
+  const tooLate = (deadline, waitMs = 0) => now() + waitMs + SEND_MARGIN_MS >= deadline;
 
   function alertOnce(kind, ref, extra = {}) {
     store.addAlert(kind, { eventKey: ref.eventKey, groupKey: ref.groupKey, ...extra });
@@ -137,7 +142,7 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
   // the reply out, so these are read again.
   function hardStop(ref, pausable) {
     if (stopped) return 'exit_refused';
-    if (now() >= endOfWindow(ref)) return 'deadline';
+    if (tooLate(endOfWindow(ref))) return 'deadline';
     const eff = getEffective();
     if (eff?.mode !== 'live' || store.getControl('terminal_close') !== null || !accountOk(eff) || !groupOf(eff, ref.groupId)) return 'exit_refused';
     if (!pausable) return null;
@@ -150,6 +155,12 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
   // One logical POST: durable before and after. Returns what the send table says should happen next. It is posted again,
   // with the same msg_seq, only after an error that shows the earlier attempt never left this machine.
   async function postPart(ref, row, content, { pausable = true, connectAttempts = SEND_CONNECT_ATTEMPTS, ownerStopped = () => false } = {}) {
+    // Read again right before the first POST: a part can wait here after the checks that let it out.
+    if (tooLate(endOfWindow(ref))) {
+      store.markSend(row.sendId, 'aborted');
+      log('exit_post', { eventKey: ref.eventKey, seq: row.msgSeq, part: row.part, state: 'deadline' });
+      return { ok: false, action: 'stop', reason: 'deadline' };
+    }
     crashpoint('before_post');
     store.markSend(row.sendId, 'sending');
     const path = `/v2/groups/${encodeURIComponent(ref.groupId)}/messages`;
@@ -274,7 +285,7 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
       const p = store.pauseState(ref.groupKey);
       if (p.global || p.group) return { sent: false, reason: 'paused' };
     }
-    if (now() >= endOfWindow(ref)) return { sent: false, reason: 'deadline' };
+    if (tooLate(endOfWindow(ref))) return { sent: false, reason: 'deadline' };
     let hit;
     try {
       hit = policy.check(text).hit;
@@ -301,7 +312,7 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
     const eff = getEffective();
     if (!eff) return first;
     const waitMs = store.sendWaitMs({ groupKey: ref.groupKey, need: 1, rate: rateOf(eff), now: now() });
-    if (!Number.isFinite(waitMs) || now() + waitMs >= endOfWindow(ref)) return first;
+    if (!Number.isFinite(waitMs) || tooLate(endOfWindow(ref), waitMs)) return first;
     log('exit_wait', { eventKey: ref.eventKey, groupKey: ref.groupKey, reason: why, durationMs: waitMs });
     await sleepUnless(waitMs);
     return sendOneLine(ref, line);
@@ -352,7 +363,7 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
     if (!groupOf(eff, turn.groupId)) return drop('failed', 'exit_refused', 'not_admitted');
     const p = store.pauseState(turn.groupKey);
     if (p.global || p.group) return drop('paused', 'paused', 'paused');
-    if (now() >= turn.deadlineAt) return drop('failed', 'deadline', 'deadline');
+    if (tooLate(turn.deadlineAt)) return drop('failed', 'deadline', 'deadline');
     return { eff, stop: null };
   }
 
@@ -390,7 +401,7 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
   // Waits until this many parts could fit. False when that cannot happen inside the passive window.
   async function waitOutRate(turn, ref, need, eff, reason, ownerStopped) {
     const waitMs = store.sendWaitMs({ groupKey: ref.groupKey, need, rate: rateOf(eff), now: now() });
-    if (!Number.isFinite(waitMs) || now() + waitMs >= turn.deadlineAt) return false;
+    if (!Number.isFinite(waitMs) || tooLate(turn.deadlineAt, waitMs)) return false;
     log('exit_wait', { eventKey: turn.eventKey, groupKey: turn.groupKey, reason, durationMs: waitMs });
     await sleepUnless(waitMs, ownerStopped);
     return true;
@@ -430,7 +441,7 @@ export function createExit({ bot, store, policy, getEffective, secrets = [], log
   // Why the rest of this reply must not go out, or null. The deadline comes first, so a reply that ran out of time says so.
   function partStop(turn, ref, ownerStopped) {
     if (stopped) return refuse('exit_refused');
-    if (now() >= turn.deadlineAt) return refuse('deadline');
+    if (tooLate(turn.deadlineAt)) return refuse('deadline');
     if (ownerStopped()) return refuse('aborted');
     const why = hardStop(ref, true);
     if (!why) return null;

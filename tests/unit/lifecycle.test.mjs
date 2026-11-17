@@ -2,7 +2,7 @@
 // Gateway against loopback mocks. Nothing here can reach QQ or OpenRouter; other Node processes must survive.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -13,7 +13,7 @@ import { makeContext } from '../../src/cli/common.mjs';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { e2eGatewayArgs, e2eGatewayEnv } from '../harness/gateway.mjs';
 import { endRecordedTree } from '../../src/cli/platform.mjs';
-import { brokenLookupEnv, IS_WINDOWS, killIfSame, otherStartTime, startTicksOf, WINDOWS_ONLY, withheldCmdlinePid } from '../harness/platform.mjs';
+import { brokenLookupEnv, IS_WINDOWS, killIfSame, LINUX_ONLY, otherStartTime, startTicksOf, WINDOWS_ONLY, withheldCmdlinePid } from '../harness/platform.mjs';
 import { APP_ID, baseConfig, clo, configOf, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, makeRoot, NET_GUARD, NODE, readJson, ROOT, testEnv, withDb, withProviders } from './_cli-helper.mjs';
 
 const roots = [];
@@ -72,7 +72,7 @@ async function freePort() {
   });
 }
 
-async function stack(label, { config = enabledConfig(), host = FAKE_HOST, extraEnv = {} } = {}) {
+async function stack(label, { config = enabledConfig(), host = FAKE_HOST, extraEnv = {}, parentProxy = true } = {}) {
   const r = makeRoot(label, config);
   roots.push(r);
   const hostFile = join(r.root, 'fake-host.mjs');
@@ -93,6 +93,8 @@ async function stack(label, { config = enabledConfig(), host = FAKE_HOST, extraE
     PERPLEXITY_API_KEY: 'PARENT-KEY-MUST-NOT-PASS',
     ...extraEnv,
   };
+  // Without the proxies, for the control of the parent_proxy reminder that start prints.
+  if (!parentProxy) { delete env.HTTP_PROXY; delete env.https_proxy; }
   const run = (argv, opts = {}) => clo(r.root, argv, { env, ...opts });
   assert.equal((await run(['model', 'refresh'], { fetch: fakeProvider().fetch })).code, 0);
   cleanups.push(() => {
@@ -187,6 +189,8 @@ test('start, status, a second start, stop: own PID only, secrets by env, bystand
   const started = await s.run(['start']);
   assert.equal(started.code, 0, `${started.out}${started.err}`);
   for (const raw of [FAKE_KEY, FAKE_SECRET]) assert.ok(!`${started.out}${started.err}`.includes(raw), 'printed a secret');
+  // doctor's parent_proxy warning does not stop a start, but start shows it. The control is the clean .env test below.
+  assert.match(started.out, /提醒：当前 shell 设了代理变量（HTTP_PROXY、https_proxy）/);
 
   const info = await fakeInfo(s.root);
   const rec = readJson(pidFileOf(s.root));
@@ -342,12 +346,13 @@ test('dry-run needs no OpenRouter key, and passes none on, whatever old line is 
   assert.equal((await s.run(['stop'])).code, 0);
 });
 
-test('a clean .env starts with no reminder about its lines', { timeout: 60000 }, async () => {
-  const s = await stack('cleanenv');
+test('a clean .env and a shell with no proxy start with no reminder at all', { timeout: 60000 }, async () => {
+  const s = await stack('cleanenv', { parentProxy: false });
   writeFileSync(join(s.root, '.env'), `CLO_QQ_APP_ID=${APP_ID}\nCLO_QQ_APP_SECRET=${FAKE_SECRET}\n`);
   const res = await s.run(['start']);
   assert.equal(res.code, 0, `${res.out}${res.err}`);
   assert.doesNotMatch(res.out, /已不再读取|不止一行/);
+  assert.doesNotMatch(res.out, /提醒：/, 'the parent_proxy control: start in the test above prints it');
   assert.equal((await s.run(['stop'])).code, 0);
 });
 
@@ -569,6 +574,146 @@ test('the scripts work from a folder whose path has spaces', { timeout: 60000, s
   assert.equal(seen.testRoot, env.CLO_TEST_ROOT, 'Start-Process passes the environment on');
   const viaClo = ps(join(repo, 'scripts', 'clo.ps1'), ['start'], env);
   assert.equal(viaClo.status, 5, 'clo start takes the same path');
+});
+
+// The bash wrappers, run by bash with the private Node folder as the whole PATH: no system node or tool is found.
+function sh(script, args, env, cwd = tmpdir()) {
+  return spawnSync('/bin/bash', [script, ...args], { env, encoding: 'utf8', timeout: 120000, cwd });
+}
+const shEnv = (root, extra = {}) => cleanChildEnv({ CLO_TEST_ROOT: root, CLO_TEST_NODE_IMPORT: NET_GUARD, ...extra });
+
+test('the bash wrappers carry output and exit codes, with a temp root that has spaces', { timeout: 180000, skip: LINUX_ONLY }, async () => {
+  const r = makeRoot('sh', baseConfig());
+  roots.push(r);
+  const scripts = join(ROOT, 'scripts');
+  const env = shEnv(r.root);
+  assert.equal(env.PATH, join(ROOT, '.runtime', 'node', 'bin'), 'only the private Node folder is on PATH');
+
+  const usage = sh(join(scripts, 'clo.sh'), [], env);
+  assert.equal(usage.status, 0, usage.stderr);
+  assert.match(usage.stdout, /用法：clo/);
+
+  const apply = sh(join(scripts, 'clo.sh'), ['apply'], env);
+  assert.equal(apply.status, 0, apply.stderr);
+  assert.ok(existsSync(join(r.root, '.runtime', 'clo', 'effective.json')), 'state went to CLO_TEST_ROOT');
+
+  const added = sh(join(scripts, 'clo.sh'), ['group', 'add', '有 空 格', '--id', 'SPACEDLABELGROUP'], env);
+  assert.equal(added.status, 0, added.stderr);
+  assert.equal(configOf(r.root).qq.groups.SPACEDLABELGROUP.label, '有 空 格', 'an argument with spaces arrives whole');
+
+  const status = sh(join(scripts, 'status.sh'), [], env);
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /模式：dry-run/);
+
+  const refused = sh(join(scripts, 'clo.sh'), ['mode', 'live'], env);
+  assert.equal(refused.status, 1, 'the refusal reaches the shell');
+  assert.match(refused.stdout, /d3：/);
+
+  const doctor = sh(join(scripts, 'doctor.sh'), ['--config-only'], env);
+  assert.match(doctor.stdout, /doctor：/);
+
+  const stop = sh(join(scripts, 'stop.sh'), [], env);
+  assert.equal(stop.status, 0, stop.stderr);
+  assert.match(stop.stdout, /没有 PID 文件/);
+});
+
+test('clo.sh start returns promptly and leaves the Gateway up after bash exits; stop.sh ends it', { timeout: 180000, skip: LINUX_ONLY }, async () => {
+  const s = await stack('shwrap');
+  const scripts = join(ROOT, 'scripts');
+  const env = shEnv(s.root, { CLO_TEST_GATEWAY_ENTRY: join(s.root, 'fake-host.mjs'), CLO_NET_GUARD_LOG: join(s.root, 'net-guard.jsonl') });
+  const t0 = Date.now();
+  const started = sh(join(scripts, 'clo.sh'), ['start'], env);
+  assert.equal(started.status, 0, `${started.stdout}${started.stderr}`);
+  assert.equal(started.error, undefined, 'a caller capturing the output must not wait for the Gateway');
+  assert.ok(Date.now() - t0 < 60000, 'returned without waiting for the Gateway');
+  assert.match(started.stdout, /已启动/, 'the output still reaches the caller');
+  const info = await fakeInfo(s.root);
+  assert.equal(info.env.CLO_TEST_ROOT, s.root);
+  await sleep(1000);
+  assert.equal(alive(info.pid), true, 'outlives the shell that started it');
+  const status = sh(join(scripts, 'status.sh'), [], env);
+  assert.match(status.stdout, new RegExp(`进程 ${info.pid} 在运行`));
+  const second = sh(join(scripts, 'start.sh'), [], env);
+  assert.equal(second.status, 1);
+  assert.match(`${second.stdout}${second.stderr}`, /已在运行/);
+  assert.equal(alive(info.pid), true);
+  const stopped = sh(join(scripts, 'stop.sh'), [], env);
+  assert.equal(stopped.status, 0, stopped.stderr);
+  assert.equal(alive(info.pid), false);
+  await until(() => !alive(info.childPid), 'the child to go', 10000);
+});
+
+test('_env.sh clears proxy variables and moves only project state in test mode', { timeout: 60000, skip: LINUX_ONLY }, () => {
+  const r = makeRoot('shenv', null);
+  roots.push(r);
+  const probe = join(r.root, 'probe.sh');
+  const quoted = `'${join(ROOT, 'scripts', '_env.sh').replace(/'/g, "'\\''")}'`;
+  writeFileSync(probe, `printf 'before=%s|%s|%s|%s\\n' "\${HTTP_PROXY-unset}" "\${all_proxy-unset}" "\${NODE_USE_ENV_PROXY-unset}" "\${NODE_OPTIONS-unset}"\n. ${quoted}\nprintf '%s\\n' "$CLO_RT" "$CLO_NODE" "$OPENCLAW_STATE_DIR" "\${HTTP_PROXY-unset}" "\${all_proxy-unset}" "$CLO_ROOT" "\${NODE_USE_ENV_PROXY-unset}" "\${NODE_OPTIONS-unset}"\n`);
+  const res = sh(probe, [], shEnv(r.root, { HTTP_PROXY: 'http://127.0.0.1:1', all_proxy: 'http://127.0.0.1:1', NODE_USE_ENV_PROXY: '1', NODE_OPTIONS: '--use-env-proxy' }));
+  assert.equal(res.status, 0, res.stderr);
+  const [before, rt, node, state, proxy, lower, root, useEnvProxy, nodeOptions] = res.stdout.trim().split('\n');
+  assert.equal(before, 'before=http://127.0.0.1:1|http://127.0.0.1:1|1|--use-env-proxy', 'positive control: the proxies were set');
+  assert.equal(proxy, 'unset');
+  assert.equal(lower, 'unset');
+  assert.equal(useEnvProxy, 'unset');
+  assert.equal(nodeOptions, 'unset');
+  assert.equal(rt, join(r.root, '.runtime'));
+  assert.equal(node, NODE, 'the private Node stays in the repo');
+  assert.equal(root, ROOT);
+  assert.ok(state.startsWith(r.root));
+});
+
+test('the bash scripts work from a folder whose path has spaces, called by any path', { timeout: 60000, skip: LINUX_ONLY }, () => {
+  const base = mkdtempSync(join(tmpdir(), 'clo-spaced-sh-'));
+  cleanups.push(() => rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }));
+  const repo = join(base, 'my project (copy)');
+  for (const d of ['scripts', join('src', 'cli'), join('.runtime', 'node', 'bin')]) mkdirSync(join(repo, d), { recursive: true });
+  for (const f of ['_env.sh', 'clo.sh', 'status.sh', 'start.sh']) writeFileSync(join(repo, 'scripts', f), readFileSync(join(ROOT, 'scripts', f)));
+  // A link, so this needs no copy of the Node binary.
+  symlinkSync(NODE, join(repo, '.runtime', 'node', 'bin', 'node'));
+  writeFileSync(join(repo, 'src', 'cli', 'clo.mjs'), 'console.log(JSON.stringify({ argv: process.argv.slice(2), testRoot: process.env.CLO_TEST_ROOT, script: process.argv[1] })); process.exit(7);\n');
+  const env = shEnv(join(base, 'state'));
+  const res = sh(join(repo, 'scripts', 'clo.sh'), ['a b', '--reason', '两个 词'], env);
+  assert.equal(res.status, 7, res.stderr);
+  assert.deepEqual(JSON.parse(res.stdout).argv, ['a b', '--reason', '两个 词']);
+  const st = sh(join(repo, 'scripts', 'status.sh'), ['--json'], env);
+  assert.equal(st.status, 7, st.stderr);
+  assert.deepEqual(JSON.parse(st.stdout).argv, ['status', '--json']);
+  // Called by a bare name from the scripts folder, and by a relative path from the repo.
+  const bare = sh('clo.sh', ['start'], env, join(repo, 'scripts'));
+  assert.equal(bare.status, 7, bare.stderr);
+  assert.deepEqual(JSON.parse(bare.stdout), { argv: ['start'], testRoot: env.CLO_TEST_ROOT, script: join(repo, 'src', 'cli', 'clo.mjs') });
+  const rel = sh(join('scripts', 'start.sh'), [], env, repo);
+  assert.equal(rel.status, 7, rel.stderr);
+  assert.deepEqual(JSON.parse(rel.stdout).argv, ['start']);
+  // Called through a symlinked folder: _env.sh resolves the root with pwd -P, so Node gets the real path.
+  const real = sh(join(repo, 'scripts', 'clo.sh'), ['x'], env);
+  assert.equal(JSON.parse(real.stdout).script, join(repo, 'src', 'cli', 'clo.mjs'), 'positive control: the real path');
+  symlinkSync(repo, join(base, 'linked repo'), 'dir');
+  const linked = sh(join(base, 'linked repo', 'scripts', 'clo.sh'), ['x'], env);
+  assert.equal(linked.status, 7, linked.stderr);
+  assert.equal(JSON.parse(linked.stdout).script, join(repo, 'src', 'cli', 'clo.mjs'));
+  // A link to the script file in the same folder works: _env.sh is next to it.
+  symlinkSync('clo.sh', join(repo, 'scripts', 'clo'));
+  const sameDir = sh(join(repo, 'scripts', 'clo'), ['y'], env);
+  assert.equal(sameDir.status, 7, sameDir.stderr);
+  assert.deepEqual(JSON.parse(sameDir.stdout).argv, ['y']);
+  // A link to the script file from another folder cannot be followed with builtins only: each wrapper stops, says
+  // why, and runs nothing.
+  mkdirSync(join(base, 'bin'));
+  for (const f of ['clo.sh', 'status.sh', 'start.sh']) {
+    symlinkSync(join(repo, 'scripts', f), join(base, 'bin', f));
+    const fileLink = sh(join(base, 'bin', f), ['z'], env);
+    assert.equal(fileLink.status, 2, `${f}: ${fileLink.stdout}`);
+    assert.match(fileLink.stderr, /No _env\.sh next to .*Link the project folder, not the script file/, f);
+    assert.equal(fileLink.stdout, '', `${f}: the console did not run`);
+  }
+  // Without the private Node the wrappers stop and say why, and run nothing else.
+  rmSync(join(repo, '.runtime', 'node', 'bin', 'node'));
+  const missing = sh(join(repo, 'scripts', 'clo.sh'), ['status'], env);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /Private Node is missing\. Run scripts\/setup\.sh first\./);
+  assert.equal(missing.stdout, '');
 });
 
 test('real Gateway against loopback mocks: start, connected, status, stop, no second connection', { timeout: 300000 }, async () => {

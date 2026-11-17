@@ -708,6 +708,46 @@ test('with another Key in the Gateway, mode live reads the Key but does not reco
   assert.ok(keyReads() > matched + 1, 'positive control: with the same Key it does reconcile');
 });
 
+test('under own, the gateway_key and reconciled hints name the bot process, not a Gateway; openclaw keeps its words', async () => {
+  const r = root('ownkeyhint');
+  const provider = fakeProvider();
+  await readyForLive(r, provider);
+  withDb(r, (store) => store.setControl('gateway_key', store.key('sk-or-v1-SOME-OTHER-KEY'), 'start'));
+
+  const gw = await clo(r, ['mode', 'live'], { fetch: provider.fetch });
+  assert.equal(gw.code, 1);
+  assert.deepEqual(failedCodes(gw.out), ['reconciled', 'gateway_key'], 'positive control: openclaw refuses on both');
+  assert.match(gw.out, /reconciled：这次没有对账：Gateway 用的 Key/);
+  assert.match(gw.out, /gateway_key：运行中的 Gateway 还没有记录 \.env 里这个 CLO_CHAT_API_KEY/);
+
+  editConfig(r, (c) => { c.runtime = 'own'; });
+  const own = await clo(r, ['mode', 'live'], { fetch: provider.fetch, env: ownEntryEnv(r) });
+  assert.equal(own.code, 1, `${own.out}${own.err}`);
+  assert.deepEqual(failedCodes(own.out), ['reconciled', 'gateway_key'], 'positive control: own refuses on the same two');
+  assert.match(own.out, /reconciled：这次没有对账：可洛进程用的 Key/);
+  assert.match(own.out, /gateway_key：运行中的可洛进程还没有记录 \.env 里这个 CLO_CHAT_API_KEY/);
+  const hints = own.out.split('\n').filter((l) => /^\s+(reconciled|gateway_key)：/.test(l));
+  assert.equal(hints.length, 2);
+  for (const line of hints) assert.doesNotMatch(line, /Gateway/, line);
+  assert.equal(effectiveOf(r).mode, 'dry-run');
+});
+
+test('without config.json the error names the copy command of this platform', async () => {
+  const r = root('noconfig');
+  const shown = await clo(r, ['mode', 'show']);
+  assert.equal(shown.code, 0, 'positive control: with config.json the same command works');
+  rmSync(join(r, 'config.json'));
+  const res = await clo(r, ['mode', 'show']);
+  assert.equal(res.code, 1);
+  assert.match(res.err, /没有 config\.json。先复制模板：/);
+  if (IS_WINDOWS) {
+    assert.match(res.err, /Copy-Item config\.example\.json config\.json，再填写 qq\.appId/);
+  } else {
+    assert.match(res.err, /cp -n config\.example\.json config\.json，再填写 qq\.appId/);
+    assert.doesNotMatch(res.err, /Copy-Item/);
+  }
+});
+
 test('resume refuses anything it cannot read, since that would otherwise resume every group; bare resume still works', async () => {
   const r = root('resumeargs', enabledConfig());
   await clo(r, ['apply']);

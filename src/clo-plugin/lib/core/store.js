@@ -1,10 +1,11 @@
 // Durable state on node:sqlite. Identifiers at rest are HMAC keys; only `discovery` holds raw IDs.
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { hmacKey, shanghaiDay, shanghaiDayStart } from './ids.js';
 import { sanitizeData } from './log.js';
+import { mkdirPrivate, PRIVATE_FILE_MODE, PRIVATE_MODES, tryNarrowMode } from './private-fs.js';
 
 export const SCHEMA_VERSION = 2;
 export const NON_TERMINAL_STATES = ['received', 'queued', 'deciding', 'approved', 'dispatching', 'delivering'];
@@ -152,6 +153,8 @@ function migrateV1(db, dbFile, version, at, onSnapshot) {
     rmSync(tmp, { force: true });
     db.exec(`VACUUM INTO ${sqlString(tmp)}`);
     try {
+      // SQLite makes a new file 0644 less the umask. The copy holds the ledger's salt, so it is narrowed first.
+      if (PRIVATE_MODES) tryNarrowMode(tmp);
       scrubBackup(tmp);
     } catch (err) {
       rmSync(tmp, { force: true });
@@ -187,8 +190,28 @@ function migrateV1(db, dbFile, version, at, onSnapshot) {
   throw new Error(`clo.db migration to schema 2 kept meeting other writers (${MIGRATE_TRIES} tries); it stays at schema 1`);
 }
 
+// Off Windows: the ledger holds raw IDs, so the file is made 0600 before SQLite opens it (SQLite gives the -wal and
+// -shm files the main file's mode), and a file an earlier build left wider is narrowed, with its -wal and -shm.
+// A file this user cannot chmod is left as it is: doctor's secret_modes reports it.
+function narrowDbFiles(dbFile) {
+  for (const f of [dbFile, `${dbFile}-wal`, `${dbFile}-shm`, `${dbFile}-journal`, backupFileOf(dbFile)]) tryNarrowMode(f);
+}
+
 function openDb(dbFile, { now = Date.now, onMigrationSnapshot } = {}) {
-  mkdirSync(dirname(dbFile), { recursive: true });
+  if (PRIVATE_MODES) {
+    mkdirPrivate(dirname(dbFile));
+    if (!existsSync(dbFile)) {
+      try {
+        closeSync(openSync(dbFile, 'wx', PRIVATE_FILE_MODE));
+      } catch (e) {
+        // Another opener made it first. Its mode is narrowed below either way.
+        if (e.code !== 'EEXIST') throw e;
+      }
+    }
+    narrowDbFiles(dbFile);
+  } else {
+    mkdirSync(dirname(dbFile), { recursive: true });
+  }
   const db = new DatabaseSync(dbFile);
   try {
     db.exec('PRAGMA busy_timeout=5000');
@@ -199,7 +222,10 @@ function openDb(dbFile, { now = Date.now, onMigrationSnapshot } = {}) {
     for (;;) {
       const found = version();
       if (found > SCHEMA_VERSION) throw new Error(`clo.db schema ${found} is newer than this build (${SCHEMA_VERSION})`);
-      if (found === SCHEMA_VERSION) return db;
+      if (found === SCHEMA_VERSION) {
+        if (PRIVATE_MODES) narrowDbFiles(dbFile);
+        return db;
+      }
       if (found === 0) createFresh(db, version);
       else if (found === 1) migrateV1(db, dbFile, version, now(), onMigrationSnapshot);
       else throw new Error(`clo.db schema ${found} has no migration in this build`);

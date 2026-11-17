@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { after, afterEach, describe, test } from 'node:test';
-import { descendantsOf, endRecordedTree, endSpawnedChild, IS_WINDOWS as SRC_IS_WINDOWS, linuxChildEnv, lookupProcessLinux, parseProcStat, privateNodePath, procRootOf, sameBinary } from '../../src/cli/platform.mjs';
+import { descendantsOf, endRecordedTree, endSpawnedChild, IS_WINDOWS as SRC_IS_WINDOWS, linuxChildEnv, lookupProcessLinux, parseProcStat, privateNodePath, procRootOf, sameBinary, snapshotLeft } from '../../src/cli/platform.mjs';
 import { cleanChildEnv } from '../harness/clean-env.mjs';
 import { IS_WINDOWS, LINUX_ONLY, NODE, WINDOWS_ONLY } from '../harness/platform.mjs';
 import { ROOT } from './_cli-helper.mjs';
@@ -324,11 +324,26 @@ describe('live processes: identity, and ending only what was started', { skip: L
     assert.equal(leader.pgrp, target.pid, 'a detached child leads its group');
     assert.equal(leader.session, target.pid);
     assert.equal(realStat(target.grand.pid).pgrp, target.pid, 'and its child stays in it');
-    assert.equal(endRecordedTree(target.record(), {}), undefined);
+    const listed = endRecordedTree(target.record(), {});
+    assert.deepEqual(listed.map((d) => d.pid), [target.grand.pid], 'it returns the descendant it listed');
     assert.ok(await until(() => outcomeOf(target.pid) === 'gone'), 'the recorded process ended');
     assert.ok(await until(() => !sameAlive(target.grand)), 'its child ended');
+    assert.deepEqual(snapshotLeft(listed, {}), [], 'and snapshotLeft reads it as gone');
     assert.equal(outcomeOf(bystander.pid), 'found', 'the bystander is untouched');
     assert.ok(sameAlive(bystander.grand), 'and so is its child');
+  });
+
+  test('snapshotLeft lists only a listed descendant that is still the same, unexited process', async () => {
+    const s = await standIn({ grandchild: true });
+    const grand = realStat(s.grand.pid);
+    const entry = { pid: s.grand.pid, startTicks: grand.startTicks };
+    assert.deepEqual(snapshotLeft([entry], {}), [entry], 'positive control: a running descendant is left');
+    assert.deepEqual(snapshotLeft([{ ...entry, startTicks: grand.startTicks + 1 }], {}), [], 'another start time is not ours');
+    const f = fixture({ entries: [] });
+    assert.deepEqual(snapshotLeft([entry], f.env), [], 'a test /proc proves nothing, so nothing is waited on');
+    assert.deepEqual(snapshotLeft(null, {}), []);
+    endRecordedTree(s.record(), {});
+    assert.ok(await until(() => snapshotLeft([entry], {}).length === 0), 'after the kill it is gone');
   });
 
   test('a snapshotted descendant is also ended by its own PID, for one that left the group', async () => {

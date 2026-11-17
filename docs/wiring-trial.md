@@ -173,7 +173,7 @@ cd <项目目录>
 .\.runtime\node\node.exe --test --test-concurrency=1 --test-reporter=spec "tests/e2e/*.test.mjs"
 ```
 
-当时 53 项约 13–15 分钟，现在 e2e 文件多了，全量串行约 90 分钟。只连 loopback，不需要任何真实密钥，也不读 `.env`。`qq-prompt-observation` 把详细观察写到临时目录里一个新的 `clo-prompt-observation-*` 文件夹（含完整系统提示词）并打印路径，不写进项目。`%TEMP%` 下 `clo-e2e-*` 是临时目录，测试结束时清理。当时还有 `clo-e2e-compile-cache` 作 Node 编译缓存；现在 harness 关闭编译缓存（`NODE_DISABLE_COMPILE_CACHE=1`），不再创建它，旧的文件夹可随时删除。
+当时 53 项约 13–15 分钟，现在 e2e 文件多了，全量串行约 90 分钟。只连 loopback，不需要任何真实密钥，也不读 `.env`。`qq-prompt-observation` 把观察结果（工具列表、提示词各节的顺序和长度等）以 JSON 打印在测试输出里，默认不在磁盘上留文件。设了 `CLO_KEEP_PROMPT_OBSERVATION=1` 时，另外写到临时目录里一个新的 `clo-prompt-observation-*` 文件夹（own 运行时是 `clo-prompt-observation-own-*`）并打印路径，这个文件夹留着给人看，看完自己删。`%TEMP%` 下 `clo-e2e-*` 是临时目录，测试结束时清理。当时还有 `clo-e2e-compile-cache` 作 Node 编译缓存；现在 harness 关闭编译缓存（`NODE_DISABLE_COMPILE_CACHE=1`），不再创建它，旧的文件夹可随时删除。
 
 文件：`src/clo-plugin/`、`tests/e2e/`（`qq-load`、`qq-lifecycle`、`qq-group-reply`、`qq-prompt-observation`）、`tests/harness/`（`gateway`、`mock-openrouter`、`mock-qq`、`net-guard`）。
 

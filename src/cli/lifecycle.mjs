@@ -7,9 +7,10 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { activeKindOf } from '../clo-plugin/lib/core/config.js';
 import { CHILD_KEY, DEFAULT_BASE, KEY_ENV } from '../clo-plugin/lib/core/providers/registry.js';
+import { ensurePrivateDirs, openAppendPrivate, tryNarrowMode } from '../clo-plugin/lib/core/private-fs.js';
 import { writeAtomic } from '../clo-plugin/lib/core/render.js';
 import { CliError, isLoopback, isTestMode } from './common.mjs';
-import { endRecordedTree, endSpawnedChild, IS_WINDOWS, linuxChildEnv, lookupProcessLinux, privateNodePath } from './platform.mjs';
+import { endRecordedTree, endSpawnedChild, IS_WINDOWS, linuxChildEnv, lookupProcessLinux, privateNodePath, snapshotLeft } from './platform.mjs';
 
 // .env name -> the name the Gateway child gets. The host's openrouter provider and the plugin read OPENROUTER_API_KEY,
 // so that is the child's name for the key. CLO_CHAT_API_KEY itself never reaches the child.
@@ -25,6 +26,7 @@ export const RENAMED_ENV_KEYS = { OPENROUTER_API_KEY: 'CLO_CHAT_API_KEY', CLO_SE
 const OS_ENV_KEYS = ['SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS'];
 // Exact names, never a prefix: CLO_TEST_API_KEY, the paid probe's key, shares the prefix and must never reach a child.
 const TEST_ENV_KEYS = ['CLO_TEST_ROOT', 'CLO_TEST_CRASH_AT', 'CLO_NET_GUARD_LOG'];
+const HOST_LOG_LEVELS = new Set(['fatal', 'error', 'warn', 'info', 'debug', 'trace']);
 const DEFAULT_PORT = 18790;
 const LOG_ROTATE_BYTES = 20 * 1024 * 1024;
 const EARLY_EXIT_WATCH_MS = 1500;
@@ -91,9 +93,12 @@ export function renamedEnvNames(file) {
 export function ensureGatewayToken(paths) {
   const file = join(paths.cloDir, 'gateway.token');
   if (!existsSync(file)) {
-    mkdirSync(paths.cloDir, { recursive: true });
+    if (IS_WINDOWS) mkdirSync(paths.cloDir, { recursive: true });
+    else ensurePrivateDirs(paths.runtime, [paths.cloDir]);
     writeAtomic(file, randomBytes(32).toString('hex'));
   }
+  // A token written before modes were set off Windows may still be readable by others.
+  if (!IS_WINDOWS) tryNarrowMode(file);
   return readFileSync(file, 'utf8').trim();
 }
 
@@ -140,6 +145,9 @@ export function gatewayEnv(paths, parentEnv, { secrets = {}, token = null } = {}
     for (const k of TEST_ENV_KEYS) {
       if (parentEnv[k]) base[k] = parentEnv[k];
     }
+    // Test mode only: raises the host's log level, which outranks logging.level in openclaw.json. Used by the
+    // offline test that checks where the host log lands. A real start never passes OPENCLAW_LOG_LEVEL.
+    if (HOST_LOG_LEVELS.has(parentEnv.CLO_TEST_HOST_LOG_LEVEL)) base.OPENCLAW_LOG_LEVEL = parentEnv.CLO_TEST_HOST_LOG_LEVEL;
   }
   return base;
 }
@@ -217,7 +225,7 @@ export function inspectArgs(paths, env) {
 
 // For every child. ANTHROPIC_API_KEY is the name SDKs read on their own, so it is never set for anyone; the bot gets its
 // Anthropic Key as CLO_PROVIDER_API_KEY.
-const FORBIDDEN_CHILD_ENV = /proxy|^PERPLEXITY_API_KEY$|^CLO_CHAT_API_KEY$|^CLO_SEARCH_API_KEY$|^CLO_SEARCH_OPENROUTER_KEY$|^CLO_TEST_API_KEY$|^CLO_ANTHROPIC_API_KEY$|^CLO_TEST_ANTHROPIC_API_KEY$|^ANTHROPIC_API_KEY$|^NODE_OPTIONS$|^NODE_EXTRA_CA_CERTS$/i;
+const FORBIDDEN_CHILD_ENV = /proxy|^OPENCLAW_LOG_LEVEL$|^PERPLEXITY_API_KEY$|^CLO_CHAT_API_KEY$|^CLO_SEARCH_API_KEY$|^CLO_SEARCH_OPENROUTER_KEY$|^CLO_TEST_API_KEY$|^CLO_ANTHROPIC_API_KEY$|^CLO_TEST_ANTHROPIC_API_KEY$|^ANTHROPIC_API_KEY$|^NODE_OPTIONS$|^NODE_EXTRA_CA_CERTS$/i;
 // The Gateway runs on OpenRouter only, so the other kinds' child names never belong in its env.
 const FORBIDDEN_GATEWAY_ENV = new Set(Object.values(CHILD_KEY).filter((k) => k !== CHILD_KEY.openrouter));
 
@@ -400,11 +408,17 @@ export function startRuntime(ctx, cfg, opts) {
 async function spawnRecorded(ctx, { runtime, args, childEnv, port, lookup }) {
   const { paths, env } = ctx;
   const label = RUNTIME_LABEL[runtime];
-  for (const d of [paths.logsDir, dirname(paths.pidFile), paths.gatewayCwd, join(paths.runtime, 'temp'), join(paths.runtime, 'appdata', 'Roaming'), join(paths.runtime, 'appdata', 'Local')]) {
-    mkdirSync(d, { recursive: true });
+  const dirs = [paths.logsDir, dirname(paths.pidFile), paths.gatewayCwd, join(paths.runtime, 'temp'), join(paths.runtime, 'appdata', 'Roaming'), join(paths.runtime, 'appdata', 'Local')];
+  if (IS_WINDOWS) {
+    for (const d of dirs) {
+      mkdirSync(d, { recursive: true });
+    }
+  } else {
+    // 0700, and narrowed if an earlier run left them wider. The Gateway's own files land inside them.
+    ensurePrivateDirs(paths.runtime, [...dirs, paths.cloDir, paths.stateDir, paths.home, paths.workspace]);
   }
   rotateLog(paths.gatewayLog);
-  const logFd = openSync(paths.gatewayLog, 'a');
+  const logFd = IS_WINDOWS ? openSync(paths.gatewayLog, 'a') : openAppendPrivate(paths.gatewayLog);
   let child;
   try {
     child = spawn(privateNode(paths), args, {
@@ -567,13 +581,22 @@ export async function withStartLock(ctx, fn, { lookup = lookupProcess } = {}) {
   }
 }
 
-function waitForGone(pid, env) {
-  const end = Date.now() + STOP_WAIT_MS;
+function waitForGone(pid, env, end = Date.now() + STOP_WAIT_MS) {
   while (Date.now() < end) {
     if (lookupProcess(pid, env).outcome === 'gone') return true;
     sleepSync(250);
   }
   return false;
+}
+
+// Linux: the descendants stop signalled, until each has exited or the same deadline passes. Returns how many are left.
+function waitForDescendants(snapshot, env, end) {
+  let left = snapshotLeft(snapshot, env);
+  while (left.length && Date.now() < end) {
+    sleepSync(50);
+    left = snapshotLeft(left, env);
+  }
+  return left.length;
 }
 
 export function stopGateway(ctx) {
@@ -591,11 +614,18 @@ export function stopGateway(ctx) {
     rmSync(paths.pidFile, { force: true });
     return { stopped: false, reason: 'pid_mismatch' };
   }
+  const end = Date.now() + STOP_WAIT_MS;
+  let snapshot = [];
   if (IS_WINDOWS) spawnSync(systemExe(env, 'taskkill.exe'), ['/PID', String(record.pid), '/T', '/F'], { env: osToolEnv(env), windowsHide: true });
   // Matches the record against the process once more, then signals that PID's own group and what it started.
-  else endRecordedTree(record, env, { log: ctx.log });
-  if (!waitForGone(record.pid, env)) throw new CliError(`进程 ${record.pid} 没有退出。PID 文件保留，可以再试一次。`);
+  else snapshot = endRecordedTree(record, env, { log: ctx.log });
+  if (!waitForGone(record.pid, env, end)) throw new CliError(`进程 ${record.pid} 没有退出。PID 文件保留，可以再试一次。`);
   rmSync(paths.pidFile, { force: true });
+  const left = IS_WINDOWS ? 0 : waitForDescendants(snapshot, env, end);
+  if (left) {
+    ctx.log('stop_descendants_left', { count: left });
+    throw new CliError(`主进程已经退出，但它启动的 ${left} 个子进程还没有退出。等一会儿再运行 clo status 核对，确认之前不要再 start。`);
+  }
   ctx.log('gateway_stopped', { count: record.pid, kind: recordRuntime(record) });
   return { stopped: true, pid: record.pid, runtime: recordRuntime(record) };
 }

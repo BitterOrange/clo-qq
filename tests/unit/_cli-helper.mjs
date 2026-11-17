@@ -99,7 +99,8 @@ export function makeRoot(label, config = baseConfig()) {
   mkdirSync(root, { recursive: true });
   if (config) writeFileSync(join(root, 'config.json'), `${JSON.stringify(config, null, 2)}\n`);
   writeFileSync(join(root, 'versions.lock.json'), `${JSON.stringify(pristineVersionsLock(), null, 2)}\n`);
-  writeFileSync(join(root, '.env'), `CLO_QQ_APP_ID=${APP_ID}\nCLO_QQ_APP_SECRET=${FAKE_SECRET}\nCLO_CHAT_API_KEY=${FAKE_KEY}\n`);
+  // 0600 as the README tells users: doctor fails off Windows on a .env others can read.
+  writeFileSync(join(root, '.env'), `CLO_QQ_APP_ID=${APP_ID}\nCLO_QQ_APP_SECRET=${FAKE_SECRET}\nCLO_CHAT_API_KEY=${FAKE_KEY}\n`, { mode: 0o600 });
   return { root, base, cleanup: () => rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }) };
 }
 

@@ -68,7 +68,7 @@ function validate(label, config) {
 
 function renderAll(cfg, label, { testMode = false } = {}) {
   const dir = join(tmp, label);
-  const paths = { repoRoot: ROOT, workspace: join(dir, 'workspace'), effectiveJson: join(dir, 'effective.json'), db: join(dir, 'clo.db'), eventLog: join(dir, 'events.jsonl'), systemPromptFile: join(dir, 'system.md') };
+  const paths = { repoRoot: ROOT, logsDir: join(dir, 'logs'), workspace: join(dir, 'workspace'), effectiveJson: join(dir, 'effective.json'), db: join(dir, 'clo.db'), eventLog: join(dir, 'events.jsonl'), systemPromptFile: join(dir, 'system.md') };
   const env = testMode ? { CLO_TEST_ROOT: dir } : {};
   const effective = buildEffective(cfg, { paths, modelsLock: LOCK, env });
   return renderOpenclaw(cfg, effective, paths, { testMode });

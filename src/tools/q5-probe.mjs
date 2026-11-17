@@ -32,7 +32,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { isLoopback } from '../cli/common.mjs';
 import { GATEWAY_NODE_FLAGS, gatewayEnv, openclawEntry, parseEnvFile, privateNode } from '../cli/lifecycle.mjs';
-import { endSpawnedChild, IS_WINDOWS } from '../cli/platform.mjs';
+import { endSpawnedChild, IS_WINDOWS, isEntryPath } from '../cli/platform.mjs';
+import { mkdirPrivate, narrowMode, privateAppender } from '../clo-plugin/lib/core/private-fs.js';
 import { registerTools } from '../clo-plugin/lib/channels/qq/tools.js';
 import { buildEffective, OPENROUTER_BASE_URL, resolvePaths } from '../clo-plugin/lib/core/config.js';
 import { POLICY_V1_SHA256 } from '../clo-plugin/lib/core/contentPolicy.js';
@@ -436,11 +437,16 @@ export function sanitizeResult(line) {
   return out;
 }
 
-function resultWriter(path, secrets = []) {
-  mkdirSync(dirname(path), { recursive: true });
+// Off Windows the result file is 0600, and one an earlier run left wider is narrowed before the first line. A folder it
+// creates is 0700; main narrows the captures folder itself.
+export function resultWriter(path, secrets = []) {
+  if (IS_WINDOWS) mkdirSync(dirname(path), { recursive: true });
+  else mkdirPrivate(dirname(path));
+  const append = IS_WINDOWS ? null : privateAppender(path);
   return (line) => {
     const text = JSON.stringify(sanitizeResult({ at: new Date().toISOString(), ...line }));
-    appendFileSync(path, `${secrets.reduce((acc, s) => acc.split(s).join('[hidden]'), text)}\n`);
+    if (IS_WINDOWS) appendFileSync(path, `${secrets.reduce((acc, s) => acc.split(s).join('[hidden]'), text)}\n`);
+    else append(`${secrets.reduce((acc, s) => acc.split(s).join('[hidden]'), text)}\n`);
   };
 }
 
@@ -1749,6 +1755,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
   const ac = new AbortController();
   const stopWatching = watchStopSignals(ac);
   const pollMs = endpoint.testMode && env.CLO_Q5_TEST_POLL_MS ? Number(env.CLO_Q5_TEST_POLL_MS) : POLL_MS;
+  // Off Windows: the captures folder is 0700, also when an earlier run or another tool left it 0755.
+  if (!IS_WINDOWS) {
+    mkdirPrivate(dirname(join(paths.root, 'captures', 'q5-results.jsonl')));
+    narrowMode(dirname(join(paths.root, 'captures', 'q5-results.jsonl')));
+  }
   try {
     const out = await runProbe({
       plan,
@@ -1776,6 +1787,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
   }
 }
 
-if (resolve(process.argv[1] ?? '').toLowerCase() === SELF.toLowerCase()) {
+// Windows keeps its case-insensitive comparison; elsewhere both paths go through realpath, so a symlink still runs.
+if (IS_WINDOWS ? resolve(process.argv[1] ?? '').toLowerCase() === SELF.toLowerCase() : isEntryPath(process.argv[1], import.meta.url)) {
   process.exitCode = await main(process.argv.slice(2));
 }

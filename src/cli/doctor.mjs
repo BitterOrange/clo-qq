@@ -2,14 +2,14 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { providerOfConfig, runtimeOf } from '../clo-plugin/lib/core/config.js';
 import { checkSentinels, sha256Hex } from '../clo-plugin/lib/core/contentPolicy.js';
 import { extractPolicySection } from '../clo-plugin/lib/core/render.js';
 import { CHILD_KEY, MODEL_ID_RULES } from '../clo-plugin/lib/core/providers/registry.js';
 import { SCHEMA_VERSION } from '../clo-plugin/lib/core/store.js';
-import { isTestMode, lockMatches, readConfig, readModelsLock, readVersionsLock, renderAll } from './common.mjs';
+import { isTestMode, lockMatches, privateFiles, readConfig, readModelsLock, readVersionsLock, renderAll, secretFiles } from './common.mjs';
 import { duplicateLinesHint, ensureGatewayEnvClean, ensureOwnEnvClean, forbiddenOwnArgs, gatewayEnvForCheck, hostCliEnv, inspectArgs, modelKeyNames, oldLinesHint, ownArgs, ownEntry, ownEnvForCheck, parseEnvFile, privateNode, renamedEnvNames, requireSecrets } from './lifecycle.mjs';
 import { IS_WINDOWS, sameBinary } from './platform.mjs';
 
@@ -50,6 +50,14 @@ function agentOverrides(openclaw) {
 function hasKeyMatching(node, re) {
   if (!node || typeof node !== 'object') return false;
   return Object.entries(node).some(([k, v]) => re.test(k) || hasKeyMatching(v, re));
+}
+
+// True when file resolves to a path strictly inside dir. Windows paths compare without case, like the other checks.
+export function insideDir(dir, file, { caseless = IS_WINDOWS } = {}) {
+  if (typeof file !== 'string' || !isAbsolute(file)) return false;
+  const fold = (p) => (caseless ? resolve(p).toLowerCase() : resolve(p));
+  const rel = relative(fold(dir), fold(file));
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 function readJson(file) {
@@ -199,6 +207,16 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
     }));
     attempt('silent_reply', () => bothCfg(() => defaults.silentReply?.group === 'allow' || 'silentReply.group 不是 allow'));
     attempt('dm_scope', () => bothCfg(() => onDisk.session?.dmScope === 'per-channel-peer' || 'session.dmScope 不是 per-channel-peer'));
+    // At any level above silent the host's file log holds message text, provider error text and group IDs.
+    attempt('host_log_level', () => bothCfg(() => {
+      const l = onDisk.logging ?? {};
+      if (l.level !== 'silent') return 'logging.level 不是 silent，宿主日志会写下服务方错误原文等内容';
+      return l.consoleLevel === 'silent' || 'logging.consoleLevel 不是 silent';
+    }));
+    // Named even while silent, so a raised level still writes inside the project and not to the shared temp folder.
+    // The host prunes old openclaw-*.log files in the log's own folder, so the file must sit in .runtime/logs/host.
+    attempt('host_log_file', () => bothCfg(() => insideDir(join(paths.logsDir, 'host'), onDisk.logging?.file)
+      || 'logging.file 没有指向项目的 .runtime/logs/host 里面，宿主日志会写到别处，按天清理也会在别的目录里删文件'));
     attempt('no_fallback_model', () => bothCfg(() => (defaults.model?.fallbacks ?? []).length === 0 || 'agents.defaults.model.fallbacks 不为空'));
   }
 
@@ -333,14 +351,35 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
   });
 
   // Warnings: they do not stop a start.
+  // ctx.envProxy is set off Windows only (common.mjs): Node's env proxy is on in this console, so it refuses requests.
   const inParent = Object.keys(env).filter((k) => PROXY_KEY.test(k));
-  add('parent_proxy', inParent.length === 0, inParent.length ? `当前 shell 设了代理变量（${inParent.join('、')}），Gateway 环境不会继承，但本机其他工具可能走代理` : '', 'warn');
+  const proxyNotes = [];
+  if (inParent.length) proxyNotes.push(`当前 shell 设了代理变量（${inParent.join('、')}），Gateway 环境不会继承，但本机其他工具可能走代理`);
+  if (ctx.envProxy) proxyNotes.push(`这个控制台进程启动时带了 ${ctx.envProxy}，它的联网请求会被拒绝，用 scripts/clo.sh 运行`);
+  const proxyOk = proxyNotes.length === 0;
+  add('parent_proxy', proxyOk, proxyNotes.join('；'), 'warn');
   add('cloud_folder', !CLOUD_DIR.test(paths.repoRoot), CLOUD_DIR.test(paths.repoRoot) ? '项目在云同步目录里，SQLite 和 .env 可能被同步或损坏，建议移走' : '', 'warn');
   attempt('gitignore', () => {
     const text = readFileSync(join(paths.repoRoot, '.gitignore'), 'utf8').split(/\r?\n/);
     const missing = GITIGNORED.filter((g) => !text.includes(g));
     return missing.length ? `.gitignore 缺少：${missing.join('、')}` : true;
   }, 'warn');
+
+  // Off Windows only: Windows has no mode bits, the folder's ACL decides there. Names are relative to the project.
+  if (!IS_WINDOWS && level === FULL_LEVEL) {
+    const reachable = (files) => files.filter((f) => {
+      const st = statSync(f, { throwIfNoEntry: false });
+      return st && (st.mode & 0o077) !== 0;
+    }).map((f) => relative(paths.root, f) || '.');
+    attempt('secret_modes', () => {
+      const bad = reachable(secretFiles(paths));
+      return bad.length ? `同组或其他用户能访问：${bad.join('、')}。运行 chmod 600 改成只有自己可读写` : true;
+    });
+    attempt('file_modes', () => {
+      const bad = reachable(privateFiles(paths));
+      return bad.length ? `同组或其他用户能访问：${bad.join('、')}。文件用 chmod 600、文件夹用 chmod 700；运行时文件夹里的，clo apply 会自动收紧` : true;
+    }, 'warn');
+  }
 
   if (level === FULL_LEVEL) {
     attempt('env_file', () => {

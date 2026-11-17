@@ -1,5 +1,6 @@
-// Observation, not a gate: writes what the model is shown to prompt.json in a fresh temp directory and prints the path.
-// It is left there to read. It asserts only facts the build depends on.
+// Observation, not a gate: prints what the model is shown, as JSON. It asserts only facts the build depends on.
+// Nothing is left on disk by default; with CLO_KEEP_PROMPT_OBSERVATION=1 the JSON also goes to prompt.json in a fresh
+// clo-prompt-observation-* temp folder, whose path is printed and which is left there to read (delete it by hand).
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -40,9 +41,13 @@ async function observe(label, options) {
 }
 
 after(() => {
-  const file = join(mkdtempSync(join(tmpdir(), 'clo-prompt-observation-')), 'prompt.json');
-  writeFileSync(file, JSON.stringify(report, null, 2));
-  console.log(`prompt observation: ${file}`);
+  const json = JSON.stringify(report, null, 2);
+  console.log(`prompt observation:\n${json}`);
+  if (process.env.CLO_KEEP_PROMPT_OBSERVATION === '1') {
+    const file = join(mkdtempSync(join(tmpdir(), 'clo-prompt-observation-')), 'prompt.json');
+    writeFileSync(file, json);
+    console.log(`prompt observation kept: ${file}`);
+  }
 });
 
 test('replacement prompt: the policy block leads and the tool list is exact', async () => {

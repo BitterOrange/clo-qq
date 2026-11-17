@@ -11,6 +11,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GatewayConnection, TokenManager } from '@tencent-connect/qqbot-nodejs/protocol';
+import { IS_WINDOWS, isEntryPath } from '../cli/platform.mjs';
+import { mkdirPrivate, narrowMode, privateAppender, writeFilePrivate } from '../clo-plugin/lib/core/private-fs.js';
 import { hashId, parseQqEnv, scrub } from './qq-shape.mjs';
 
 const USER_AGENT = `clo-q0-probe/0 (Node/${process.versions.node})`;
@@ -69,13 +71,24 @@ async function post(apiBase, token, req) {
   return { status: res.status, code: json?.code ?? json?.err_code ?? null, hasId: Boolean(json?.id) };
 }
 
+// The DM target is a raw ID: 0600 off Windows, also when an earlier run left the file wider.
+export function saveDmTarget(targetPath, target) {
+  if (IS_WINDOWS) writeFileSync(targetPath, target);
+  else writeFilePrivate(targetPath, target);
+}
+
 /** Sends at most once, then watches briefly for an echo. Exported so tests can run it against a mock. */
 export async function runProbe({ caseName, allowHash, appId, secret, apiBase, tokenBase, salt, resultPath, signal, say = console.log, savedTarget = null, echoWatchMs = ECHO_WATCH_MS }) {
   const c = CASES[caseName];
   if (!c) throw new Error(`Unknown case ${caseName}`);
   const secrets = [secret];
   const tokens = new TokenManager({ userAgent: USER_AGENT, baseUrl: tokenBase });
-  const record = (rec) => appendFileSync(resultPath, JSON.stringify({ at: new Date().toISOString(), case: caseName, ...rec }) + '\n');
+  // Off Windows the result file is 0600; q0b-results.jsonl is appended across runs, so an older wider one is narrowed first.
+  const appendResult = IS_WINDOWS ? null : privateAppender(resultPath);
+  const record = (rec) => {
+    if (IS_WINDOWS) appendFileSync(resultPath, JSON.stringify({ at: new Date().toISOString(), case: caseName, ...rec }) + '\n');
+    else appendResult(JSON.stringify({ at: new Date().toISOString(), case: caseName, ...rec }) + '\n');
+  };
   const getToken = async () => {
     const t = await tokens.getAccessToken(appId, secret);
     secrets.push(t);
@@ -164,7 +177,11 @@ async function main() {
   if (!existsSync(saltPath)) { console.error('No salt yet. Run the listener first so target hashes exist.'); process.exit(2); }
   const salt = readFileSync(saltPath, 'utf8');
   const resultPath = join(ROOT, 'captures', 'q0b-results.jsonl');
-  mkdirSync(dirname(resultPath), { recursive: true });
+  if (IS_WINDOWS) mkdirSync(dirname(resultPath), { recursive: true });
+  else {
+    mkdirPrivate(dirname(resultPath));
+    narrowMode(dirname(resultPath));
+  }
   // The DM target is kept only here, under the git-ignored runtime directory, for the later proactive case.
   const targetPath = join(ROOT, '.runtime', 'q0b-dm-target');
   const savedTarget = existsSync(targetPath) ? readFileSync(targetPath, 'utf8') : null;
@@ -178,7 +195,7 @@ async function main() {
       tokenBase: process.env.CLO_QQ_TOKEN_BASE || 'https://bots.qq.com',
       salt, resultPath, signal: ac.signal, savedTarget,
     });
-    if (c.scope === 'c2c' && c.mode === 'passive' && out.target) writeFileSync(targetPath, out.target);
+    if (c.scope === 'c2c' && c.mode === 'passive' && out.target) saveDmTarget(targetPath, out.target);
     console.log(`Done. Sends: ${out.sent}. Bot-author messages seen: ${out.echo ?? 0}.`);
   } catch (err) {
     console.error(`Stopped: ${err.message}`);
@@ -186,4 +203,6 @@ async function main() {
   }
 }
 
-if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) await main();
+// Windows keeps its comparison; elsewhere both paths go through realpath, so a symlink still runs.
+const isMain = IS_WINDOWS ? resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url) : isEntryPath(process.argv[1], import.meta.url);
+if (isMain) await main();

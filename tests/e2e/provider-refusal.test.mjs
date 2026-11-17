@@ -9,7 +9,6 @@ import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fullAt, nextId, push } from '../fixtures/qq-events.mjs';
 import { assertAgentRequest, assertEveryPostLegal, startStack, unexpectedNetAttempts, until } from '../harness/gateway.mjs';
-import { IS_WINDOWS } from '../harness/platform.mjs';
 
 const LINES = JSON.parse(readFileSync(new URL('../../persona/policy-lines.zh.json', import.meta.url), 'utf8'));
 const LEAK = 'PROVIDER-SECRET-TEXT';
@@ -29,23 +28,14 @@ const CASES = [
 
 let s;
 
-// Off Windows the pinned host prefers the fixed folder /tmp/openclaw (dist/logger: resolvePreferredOpenClawTmpDir) and
-// falls back to openclaw-<uid> under its temp folder. Both are read. The fixed folder is shared with other runs and
-// stays empty while logging is silent, so off Windows the host file log check below has no positive control: it
-// cannot show that this run's host wrote there. DECISIONS.md records that.
-function linuxHostLogDirs() {
-  const temp = join(s.tmp, 'temp');
-  const under = existsSync(temp) ? readdirSync(temp).filter((n) => n === 'openclaw' || n.startsWith('openclaw-')).map((n) => join(temp, n)) : [];
-  return ['/tmp/openclaw', ...under].filter((d) => existsSync(d) && statSync(d).isDirectory());
-}
-
-function hostFileLogs() {
-  if (!IS_WINDOWS) {
-    return linuxHostLogDirs().flatMap((d) => readdirSync(d).map((f) => join(d, f))).filter((f) => statSync(f).isFile()).map((f) => readFileSync(f, 'utf8')).join('\n');
-  }
-  const dir = join(s.tmp, 'temp', 'openclaw');
+// The host's file log, where openclaw.json names it (logging.file, under .runtime/logs/host), on every platform.
+// Silent, so it stays empty on the main stack. The last test in this file is the positive control in this run: a
+// second stack with the level raised through the test-mode seam does write the provider text into this folder.
+function hostFileLogs(stack = s) {
+  const dir = join(stack.paths.logsDir, 'host');
+  assert.equal(stack.config.logging.file, join(dir, 'openclaw-YYYY-MM-DD.log'), 'the folder read here is the one the host was given');
   if (!existsSync(dir)) return '';
-  return readdirSync(dir).map((f) => readFileSync(join(dir, f), 'utf8')).join('\n');
+  return readdirSync(dir).map((f) => join(dir, f)).filter((f) => statSync(f).isFile()).map((f) => readFileSync(f, 'utf8')).join('\n');
 }
 
 before(async () => {
@@ -141,4 +131,24 @@ test('no provider text in any POST on this stack', () => {
 test('last: every POST on this stack is legal', () => {
   assertEveryPostLegal(s, { minPosts: 5 });
   assert.deepEqual(unexpectedNetAttempts(s.gw), []);
+});
+
+// Positive control for the host file log checks above: the same refusal on a stack whose host log level is raised to
+// info (test mode only; clo start never passes it) puts the provider text in the folder hostFileLogs reads. So the
+// silent stack's empty log is the level at work, not a scan of the wrong place.
+test('positive control: at a raised host log level the same refusal lands in the folder read above', { timeout: 300000 }, async () => {
+  const loud = await startStack({ label: 'refusal-loud', script: () => CASES[0][1], parentEnv: { CLO_TEST_HOST_LOG_LEVEL: 'info' } });
+  try {
+    await loud.waitConnected();
+    assert.equal(loud.childEnv.OPENCLAW_LOG_LEVEL, 'info');
+    const id = nextId();
+    push(loud, fullAt('触发 loud', { id }));
+    assert.equal((await loud.waitRow(id)).state, 'failed');
+    assert.ok(hostFileLogs(loud).includes(LEAK), 'the provider text is in the raised-level host log');
+    assert.ok(!readFileSync(loud.paths.eventLog, 'utf8').includes(LEAK), 'still not in our own event log');
+    assert.deepEqual(unexpectedNetAttempts(loud.gw), []);
+  } finally {
+    await loud.stop();
+    loud.cleanup();
+  }
 });

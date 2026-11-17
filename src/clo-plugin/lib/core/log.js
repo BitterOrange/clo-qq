@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { appendPrivate, mkdirPrivate, PRIVATE_MODES, tryNarrowMode } from './private-fs.js';
 
 export const LOG_KEYS = new Set([
   'eventKey', 'groupKey', 'cls', 'state', 'reason', 'ruleId', 'path', 'count', 'closeCode', 'code', 'httpStatus',
@@ -46,10 +47,17 @@ export function createLog(path, { gen = randomUUID().slice(0, 8), now = Date.now
     const line = JSON.stringify({ ...kept, event: name, pid: process.pid, t: now(), gen });
     try {
       if (!dirReady) {
-        mkdirSync(dirname(path), { recursive: true });
+        if (PRIVATE_MODES) {
+          // 0700 for a new folder; a log an earlier build left wider is narrowed once, new ones are made 0600.
+          mkdirPrivate(dirname(path));
+          tryNarrowMode(path);
+        } else {
+          mkdirSync(dirname(path), { recursive: true });
+        }
         dirReady = true;
       }
-      appendFileSync(path, `${line}\n`);
+      if (PRIVATE_MODES) appendPrivate(path, `${line}\n`);
+      else appendFileSync(path, `${line}\n`);
     } catch {
       // A full disk must not take the bot down or change what it does.
     }

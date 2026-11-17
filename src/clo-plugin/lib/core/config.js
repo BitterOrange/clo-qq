@@ -236,7 +236,7 @@ export function validateBusinessConfig(cfg, { env = process.env } = {}) {
         if (qq.enabled && !ownersOf(qq, id).length) {
           // A group is added before its owner is known, so this only stops live.
           if (cfg.mode === 'live') err(`qq.groups.${g.label}`, 'needs at least one owner');
-          else warnings.push({ path: `qq.groups.${g.label}`, message: 'has no owner yet; live will refuse' });
+          else warnings.push({ path: `qq.groups.${g.label}`, message: `还没有 owner，live 会拒绝；下一步 clo owner add ${g.label} --id <成员ID>` });
         }
       }
     }

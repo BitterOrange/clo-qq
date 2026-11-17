@@ -31,6 +31,8 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { isLoopback } from '../cli/common.mjs';
 import { parseEnvFile } from '../cli/lifecycle.mjs';
+import { IS_WINDOWS, isEntryPath } from '../cli/platform.mjs';
+import { mkdirPrivate, narrowMode, privateAppender } from '../clo-plugin/lib/core/private-fs.js';
 import { resolvePaths } from '../clo-plugin/lib/core/config.js';
 import { buildRequest as buildDecisionRequest, parseAnswer } from '../clo-plugin/lib/core/decision.js';
 import { checkAnthropicModels, priceBookProblems } from '../clo-plugin/lib/core/models.js';
@@ -384,11 +386,16 @@ export function sanitizeResult(line) {
   return out;
 }
 
-function resultWriter(path, secrets) {
-  mkdirSync(dirname(path), { recursive: true });
+// Off Windows the result file is 0600, and one an earlier run left wider is narrowed before the first line. A folder it
+// creates is 0700; main narrows the captures folder itself.
+export function resultWriter(path, secrets) {
+  if (IS_WINDOWS) mkdirSync(dirname(path), { recursive: true });
+  else mkdirPrivate(dirname(path));
+  const append = IS_WINDOWS ? null : privateAppender(path);
   return (line) => {
     const text = JSON.stringify(sanitizeResult({ at: new Date().toISOString(), ...line }));
-    appendFileSync(path, `${secrets.reduce((acc, s) => acc.split(s).join('[hidden]'), text)}\n`);
+    if (IS_WINDOWS) appendFileSync(path, `${secrets.reduce((acc, s) => acc.split(s).join('[hidden]'), text)}\n`);
+    else append(`${secrets.reduce((acc, s) => acc.split(s).join('[hidden]'), text)}\n`);
   };
 }
 
@@ -704,6 +711,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
   }
   const ac = new AbortController();
   const stopWatching = watchStopSignals(ac);
+  // Off Windows: the captures folder is 0700, also when an earlier run or another tool left it 0755.
+  if (!IS_WINDOWS) {
+    mkdirPrivate(dirname(join(paths.root, RESULT_FILE)));
+    narrowMode(dirname(join(paths.root, RESULT_FILE)));
+  }
   try {
     const out = await runProbe({
       plan,
@@ -726,6 +738,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
   }
 }
 
-if (resolve(process.argv[1] ?? '').toLowerCase() === SELF.toLowerCase()) {
+// Windows keeps its case-insensitive comparison; elsewhere both paths go through realpath, so a symlink still runs.
+if (IS_WINDOWS ? resolve(process.argv[1] ?? '').toLowerCase() === SELF.toLowerCase() : isEntryPath(process.argv[1], import.meta.url)) {
   process.exitCode = await main(process.argv.slice(2));
 }

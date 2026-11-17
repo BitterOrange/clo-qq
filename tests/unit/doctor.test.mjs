@@ -2,10 +2,11 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { makeContext } from '../../src/cli/common.mjs';
-import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, inspectHooks, runDoctor } from '../../src/cli/doctor.mjs';
+import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, insideDir, inspectHooks, runDoctor } from '../../src/cli/doctor.mjs';
 import { ensureGatewayEnvClean, gatewayEnv, gatewayEnvForCheck } from '../../src/cli/lifecycle.mjs';
 import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
 import { APP_ID, baseConfig, clo, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, NET_GUARD, openclawOf, OWNER_ID, ROOT, testEnv, withProviders, writePriceBook } from './_cli-helper.mjs';
@@ -57,6 +58,14 @@ const RENDER_CASES = [
   ['silent_reply', 'silentReply missing', (o) => { delete o.agents.defaults.silentReply; }],
   ['dm_scope', 'dmScope default', (o) => { delete o.session.dmScope; }],
   ['no_fallback_model', 'fallback set', (o) => { o.agents.defaults.model.fallbacks = ['openrouter/openai/gpt-x']; }],
+  ['host_log_level', 'file log at info', (o) => { o.logging.level = 'info'; }],
+  ['host_log_level', 'file log level removed', (o) => { delete o.logging.level; }],
+  ['host_log_level', 'console log at error', (o) => { o.logging.consoleLevel = 'error'; }],
+  ['host_log_file', 'file log not named', (o) => { delete o.logging.file; }],
+  ['host_log_file', 'file log in the shared temp folder', (o) => { o.logging.file = join(tmpdir(), 'openclaw', 'openclaw-YYYY-MM-DD.log'); }],
+  ['host_log_file', 'file log relative', (o) => { o.logging.file = join('.runtime', 'logs', 'host', 'openclaw-YYYY-MM-DD.log'); }],
+  ['host_log_file', 'file log escapes with ..', (o) => { o.logging.file = join(dirname(o.plugins.entries.clo.config.effectivePath), '..', '..', 'openclaw-YYYY-MM-DD.log'); }],
+  ['host_log_file', 'file log in a sibling that shares the prefix', (o) => { o.logging.file = join(`${dirname(dirname(o.plugins.entries.clo.config.effectivePath))}-x`, 'openclaw-YYYY-MM-DD.log'); }],
   ['forbidden_plugins', 'official plugin allowed', (o) => { o.plugins.allow.push('openclaw-qqbot'); }],
   ['forbidden_plugins', 'wechat plugin entry', (o) => { o.plugins.entries['agent-wechat'] = { enabled: true }; }],
   ['proxy_config', 'proxy key', (o) => { o.gateway.proxy = 'http://x'; }],
@@ -71,6 +80,40 @@ for (const [id, what, edit] of RENDER_CASES) {
     assert.ok(failedIds(report).includes('render_fresh'));
   });
 }
+
+test('the rendered host log passes both log checks; host_log_file wants .runtime/logs/host, not just .runtime', async () => {
+  const root = await prepared('hostlog');
+  const clean = doctor(root);
+  for (const id of ['host_log_level', 'host_log_file']) {
+    assert.ok(clean.checks.some((c) => c.id === id && c.ok), `${id} ran and passed: ${formatDoctor(clean)}`);
+  }
+  assert.equal(openclawOf(root).logging.file, join(root, '.runtime', 'logs', 'host', 'openclaw-YYYY-MM-DD.log'));
+  // Another name in the same folder: only render_fresh objects, so host_log_file judges the place and not the bytes.
+  editOpenclaw(root, (o) => { o.logging.file = join(root, '.runtime', 'logs', 'host', 'other-YYYY-MM-DD.log'); });
+  const renamed = doctor(root);
+  assert.ok(!failedIds(renamed).includes('host_log_file'), formatDoctor(renamed));
+  assert.ok(failedIds(renamed).includes('render_fresh'));
+  // Another folder inside .runtime (the state folder): the host's daily prune would run there, so it fails.
+  editOpenclaw(root, (o) => { o.logging.file = join(root, '.runtime', 'state', 'openclaw-YYYY-MM-DD.log'); });
+  const moved = doctor(root);
+  assert.ok(failedIds(moved).includes('host_log_file'), formatDoctor(moved));
+  assert.ok(failedIds(moved).includes('render_fresh'));
+});
+
+test('insideDir: strictly inside, by resolved path; without case only where asked (Windows)', () => {
+  const dir = join(tmpdir(), 'clo proj', '.runtime');
+  assert.equal(insideDir(dir, join(dir, 'logs', 'host', 'a.log')), true, 'positive control');
+  assert.equal(insideDir(dir, join(dir, 'logs', '..', 'a.log')), true, 'resolved, still inside');
+  assert.equal(insideDir(dir, dir), false, 'the folder itself is not inside it');
+  assert.equal(insideDir(dir, join(dir, '..', 'a.log')), false);
+  assert.equal(insideDir(dir, `${dir}-x${join('/', 'a.log')}`), false, 'a sibling with the same prefix');
+  assert.equal(insideDir(dir, join('logs', 'a.log')), false, 'relative');
+  assert.equal(insideDir(dir, undefined), false);
+  assert.equal(insideDir(dir, 42), false);
+  const upper = join(dir.toUpperCase(), 'logs', 'a.log');
+  assert.equal(insideDir(dir, upper, { caseless: true }), true, 'Windows: case does not matter');
+  assert.equal(insideDir(dir, upper, { caseless: false }), false, 'elsewhere it does');
+});
 
 test('doctor catches an edited workspace: policy section, persona and system prompt', async () => {
   const root = await prepared('workspace');
@@ -190,6 +233,26 @@ test('proxy variables in the shell only warn, because the Gateway env is an allo
   assert.equal(checked.OPENROUTER_API_KEY, 'check-only', 'the check sees the key under the name start would give it, with no real value');
   assert.deepEqual(ensureGatewayEnvClean(checked), [], 'and that name is clean');
   assert.ok(!Object.values(checked).includes('PARENT'), 'nothing from the parent');
+});
+
+test('the host log level seam: only test mode raises it, only from its own name, and doctor flags the host name', async () => {
+  const root = await prepared('loglevel');
+  const ctx = ctxOf(root);
+  assert.ok(ctx.env.CLO_TEST_ROOT, 'positive control: this context is in test mode');
+  const raised = gatewayEnv(ctx.paths, { ...ctx.env, CLO_TEST_HOST_LOG_LEVEL: 'info' });
+  assert.equal(raised.OPENCLAW_LOG_LEVEL, 'info', 'positive control: the seam works in test mode');
+  assert.equal(raised.CLO_TEST_HOST_LOG_LEVEL, undefined, 'the seam name itself is not passed on');
+  assert.equal(gatewayEnv(ctx.paths, ctx.env).OPENCLAW_LOG_LEVEL, undefined, 'not set: nothing');
+  // Outside test mode the same parent gives nothing.
+  const { CLO_TEST_ROOT: _root, ...realParent } = ctx.env;
+  assert.equal(gatewayEnv(ctx.paths, { ...realParent, CLO_TEST_HOST_LOG_LEVEL: 'info' }).OPENCLAW_LOG_LEVEL, undefined, 'a real start ignores the seam');
+  // The host's own name is never copied from the parent, in either mode, and only known levels pass the seam.
+  for (const parent of [{ ...ctx.env, OPENCLAW_LOG_LEVEL: 'debug' }, { ...realParent, OPENCLAW_LOG_LEVEL: 'debug' }]) {
+    assert.equal(gatewayEnv(ctx.paths, parent).OPENCLAW_LOG_LEVEL, undefined);
+  }
+  assert.equal(gatewayEnv(ctx.paths, { ...ctx.env, CLO_TEST_HOST_LOG_LEVEL: 'loud' }).OPENCLAW_LOG_LEVEL, undefined);
+  assert.deepEqual(ensureGatewayEnvClean(raised), ['OPENCLAW_LOG_LEVEL'], 'the gateway_env check would refuse an env that raises it');
+  assert.deepEqual(ensureGatewayEnvClean(gatewayEnvForCheck(ctx.paths, ctx.env)), [], 'and the env start builds is clean (control)');
 });
 
 test('the full level asks the host about hooks, and each bad answer fails', async () => {
@@ -328,7 +391,7 @@ test('the project files doctor reads are there', () => {
 
 // --- The own runtime: no host config, and its own checks. ---
 
-const HOST_ONLY = ['openclaw_json', 'conversation_access', 'skip_bootstrap', 'context_injection', 'bootstrap_limits', 'node_turn', 'tools_policy', 'silent_reply', 'dm_scope', 'no_fallback_model', 'policy_section', 'persona_hashes', 'render_fresh', 'gateway_env', 'proxy_config', 'hook_registered'];
+const HOST_ONLY = ['openclaw_json', 'conversation_access', 'skip_bootstrap', 'context_injection', 'bootstrap_limits', 'node_turn', 'tools_policy', 'silent_reply', 'dm_scope', 'no_fallback_model', 'host_log_level', 'host_log_file', 'policy_section', 'persona_hashes', 'render_fresh', 'gateway_env', 'proxy_config', 'hook_registered'];
 const OWN_ONLY = ['system_prompt', 'bot_env', 'bot_entry', 'bot_no_listen'];
 
 async function preparedOwn(label) {

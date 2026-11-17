@@ -10,6 +10,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GatewayConnection, TokenManager } from '@tencent-connect/qqbot-nodejs/protocol';
+import { IS_WINDOWS, isEntryPath } from '../cli/platform.mjs';
+import { mkdirPrivate, narrowMode, privateAppender, writeFilePrivate } from '../clo-plugin/lib/core/private-fs.js';
 import { parseQqEnv, scrub, summarizeMessage, summarizeRaw } from './qq-shape.mjs';
 
 /** Only the group-and-C2C intent bit. No interaction or guild events. */
@@ -17,11 +19,18 @@ export const LISTENER_INTENTS = 1 << 25;
 const USER_AGENT = `clo-q0-listener/0 (Node/${process.versions.node})`;
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-function loadSalt(path) {
-  if (existsSync(path)) return readFileSync(path, 'utf8');
-  mkdirSync(dirname(path), { recursive: true });
+// Off Windows the salt is 0600 in a 0700 folder: with it, the hashes in the captures can be matched to raw IDs.
+export function loadSalt(path) {
+  if (existsSync(path)) {
+    if (!IS_WINDOWS) narrowMode(path);
+    return readFileSync(path, 'utf8');
+  }
+  if (IS_WINDOWS) mkdirSync(dirname(path), { recursive: true });
+  else mkdirPrivate(dirname(path));
+  if (!IS_WINDOWS) narrowMode(dirname(path));
   const salt = randomBytes(32).toString('hex');
-  writeFileSync(path, salt, { flag: 'wx' });
+  if (IS_WINDOWS) writeFileSync(path, salt, { flag: 'wx' });
+  else writeFilePrivate(path, salt, { flag: 'wx' });
   return salt;
 }
 
@@ -29,8 +38,11 @@ function loadSalt(path) {
 export async function runListener({ appId, secret, apiBase, tokenBase, capturePath, salt, signal, say = console.log }) {
   const counts = new Map();
   const secrets = [secret];
+  // Off Windows the capture file is 0600. Its name carries the start time, so it is normally new; one that exists is narrowed.
+  const appendCapture = IS_WINDOWS ? null : privateAppender(capturePath);
   const write = (rec) => {
-    appendFileSync(capturePath, JSON.stringify(rec) + '\n');
+    if (IS_WINDOWS) appendFileSync(capturePath, JSON.stringify(rec) + '\n');
+    else appendCapture(JSON.stringify(rec) + '\n');
     counts.set(rec.event, (counts.get(rec.event) ?? 0) + 1);
   };
   const tokens = new TokenManager({ userAgent: USER_AGENT, baseUrl: tokenBase });
@@ -105,7 +117,11 @@ async function main() {
   const tokenBase = process.env.CLO_QQ_TOKEN_BASE || 'https://bots.qq.com';
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const capturePath = join(ROOT, 'captures', `q0a-${stamp}.jsonl`);
-  mkdirSync(dirname(capturePath), { recursive: true });
+  if (IS_WINDOWS) mkdirSync(dirname(capturePath), { recursive: true });
+  else {
+    mkdirPrivate(dirname(capturePath));
+    narrowMode(dirname(capturePath));
+  }
   const salt = loadSalt(join(ROOT, '.runtime', 'q0-salt'));
 
   const ac = new AbortController();
@@ -124,4 +140,6 @@ async function main() {
   }
 }
 
-if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) await main();
+// Windows keeps its comparison; elsewhere both paths go through realpath, so a symlink still runs.
+const isMain = IS_WINDOWS ? resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url) : isEntryPath(process.argv[1], import.meta.url);
+if (isMain) await main();

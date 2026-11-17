@@ -5,8 +5,10 @@ import { activeKindOf, buildEffective, ConfigError, createEffectiveReader, liveC
 import { ACTIVE_PROVIDER_CONTROL, providerRecord } from '../clo-plugin/lib/core/providers/registry.js';
 import { createLedger } from '../clo-plugin/lib/core/ledger.js';
 import { createLog } from '../clo-plugin/lib/core/log.js';
+import { ensurePrivateDirs, tryNarrowMode } from '../clo-plugin/lib/core/private-fs.js';
 import { renderOpenclaw, renderWorkspace, writeAtomic } from '../clo-plugin/lib/core/render.js';
-import { openStore } from '../clo-plugin/lib/core/store.js';
+import { backupFileOf, openStore } from '../clo-plugin/lib/core/store.js';
+import { IS_WINDOWS } from './platform.mjs';
 
 export class CliError extends Error {
   constructor(message, { code = 1 } = {}) {
@@ -35,16 +37,52 @@ export function guardedFetch(env, realFetch) {
   };
 }
 
-export function makeContext({ env = process.env, fetch = globalThis.fetch, stdout = process.stdout, stderr = process.stderr, now = Date.now } = {}) {
+// Node turns its env proxy on at startup, from NODE_USE_ENV_PROXY or --use-env-proxy, and keeps the proxy URL it read
+// then: deleting either variable from process.env later does not undo it (checked on the private Node 24.22.2 with a
+// loopback listener). So a console started that way cannot be cleaned up from inside and refuses to make requests.
+// Node 24.22.2 acts only on the value '1'; any other non-empty value except '0' counts too, in case a later Node widens it.
+// The flag is matched loosely, because Node 24.22.2 turns the proxy on for '"--use-env-proxy"' (quoted in NODE_OPTIONS),
+// '--use-env-proxy=true', '--use-env-proxy=false' and '--use_env_proxy' alike (checked with a loopback fake proxy).
+// Any entry that mentions use-env-proxy counts, except a lone '--no-use-env-proxy'; that refuses a few spellings Node
+// would leave off (a later '--no-use-env-proxy' that cancels an earlier one), which is the safe side.
+const ENV_PROXY_FLAG = /use[-_]env[-_]proxy/i;
+const ENV_PROXY_OFF = /^--no[-_]use[-_]env[-_]proxy$/i;
+const mentionsEnvProxy = (tokens) => tokens.map((t) => t.replace(/^["']+|["']+$/g, '')).some((t) => ENV_PROXY_FLAG.test(t) && !ENV_PROXY_OFF.test(t));
+export function envProxyAtLaunch(env, execArgv = []) {
+  const flag = env.NODE_USE_ENV_PROXY;
+  if (typeof flag === 'string' && flag !== '' && flag !== '0') return 'NODE_USE_ENV_PROXY';
+  if (mentionsEnvProxy(execArgv.map(String))) return '--use-env-proxy';
+  if (mentionsEnvProxy(String(env.NODE_OPTIONS ?? '').split(/\s+/))) return 'NODE_OPTIONS 里的 --use-env-proxy';
+  return null;
+}
+
+// Read once, when the console loads: what Node saw at startup, not what the environment says later.
+const LAUNCH_ENV_PROXY = envProxyAtLaunch(process.env, process.execArgv);
+
+export function envProxyMessage(reason) {
+  return `这个控制台进程启动时带了 ${reason}，Node 会让它的网络请求走代理，启动后改不掉。拒绝联网。用 scripts/clo.sh 运行，或者先去掉 NODE_USE_ENV_PROXY 和 NODE_OPTIONS 里的 --use-env-proxy 再运行。`;
+}
+
+export function assertNoEnvProxy(ctx) {
+  if (ctx.envProxy) throw new CliError(envProxyMessage(ctx.envProxy));
+}
+
+// envProxy: off Windows, why Node's env proxy is on in this process, or null. Windows keeps its earlier behaviour.
+// The launch state only applies to a context that reads this process's own environment, as the real console does: a
+// caller that injects env (the tests) is not this process's launch, and gets null unless it passes envProxy itself.
+export function makeContext({ env = process.env, fetch = globalThis.fetch, stdout = process.stdout, stderr = process.stderr, now = Date.now, envProxy = IS_WINDOWS || env !== process.env ? null : LAUNCH_ENV_PROXY } = {}) {
   const paths = resolvePaths(env);
   const out = (line = '') => stdout.write(`${line}\n`);
   const err = (line = '') => stderr.write(`${line}\n`);
-  return { env, paths, out, err, now, fetch: guardedFetch(env, fetch), log: createLog(paths.eventLog) };
+  const guarded = guardedFetch(env, fetch);
+  const send = envProxy ? () => Promise.reject(new CliError(envProxyMessage(envProxy))) : guarded;
+  return { env, paths, out, err, now, envProxy, fetch: send, log: createLog(paths.eventLog) };
 }
 
 export function readConfig(ctx) {
   if (!existsSync(ctx.paths.configJson)) {
-    throw new CliError('没有 config.json。先复制模板：Copy-Item config.example.json config.json，再填写 qq.appId。');
+    const copy = IS_WINDOWS ? 'Copy-Item config.example.json config.json' : 'cp -n config.example.json config.json';
+    throw new CliError(`没有 config.json。先复制模板：${copy}，再填写 qq.appId。`);
   }
   return loadBusinessConfig(ctx.paths.configJson);
 }
@@ -260,12 +298,33 @@ export function forceEffectiveDryRun(ctx) {
   return true;
 }
 
+// Off Windows only. Files that hold a secret or the ledger's raw IDs: doctor fails while group or others can reach
+// them. .env is the user's; the rest are the project's, and apply narrows them.
+export function secretFiles(paths) {
+  return [paths.envFile, join(paths.cloDir, 'gateway.token'), paths.db, `${paths.db}-wal`, `${paths.db}-shm`, `${paths.db}-journal`, backupFileOf(paths.db)];
+}
+
+// Off Windows only. Files and folders that may hold an ID, a hash salt or log lines: doctor warns. config.json is
+// the user's; everything under the runtime folder is the project's, and apply narrows it.
+export function privateFiles(paths) {
+  return [paths.configJson, paths.runtime, paths.cloDir, paths.logsDir, paths.stateDir, paths.effectiveJson, paths.eventLog, paths.gatewayLog, `${paths.gatewayLog}.1`, join(paths.runtime, 'q0-salt'), join(paths.runtime, 'q0b-dm-target')];
+}
+
 export function apply(ctx, cfg, { allowLive = false } = {}) {
   const { effective, openclaw, workspace } = assertApplicable(ctx, cfg, { allowLive });
   const { paths } = ctx;
   // doctor runs before start and needs TEMP to exist: the host's plugin inspect makes a temp folder there.
-  for (const d of [paths.stateDir, paths.home, paths.workspace, paths.cloDir, paths.logsDir, paths.gatewayCwd, dirname(paths.pidFile), join(paths.runtime, 'temp')]) {
-    mkdirSync(d, { recursive: true });
+  const dirs = [paths.stateDir, paths.home, paths.workspace, paths.cloDir, paths.logsDir, paths.gatewayCwd, dirname(paths.pidFile), join(paths.runtime, 'temp')];
+  if (IS_WINDOWS) {
+    for (const d of dirs) {
+      mkdirSync(d, { recursive: true });
+    }
+  } else {
+    ensurePrivateDirs(paths.runtime, dirs);
+    // What an earlier build left 0644 under the runtime folder. .env and config.json are the user's and left alone.
+    for (const f of [...secretFiles(paths), ...privateFiles(paths)]) {
+      if (f !== paths.envFile && f !== paths.configJson) tryNarrowMode(f);
+    }
   }
   // The own runtime reads only the system prompt and effective.json. The host's workspace files and openclaw.json are
   // left as they are: a switch back to openclaw renders them again, and nothing that runs reads them meanwhile.

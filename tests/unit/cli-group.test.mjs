@@ -206,3 +206,21 @@ test('a command refused by the config it would apply writes nothing, while live 
     assert.deepEqual(effectiveOf(r), effective);
   }
 });
+
+test('a group without an owner gets a Chinese reminder that names the next command; adding the owner clears it', async () => {
+  const cfg = enabledConfig();
+  cfg.qq.allowedGroupIds = [];
+  cfg.qq.groups = {};
+  cfg.qq.owner.groupMember = {};
+  const r = root('ownerwarn', cfg);
+  const added = await clo(r, ['group', 'add', '测试群', '--id', GROUP_ID]);
+  assert.equal(added.code, 0, added.err);
+  assert.match(added.out, /提醒：qq\.groups\.测试群 还没有 owner，live 会拒绝；下一步 clo owner add 测试群 --id <成员ID>/, 'positive control: the reminder is shown');
+  assert.doesNotMatch(added.out, /has no owner|live will refuse/, 'no English left in it');
+  assert.ok(!added.out.includes(GROUP_ID), 'the reminder carries the label, not the id');
+
+  assert.equal((await clo(r, ['owner', 'add', '测试群', '--id', OWNER_ID])).code, 0);
+  const set = await clo(r, ['group', 'set', '测试群', '--interject', 'on']);
+  assert.equal(set.code, 0, set.err);
+  assert.doesNotMatch(set.out, /还没有 owner/, 'with an owner there is no reminder');
+});

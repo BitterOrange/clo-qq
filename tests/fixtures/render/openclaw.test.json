@@ -15,7 +15,8 @@
   },
   "logging": {
     "level": "silent",
-    "consoleLevel": "silent"
+    "consoleLevel": "silent",
+    "file": "C:\\fake repo\\.runtime\\logs\\host\\openclaw-YYYY-MM-DD.log"
   },
   "update": {
     "checkOnStart": false,
