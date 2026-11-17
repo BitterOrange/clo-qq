@@ -274,7 +274,12 @@
 
 2026-11-17 已观察：在用户的 Ubuntu 机器上用普通用户真的跑了一次 `bash scripts/setup.sh --runtime`（之前装的 Node 先挪开，没有删）。Node 压缩包真的从 nodejs.org 下载，校验值核对通过，解出来的 `node` 和之前装的逐字节相同；根目录和 `.runtime/pkg` 的 `npm ci` 都完成，锁文件里的版本和完整性核对通过；缺的 `.env`、`config.json` 建成了 0600。**npm 11.19.1 没有运行依赖包的安装脚本**：它报 5 个包（`openclaw`、`esbuild`、`koffi`、`protobufjs`、`@google/genai`）的安装脚本“不在 allowScripts 里”，跳过了。这和容器里一直用来测试的安装状态一样（那里也没跑这些脚本）；OpenClaw 的那个脚本读源码是清理旧版本残留的文件，全新安装用不上；esbuild、koffi 的脚本处理平台相关的二进制文件，不跑会不会影响真实运行没有查清。Windows 上 `setup.ps1` 用同一个 npm，应该同样跳过，没有在 Windows 上看过。另外 `.runtime` 原来是 775（Ubuntu 默认 umask 002），`setup.sh` 现在把 `.runtime` 本身收紧到 0700（只在离线测试里验证过）。
 
-还没做的：Q3。
+2026-11-17 已观察：在用户的 Ubuntu 机器上，两种运行时的 Q3、Q4 都走通了，都是 dry-run，没有调用模型，也没有发送。
+- openclaw：连上 QQ，收到 READY，用户确认了机器人身份（`clo ack identity`）。Gateway 只监听回环地址。宿主没有写日志文件（级别 silent）。群名单为空时，用户的一次真实 @ 在第一步被丢弃（`gate_drop`，原因 `not_admitted`）。中途断线一次（关闭码 1006），6 秒后自动恢复。采集到测试群 ID 和用户的成员 ID（各一个，原始 ID 没有出现在聊天和日志里），加进配置后采集被清空；之后用户的一次真实 @ 记成 `dry_run`/`would_at`。`stop` 之后没有留下进程，`.runtime/temp` 下留下一个 `oc-br-*` 文件夹（已知）。`/tmp/openclaw` 是一个空文件夹，在离线测试时就已经建了。
+- own：同一个配置改成 `runtime: own`，连上 QQ，READY 用户名相同，进程不监听端口。用户的一次真实 @ 记成 `dry_run`/`would_at`。`stop` 正常。own 运行时上没有单独看名单为空时的丢弃（openclaw 上看过，两种运行时用同一段 gate 代码）。
+- 每种情况只看了一条消息。
+
+还没做的：Q5（付费探测）要用户同意金额；进 live 之前还要用户做 D3、告知群友，以及第 8 步的确认。
 
 ## Ubuntu 真实测试前发现的问题（2026-11-16，还没有修）
 
