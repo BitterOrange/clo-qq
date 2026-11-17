@@ -45,7 +45,10 @@ if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || [ "$file" != "node-v$ver-linux-x64.tar.xz
   exit 1
 fi
 
-mkdir -p -- "$CLO_RT" "$CLO_REPO_RT"
+# The runtime folder holds the ledger, the Gateway token and logs: owner-only, whatever the umask. Ubuntu's default
+# umask 002 would leave it group-writable. Only this folder is narrowed; what is inside is the console's to narrow.
+( umask 077 && mkdir -p -- "$CLO_RT" "$CLO_REPO_RT" )
+chmod go-rwx -- "$CLO_RT" "$CLO_REPO_RT"
 
 # 1. Private Node, verified before extraction.
 wanted="v$ver"

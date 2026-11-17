@@ -43,7 +43,7 @@ test('versions.lock.json has a well-formed Linux x64 Node entry, and the Windows
 function toolDir(base) {
   const bin = join(base, 'bin');
   mkdirSync(bin);
-  for (const t of ['sed', 'wc', 'uname', 'sha256sum', 'tar', 'xz', 'mkdir', 'rm', 'mv', 'cp']) {
+  for (const t of ['sed', 'wc', 'uname', 'sha256sum', 'tar', 'xz', 'mkdir', 'rm', 'mv', 'cp', 'chmod']) {
     const at = ['/usr/bin', '/bin'].map((d) => join(d, t)).find((p) => existsSync(p));
     assert.ok(at, `${t} is on this machine`);
     symlinkSync(at, join(bin, t));
@@ -191,7 +191,7 @@ test('setup.sh verifies the Node it extracted against what the JSON entry says',
   assert.equal(r.run().status, 0);
 });
 
-test('setup.sh creates a missing .env and config.json owner-only, and never touches existing ones', { timeout: 120000, skip: LINUX_ONLY }, () => {
+test('setup.sh creates a missing .env and config.json owner-only, narrows .runtime, and never touches existing files', { timeout: 120000, skip: LINUX_ONLY }, () => {
   const r = fakeRepo('envfiles');
   r.placeTarball();
   const env = join(r.repo, '.env');
@@ -199,8 +199,13 @@ test('setup.sh creates a missing .env and config.json owner-only, and never touc
   // The template's own mode shows the copy's mode does not come from it: git checks it out by the umask.
   chmodSync(join(r.repo, '.env.example'), 0o644);
   assert.equal(statSync(join(r.repo, '.env.example')).mode & 0o777, 0o644, 'positive control: the template is readable by others');
+  // The runtime folders exist already, wide, as an old install or umask 002 leaves them.
+  mkdirSync(join(r.repo, '.runtime'), { recursive: true });
+  for (const d of [join(r.repo, '.runtime'), join(r.state, '.runtime')]) chmodSync(d, 0o775);
+  assert.equal(statSync(join(r.repo, '.runtime')).mode & 0o777, 0o775, 'positive control: wide before');
   const first = r.run();
   assert.equal(first.status, 0, first.stdout + first.stderr);
+  for (const d of [join(r.repo, '.runtime'), join(r.state, '.runtime')]) assert.equal(statSync(d).mode & 0o777, 0o700, d);
   assert.equal(statSync(env).mode & 0o777, 0o600);
   assert.equal(statSync(cfg).mode & 0o777, 0o600);
   assert.deepEqual(readFileSync(env), readFileSync(join(r.repo, '.env.example')));

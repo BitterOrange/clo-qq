@@ -91,7 +91,7 @@ const INVENTORY = [
   ['tests/unit/setup-sh.test.mjs', 'setup.sh stops when an installed lockfile entry differs from versions.lock.json', 'LINUX_ONLY'],
   ['tests/unit/setup-sh.test.mjs', 'setup.sh refuses a malformed or inconsistent Node entry before any download', 'LINUX_ONLY'],
   ['tests/unit/setup-sh.test.mjs', 'setup.sh verifies the Node it extracted against what the JSON entry says', 'LINUX_ONLY'],
-  ['tests/unit/setup-sh.test.mjs', 'setup.sh creates a missing .env and config.json owner-only, and never touches existing ones', 'LINUX_ONLY'],
+  ['tests/unit/setup-sh.test.mjs', 'setup.sh creates a missing .env and config.json owner-only, narrows .runtime, and never touches existing files', 'LINUX_ONLY'],
   ['tests/unit/private-modes.test.mjs', 'owner-only modes off Windows', 'NOT_WINDOWS'],
   ['tests/unit/qq-send-probe.test.mjs', 'an existing wider result file is narrowed to 0600 off Windows, and keeps its earlier lines', 'NOT_WINDOWS'],
   ['tests/unit/provider-golden.test.mjs', 'the OpenRouter adapter turnBody is byte-identical to the goldens', "!existsSync(ADAPTER) && 'openrouterAdapter.js is not there yet'"],

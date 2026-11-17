@@ -272,7 +272,9 @@
 
 同一天用户定了期限余量的修法：所有被动窗口和回合期限的检查都留 1 秒（`exit.js` 的 `SEND_MARGIN_MS`），离期限不到 1 秒就不再开始发送，等待也要在期限前 1 秒结束；每一段在真正 POST 之前再查一次窗口，过了就把这一段记成 `aborted`，不发。起因是 `tests/e2e-own/dispatch-stalled.test.mjs` 在用户的 Ubuntu 机器上偶尔失败：检查时还剩几毫秒，失败固定句在窗口之后才发出去。`turn.js` 没改：期限到了才超时的回合仍记 `failed`，它的失败固定句会被这 1 秒挡住。只在离线测试里验证过（`tests/unit/qq-passive.test.mjs` 里 1 秒边界两侧各一个、POST 之前再查一次的测试；去掉 POST 前那次检查，这个测试会失败）。代价：理论上离窗口结束不到 1 秒时本来还来得及的回复也不发了。
 
-还没做的：在 Ubuntu 上用普通用户真的跑一次 `bash scripts/setup.sh --runtime`（第一次真的下载 Node、核对校验值、跑 `npm ci`，包括 OpenClaw 的安装脚本）；处理下面“Ubuntu 真实测试前发现的问题”里的项，至少决定哪些先做；然后才开始 Q3。
+2026-11-17 已观察：在用户的 Ubuntu 机器上用普通用户真的跑了一次 `bash scripts/setup.sh --runtime`（之前装的 Node 先挪开，没有删）。Node 压缩包真的从 nodejs.org 下载，校验值核对通过，解出来的 `node` 和之前装的逐字节相同；根目录和 `.runtime/pkg` 的 `npm ci` 都完成，锁文件里的版本和完整性核对通过；缺的 `.env`、`config.json` 建成了 0600。**npm 11.19.1 没有运行依赖包的安装脚本**：它报 5 个包（`openclaw`、`esbuild`、`koffi`、`protobufjs`、`@google/genai`）的安装脚本“不在 allowScripts 里”，跳过了。这和容器里一直用来测试的安装状态一样（那里也没跑这些脚本）；OpenClaw 的那个脚本读源码是清理旧版本残留的文件，全新安装用不上；esbuild、koffi 的脚本处理平台相关的二进制文件，不跑会不会影响真实运行没有查清。Windows 上 `setup.ps1` 用同一个 npm，应该同样跳过，没有在 Windows 上看过。另外 `.runtime` 原来是 775（Ubuntu 默认 umask 002），`setup.sh` 现在把 `.runtime` 本身收紧到 0700（只在离线测试里验证过）。
+
+还没做的：Q3。
 
 ## Ubuntu 真实测试前发现的问题（2026-11-16，还没有修）
 
