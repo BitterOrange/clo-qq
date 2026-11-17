@@ -104,38 +104,6 @@ jobs:
           git ls-files --eol CLAUDE.md persona scripts/setup.sh
       - name: Install the private Node and the locked packages
         run: ./scripts/setup.ps1 -Runtime
-      # The project and lookups are slow on this runner: the first run took minutes for steps that take seconds on
-      # Linux. This shows what one process lookup (powershell.exe with Get-CimInstance, as the console does) costs.
-      - name: Time a process lookup
-        continue-on-error: true
-        run: |
-          foreach ($i in 1..3) {
-            $t = Measure-Command { & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=$PID' | Out-Null" }
-            "lookup ${i}: $([int]$t.TotalMilliseconds) ms"
-          }
-          # The same lookup with the variables the console passes on (OS names, PSModulePath, TEMP, TMP, USERPROFILE),
-          # from a full environment and from the one tests/run-files.mjs builds, which has no PSModulePath.
-          $probe = @'
-          const { spawnSync } = await import('node:child_process');
-          const exe = `${process.env.SystemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
-          const script = `$p=Get-CimInstance Win32_Process -Filter "ProcessId=${process.pid}";if($p){$p.CommandLine}`;
-          const pick = (names) => Object.fromEntries(names.filter((k) => process.env[k]).map((k) => [k, process.env[k]]));
-          const os = ['SystemRoot', 'windir', 'ComSpec', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS', 'TEMP', 'TMP', 'USERPROFILE'];
-          const sets = {
-            'console from a full shell': pick([...os, 'PSModulePath']),
-            'console under run-files (no PSModulePath)': pick(os),
-            'no PSModulePath, plus LOCALAPPDATA and APPDATA': pick([...os, 'LOCALAPPDATA', 'APPDATA']),
-            'no PSModulePath, plus ProgramFiles and ProgramData': pick([...os, 'ProgramFiles', 'ProgramData', 'ProgramW6432', 'SystemDrive']),
-            'the whole environment': { ...process.env },
-          };
-          for (const [name, env] of Object.entries(sets)) {
-            const t = Date.now();
-            const r = spawnSync(exe, ['-NoProfile', '-NonInteractive', '-Command', script], { env, encoding: 'utf8', windowsHide: true, timeout: 30000 });
-            console.log(`${name}: ${r.error ? r.error.code : `exit ${r.status}`}, ${Date.now() - t} ms`);
-          }
-          '@
-          Set-Content -Path "$env:RUNNER_TEMP\lookup-probe.mjs" -Value $probe -Encoding utf8
-          .\.runtime\node\node.exe "$env:RUNNER_TEMP\lookup-probe.mjs"
       - name: Run the test files one at a time
         # The checkout is on D: and the image's temp folder on C:. Some tests hard-link the private Node into a temp
         # folder, which cannot cross volumes, so temp goes on the same volume, as it usually is on a user's machine.

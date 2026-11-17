@@ -108,6 +108,9 @@ export function testEnv(root, extra = {}) {
   return {
     CLO_TEST_ROOT: root,
     SystemRoot: process.env.SystemRoot ?? 'C:\\Windows',
+    // Every Windows shell has it, and the console passes it to powershell.exe for process lookups. Without it Windows
+    // PowerShell searches for the CIM module the slow way: 18 to 30 s a lookup on the CI runner, against 0.3 s.
+    ...(process.env.PSModulePath ? { PSModulePath: process.env.PSModulePath } : {}),
     ...extra,
   };
 }

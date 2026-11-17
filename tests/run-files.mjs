@@ -72,7 +72,8 @@ function testFiles(paths) {
 
 // The environment each file gets. Off Windows: a PATH with the private Node first and the system folders the tests'
 // own helpers use (bash, tar, sha256sum), plus HOME, TMPDIR and a UTF-8 locale. On Windows: the OS variables
-// Node and powershell.exe need, and a PATH of the private Node, System32 and Windows PowerShell.
+// Node and powershell.exe need, and a PATH of the private Node, System32 and Windows PowerShell. PSModulePath is
+// among them: without it each process lookup through powershell.exe took 18 to 30 s on the CI runner, not 0.3 s.
 function childEnv(provider) {
   const env = {};
   const copy = (names) => {
@@ -81,7 +82,7 @@ function childEnv(provider) {
     }
   };
   if (IS_WINDOWS) {
-    copy(['SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS', 'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)', 'CommonProgramFiles']);
+    copy(['SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS', 'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)', 'CommonProgramFiles', 'PSModulePath']);
     const systemRoot = process.env.SystemRoot ?? 'C:\\Windows';
     env.PATH = [join(ROOT, '.runtime', 'node'), join(systemRoot, 'System32'), systemRoot, join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0')].join(';');
   } else {
