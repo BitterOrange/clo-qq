@@ -152,7 +152,7 @@
 | 拒答和审核 403 | F13 不变。402 和 Key 限额（limit_source）立即按余额或 Key 限额暂停，不计入连败 |
 | `/stop` 和同一秒的消息 | 保持现状：同一秒不算更新，跳过，带危险词的除外。改由 gate 明确实现 |
 | 不是命令的斜杠文本 | 只有列出的 owner 命令算命令，其他斜杠文本按普通文字走正常触发 |
-| 搜索 | 启用搜索时再定。倾向：判定返回 need_search 时，由 gate 先直接调 perplexity/sonar-pro，把结果当作不可信资料交给主回复，引用照样过出口内容策略 |
+| 搜索 | 已定（2026-11-17）：gate 直接调 perplexity/sonar-pro，把结果当作不可信资料交给主回复，引用照样过出口内容策略，只在 own 运行时。细节见下面“用户定的（2026-11-17，搜索）”。原来写的是“启用搜索时再定”加这条倾向 |
 | acorn | 作为测试用的固定版本 devDependency 加入，锁文件带校验值，单出口的静态检查要用它 |
 | Linux 和 VPS | 以后单独做，在 Windows 切换之后。新运行时本身不依赖 PowerShell |
 | 真实验收的花费 | Q3、Q4 $0；Q5 付费探测上限约 $0.10，按下面“用户定的（2026-11-06，Q5 和费用）”的两回合计划跑，计划最坏 $0.094144，开始前另外确认金额（2026-11-07 按 $0.10 跑过一次，实际 $0.0338）；Q6、Q7 测试群上限约 $0.40。只用现有测试群 |
@@ -331,6 +331,40 @@
 | 控制台遇到 Node 的环境代理 | 不是 Windows 时，控制台启动时带了 `NODE_USE_ENV_PROXY`（除 `0` 和空值以外的任何值都算，24.22.2 实际只认 `1`）或 `--use-env-proxy`（命令行或 `NODE_OPTIONS` 里，去掉引号后提到 `use-env-proxy` 的都算，包括 `=true`、`=false`、下划线写法）就拒绝联网。只写了 `--no-use-env-proxy` 不算；它和打开的写法同时出现时照样拒绝，没有细分。只设了 `HTTP_PROXY` 这类变量时只提醒，不拒绝，也不从进程环境里删 | 只看启动时的情况，因为 Node 只在启动时读。拒绝而不是删：删了也撤不掉（见上一节）。`NODE_OPTIONS` 里的 `--require`、`--import` 能加载任意代码，直接运行时控制台不查，只有 `clo.sh` 清掉它。Windows 上不拒绝，Windows 上直接运行时会不会走代理没有试过 |
 | 故意没做的 | Q0、Q5 探测脚本的 shell 版本；这个容器里没有运行的 npm 安装脚本怎么处理；SIGTERM 停止；`doctor` 在启动失败时打印的“退出码 timeout”；`CMDLINE_HINT` 的措辞（Linux 上“用更高权限启动”不一定是原因）；Linux 上的内存和时长；任何真实 QQ、OpenRouter、Anthropic 调用 | 这些要么改了会动 Windows 的输出，要么属于 Linux 部署，等用户决定做 Linux 时再做 |
 | Linux 上的几处提示措辞 | 没有 `config.json` 时说 `cp -n config.example.json config.json`；own 运行时 `mode live` 的 `gateway_key`、`reconciled` 说“可洛进程”；群没有 owner 的提醒改成中文，带下一步的 `clo owner add <名> --id <成员ID>`。README 写项目路径最好不超过约 60 字节、只用 ASCII | 都是开发时选的说法。约 60 字节的界限来自走查时看到的约 62 字节，没有在真实部署上量过 |
+
+## 用户定的（2026-11-17，搜索）
+
+用户同意搜索规划里的全部推荐答案（“按推荐”），并决定先只做 own 运行时。表里的 D0 到 D7 是这次搜索规划里的编号，和下面“待定（决策点 D）”、`CLAUDE.md` 里的 D2、D3、D5 不是一回事。用户原话里的“D5 走甲”按规划的推荐（仍搜）记。
+
+现状（2026-11-17）：只写进了配置、生成的运行配置、启动时的环境和 `doctor`（见下一节），离线测试通过。搜索请求、账本、判定、gate、来源行、控制台命令都还没有写；任何真实请求都没有发过。搜索打开时 `clo mode live` 一律拒绝（`search_rules`），直到第 4 项的真实探测做完、规则写进来。
+
+| 项目 | 决定 |
+|---|---|
+| D0 搜索的路径 | 改写 `CLAUDE.md` §6“默认搜索方案”：own 运行时的 gate 在主模型之前直接调 OpenRouter 上的 `perplexity/sonar-pro`，用单独的搜索 Key（`CLO_SEARCH_API_KEY`），不经过 `web_search` 工具和 `@openclaw/perplexity-plugin`。主模型的请求里仍然没有工具。`CLAUDE.md` §7.1–7.5 不动 |
+| 先做哪个运行时 | 只做 own。openclaw 运行时这一版没有搜索：`searchProvider` 不是 `none` 时配置校验、`clo apply` 和 `doctor` 都拒绝，并说明搜索只在 own 运行时 |
+| D1 真实 @ 怎么知道要不要搜 | 每条真实 @ 和回复可洛，在搜索打开的群里多买一次 Haiku 判定，只问要不要搜和搜索词。搜索额度用完或搜索暂停时不买。这次判定不决定回不回，失败就当不搜 |
+| D2 来源怎么进回复 | 程序在模型文字后面追加一行“来源：…”，只用接口实际返回的来源，QQ 里只写名称（`qq.urlMode:names`） |
+| D3 搜索 Key 的对账 | 轻方案：搜索 Key 的每日限额是硬上限；本地有自己的层级和次数；按 UTC 日拿 `/key` 的 `usage_daily` 和当天的搜索行比；`clo.db` 不迁移，仍是第 2 版。未结算的搜索行到期按预留额结清，只多算不少算 |
+| D4 插话搜不搜 | 第一版不搜。危险路线也不搜 |
+| D5 对话接口是 Anthropic 时 | 仍搜，经 OpenRouter 到 Perplexity，用搜索 Key 自己的日限额作硬上限。告知草稿要写清：对话直连 Anthropic，搜索经 OpenRouter |
+| D6 “这个我不查”谁来说 | 主模型说：程序把“拒绝”状态交给它，问题里能答的部分照常答 |
+| D7 启用的范围 | 全局开关算一次模型变更：清 D3 和每个群的“已告知”，启用 QQ 时要 `--qq-platform-notified`。再加每群开关，先只在测试群开 |
+| 金额 | 搜索 Key 的每日限额和付费探测的上限还没定。配置要求写明 `budget.searchKeyDailyLimitUsd`，没写就不能打开搜索；不替用户填数 |
+
+## 开发时定的，用户还没有确认（2026-11-17，搜索）
+
+都只在离线测试里验证过。用户不同意的话，按用户的决定改代码。实现合同是 `docs/search-contract.md`。
+
+| 项目 | 现在的值或行为 | 说明 |
+|---|---|---|
+| 配置的形状 | `searchProvider` 取 `none` 或 `openrouter-sonar`。打开时还要 `acks.search`（`{provider, at}`，以后由 `clo search enable` 写，手改 `searchProvider` 不够）和正数的 `budget.searchKeyDailyLimitUsd`。可选的 `search` 块：`perAnswer`、`perDay`、`maxTokens`、`resultMaxChars`、`queryMaxChars`，另有 `timeouts.searchMs` 和每群的 `qq.groups[id].search` | 模型不能配置，换模型就是模型变更 |
+| 次数和长度的上限 | 每次回答 2 次、每天 10 次，配置只能调低。默认和上限：`maxTokens` 600（上限 1000），`resultMaxChars` 1500（上限 3000），`queryMaxChars` 80（上限 80），`searchMs` 20000（上限 30000） | 任务书写的是“每次回答最多 2 次，每天最多 10 次”，这里理解成上限，允许更严。其余数字是开发时选的，没有真实数据支撑 |
+| 生成的运行配置 | 搜索关着时 `effective.json` 一个字节都不变：不写 `search` 块、每群的 `search`、`searchKeyDailyLimitUsd`、`searchMs`。打开时才写，读取方发现不认识的搜索块，或搜索块出现在 openclaw 运行时上，就当作没有配置 | 和 `apiProvider` 一样 |
+| 搜索的地址 | 默认 `https://openrouter.ai/api/v1`。测试模式可以用 `search.baseUrl` 指到本机；没写时跟着 OpenRouter 的测试地址 | 正式运行不能改地址 |
+| 子进程里的名字 | 搜索 Key 只在搜索打开时交给可洛进程，名字是 `CLO_SEARCH_KEY`；`.env` 里的名字 `CLO_SEARCH_API_KEY` 照旧不许进任何子进程，Gateway 两个名字都拿不到 | 它不算模型 Key，可洛进程里仍然恰好一个模型 Key |
+| 和对话 Key 相同 | live 下搜索打开时，`clo start` 和 `doctor` 发现搜索 Key 和 `CLO_CHAT_API_KEY` 是同一个就拒绝，不打印值 | 和探测 Key 的比较放在以后的 `clo mode live` 检查里，`clo start` 不读探测 Key |
+| live 的拦截 | 新增 `search_rules`：搜索打开时 `clo mode live` 拒绝，live 下手改打开搜索时 `clo apply` 也拒绝。常量 `SEARCH_RULES_RECORDED` 现在是 false，真实探测确认 Sonar 的字段和价格、规则写进来之后才改 | 照 `provider_rules` 的写法 |
+| `doctor` | openclaw 运行时保留 `search_off`，提示搜索只在 own 运行时。own 运行时换成 `search_config`：可洛进程的环境里有搜索 Key 的名字，当且仅当搜索打开，并且 `effective.json` 和 `config.json` 一致 | |
 
 ## 待定（决策点 D）
 

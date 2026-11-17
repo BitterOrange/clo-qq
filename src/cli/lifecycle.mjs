@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { activeKindOf } from '../clo-plugin/lib/core/config.js';
 import { CHILD_KEY, DEFAULT_BASE, KEY_ENV } from '../clo-plugin/lib/core/providers/registry.js';
+import { SEARCH_CHILD_KEY, SEARCH_KEY_ENV, searchOnInConfig } from '../clo-plugin/lib/core/providers/searchRegistry.js';
 import { ensurePrivateDirs, openAppendPrivate, tryNarrowMode } from '../clo-plugin/lib/core/private-fs.js';
 import { writeAtomic } from '../clo-plugin/lib/core/render.js';
 import { CliError, isLoopback, isTestMode } from './common.mjs';
@@ -19,8 +20,9 @@ export const ENV_FILE_KEYS = Object.keys(CHILD_ENV_NAMES);
 // The model Keys of the other provider kinds. Read from .env, but never mapped by CHILD_ENV_NAMES: only the own
 // runtime's env builder passes one, the active kind's, under its child name. The Gateway never gets any of them.
 export const PROVIDER_ENV_FILE_KEYS = Object.freeze(Object.values(KEY_ENV).filter((k) => !ENV_FILE_KEYS.includes(k)));
-// Everything start reads from .env.
-const READ_ENV_KEYS = [...ENV_FILE_KEYS, ...PROVIDER_ENV_FILE_KEYS];
+// Everything start reads from .env. The search Key too, though only the own runtime's env builder passes it, and only
+// while search is on.
+const READ_ENV_KEYS = [...ENV_FILE_KEYS, ...PROVIDER_ENV_FILE_KEYS, SEARCH_KEY_ENV];
 // Old .env names. Never read as a key: finding one only changes what the refusal says.
 export const RENAMED_ENV_KEYS = { OPENROUTER_API_KEY: 'CLO_CHAT_API_KEY', CLO_SEARCH_OPENROUTER_KEY: 'CLO_SEARCH_API_KEY' };
 const OS_ENV_KEYS = ['SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS'];
@@ -181,8 +183,10 @@ export function ownEntry(paths, env) {
 // The Gateway's env, minus what only the host reads: its OPENCLAW_* settings and the control-port token. On OpenRouter
 // the key keeps the name the Gateway gets. kind is the provider kind config.json runs on: exactly one model Key
 // reaches the bot, that kind's, under CHILD_KEY[kind]. An unknown or missing kind gets none.
+// search: whether search is on in config.json. Only then does the search Key reach the bot, as SEARCH_CHILD_KEY; it is
+// never a model Key and never stands in for one.
 // CLO_EFFECTIVE_PATH tells the bot which effective.json to read.
-export function ownEnv(paths, parentEnv, { secrets = {}, kind = 'openrouter' } = {}) {
+export function ownEnv(paths, parentEnv, { secrets = {}, kind = 'openrouter', search = false } = {}) {
   const env = gatewayEnv(paths, parentEnv, { secrets });
   for (const k of Object.keys(env)) {
     if (k.startsWith('OPENCLAW_')) delete env[k];
@@ -192,14 +196,15 @@ export function ownEnv(paths, parentEnv, { secrets = {}, kind = 'openrouter' } =
     const fileName = Object.hasOwn(KEY_ENV, kind) ? KEY_ENV[kind] : null;
     if (fileName && secrets[fileName]) env[CHILD_KEY[kind]] = secrets[fileName];
   }
+  if (search === true && secrets[SEARCH_KEY_ENV]) env[SEARCH_CHILD_KEY] = secrets[SEARCH_KEY_ENV];
   env.CLO_EFFECTIVE_PATH = paths.effectiveJson;
   return env;
 }
 
 // Same as gatewayEnvForCheck, for the own runtime and the kind it would run on.
-export function ownEnvForCheck(paths, parentEnv, { kind = 'openrouter' } = {}) {
+export function ownEnvForCheck(paths, parentEnv, { kind = 'openrouter', search = false } = {}) {
   const secrets = Object.fromEntries(READ_ENV_KEYS.map((k) => [k, 'check-only']));
-  return ownEnv(paths, parentEnv, { secrets, kind });
+  return ownEnv(paths, parentEnv, { secrets, kind, search });
 }
 
 // Node flags the bot must never get: a listening debugger, or a proxy taken from the environment.
@@ -226,8 +231,8 @@ export function inspectArgs(paths, env) {
 // For every child. ANTHROPIC_API_KEY is the name SDKs read on their own, so it is never set for anyone; the bot gets its
 // Anthropic Key as CLO_PROVIDER_API_KEY.
 const FORBIDDEN_CHILD_ENV = /proxy|^OPENCLAW_LOG_LEVEL$|^PERPLEXITY_API_KEY$|^CLO_CHAT_API_KEY$|^CLO_SEARCH_API_KEY$|^CLO_SEARCH_OPENROUTER_KEY$|^CLO_TEST_API_KEY$|^CLO_ANTHROPIC_API_KEY$|^CLO_TEST_ANTHROPIC_API_KEY$|^ANTHROPIC_API_KEY$|^NODE_OPTIONS$|^NODE_EXTRA_CA_CERTS$/i;
-// The Gateway runs on OpenRouter only, so the other kinds' child names never belong in its env.
-const FORBIDDEN_GATEWAY_ENV = new Set(Object.values(CHILD_KEY).filter((k) => k !== CHILD_KEY.openrouter));
+// The Gateway runs on OpenRouter only, so the other kinds' child names never belong in its env. It has no search either.
+const FORBIDDEN_GATEWAY_ENV = new Set([...Object.values(CHILD_KEY).filter((k) => k !== CHILD_KEY.openrouter), SEARCH_CHILD_KEY]);
 
 // Names only. Used by doctor against gatewayEnvForCheck.
 export function ensureGatewayEnvClean(childEnv) {
@@ -356,6 +361,11 @@ export function requireSecrets(cfg, secrets, { renamed = [] } = {}) {
     const kind = activeKindOf(cfg);
     if (!kind) throw new CliError('config.json 没有指定能用的模型接口（providers、activeProvider）。');
     if (!secrets[KEY_ENV[kind]]) missing.push(KEY_ENV[kind]);
+    // Search spends on its own Key, whose daily limit is its hard cap. The same Key as the chat would mix the two.
+    if (searchOnInConfig(cfg)) {
+      if (!secrets[SEARCH_KEY_ENV]) missing.push(SEARCH_KEY_ENV);
+      else if (secrets[SEARCH_KEY_ENV] === secrets[KEY_ENV.openrouter]) throw new CliError(`.env 的 ${SEARCH_KEY_ENV} 和 ${KEY_ENV.openrouter} 是同一个 Key。搜索要单独建一个 Key，设好它自己的每日限额。`);
+    }
   }
   if (missing.length) throw new CliError(`.env 缺少：${missing.join('、')}。${renamedKeyHint(renamed, missing)}`);
 }
@@ -398,7 +408,7 @@ export async function startOwn(ctx, cfg, { secrets, lookup = processInfo }) {
   if (!existsSync(ownEntry(paths, env))) throw new CliError('没有 src/bot/main.mjs，不能用 own 运行时启动。');
   const kind = activeKindOf(cfg);
   if (!kind) throw new CliError('config.json 没有指定能用的模型接口，没有启动。');
-  return spawnRecorded(ctx, { runtime: 'own', args, childEnv: ownEnv(paths, env, { secrets, kind }), port: null, lookup });
+  return spawnRecorded(ctx, { runtime: 'own', args, childEnv: ownEnv(paths, env, { secrets, kind, search: searchOnInConfig(cfg) }), port: null, lookup });
 }
 
 export function startRuntime(ctx, cfg, opts) {

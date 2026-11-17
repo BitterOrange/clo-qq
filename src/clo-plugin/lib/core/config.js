@@ -8,6 +8,10 @@ import {
   ANTHROPIC_EFFORTS, hardCapAckProblems, KEY_ENV, MODEL_ID_RULES, PROVIDER_ENTRY_FIELDS, PROVIDER_KINDS, PROVIDER_NAME_RE,
   providerOfConfig, providerOfEffective, providerRulesRecorded,
 } from './providers/registry.js';
+import {
+  SEARCH_BLOCK_FIELDS, SEARCH_BLOCK_LIMITS, SEARCH_CEILINGS, SEARCH_DEFAULTS, SEARCH_MODEL, SEARCH_OFF, SEARCH_PROVIDERS, SEARCH_RUNTIMES,
+  searchOnInConfig, searchProviderOf, searchRulesRecorded,
+} from './providers/searchRegistry.js';
 
 export { providerOfConfig, providerOfEffective };
 
@@ -166,7 +170,7 @@ export function validateBusinessConfig(cfg, { env = process.env } = {}) {
   validateModelBlock(cfg.decisionModel, 'decisionModel', err);
   if (cfg.decisionModel?.id === 'opus-latest') err('decisionModel.id', 'the selector is for the primary model only');
 
-  if (cfg.searchProvider !== 'none') err('searchProvider', 'must be none in this build');
+  validateSearch(cfg, err, testMode);
   if (!isObj(cfg.timeouts) || !isPos(cfg.timeouts.decisionMs) || !isPos(cfg.timeouts.turnSeconds)) err('timeouts', 'decisionMs and turnSeconds must be positive');
 
   if (!Array.isArray(cfg.names) || cfg.names.length === 0 || !cfg.names.every(isStr)) err('names', 'must be a non-empty list of strings');
@@ -229,6 +233,9 @@ export function validateBusinessConfig(cfg, { env = process.env } = {}) {
         }
         // Optional: a config written before this switch means off.
         if (g.displayNames !== undefined && typeof g.displayNames !== 'boolean') err(`qq.groups.${g.label}.displayNames`, 'must be a boolean');
+        // Optional, off when left out. It counts only while search is on globally.
+        if (g.search !== undefined && typeof g.search !== 'boolean') err(`qq.groups.${g.label}.search`, 'must be a boolean');
+        else if (g.search === true && !searchOnInConfig(cfg)) warnings.push({ path: `qq.groups.${g.label}.search`, message: '搜索没有全局打开，这个群的搜索开关现在不起作用' });
         if (g.cooldownMinutes !== undefined && !isNonNeg(g.cooldownMinutes)) err(`qq.groups.${g.label}.cooldownMinutes`, 'must be non-negative');
         for (const f of ['perHour', 'perDay']) {
           if (g[f] !== undefined && !isPosInt(g[f])) err(`qq.groups.${g.label}.${f}`, 'must be a positive integer');
@@ -270,6 +277,38 @@ export function validateBusinessConfig(cfg, { env = process.env } = {}) {
   validateProviders(cfg, err, testMode);
 
   return { ok: errors.length === 0, errors, warnings };
+}
+
+// Search (docs/search-contract.md). Off by default and on the OpenClaw runtime always. On, it needs the console's
+// record of turning it on (acks.search, written by the same command that clears D3 and every group's notice) and the
+// search Key's daily limit, which is its only hard cap. The optional limits can only be lowered.
+function validateSearch(cfg, err, testMode) {
+  const provider = searchProviderOf(cfg);
+  if (cfg.searchProvider === undefined || !SEARCH_PROVIDERS.includes(cfg.searchProvider)) err('searchProvider', `must be one of ${SEARCH_PROVIDERS.join(', ')}`);
+  const block = cfg.search;
+  if (block !== undefined) {
+    if (!isObj(block)) {
+      err('search', 'must be an object');
+    } else {
+      for (const f of Object.keys(block)) {
+        if (!SEARCH_BLOCK_FIELDS.includes(f)) err(`search.${f}`, `unknown field; allowed: ${SEARCH_BLOCK_FIELDS.join(', ')}`);
+      }
+      for (const f of SEARCH_BLOCK_LIMITS) {
+        if (block[f] !== undefined && !(isPosInt(block[f]) && block[f] <= SEARCH_CEILINGS[f])) err(`search.${f}`, `must be an integer from 1 to ${SEARCH_CEILINGS[f]}`);
+      }
+      if (block.baseUrl !== undefined && !(testMode && isLoopbackUrl(block.baseUrl))) err('search.baseUrl', 'allowed only in test mode, on loopback');
+    }
+  }
+  const ms = cfg.timeouts?.searchMs;
+  if (ms !== undefined && !(isPosInt(ms) && ms <= SEARCH_CEILINGS.searchMs)) err('timeouts.searchMs', `must be an integer from 1 to ${SEARCH_CEILINGS.searchMs}`);
+  const limit = cfg.budget?.searchKeyDailyLimitUsd;
+  if (limit !== undefined && !isPos(limit)) err('budget.searchKeyDailyLimitUsd', 'must be a positive number');
+  if (!searchOnInConfig(cfg) || !SEARCH_PROVIDERS.includes(provider)) return;
+  if (!SEARCH_RUNTIMES.includes(runtimeOf(cfg))) err('searchProvider', 'search runs on the own runtime only; the OpenClaw runtime has no search in this build');
+  // Only `clo search enable` writes both, so search turned on by editing searchProvider is refused here.
+  const ack = cfg.acks?.search;
+  if (!(isObj(ack) && ack.provider === provider && isStr(ack.at))) err('acks.search', 'must name searchProvider; turn search on with clo search enable');
+  if (limit === undefined) err('budget.searchKeyDailyLimitUsd', "required while search is on: the search Key's daily limit on OpenRouter, as set there");
 }
 
 // Fields that would make one provider stand in for another. Nothing here fails over, so they are refused by name.
@@ -476,7 +515,23 @@ export function buildEffective(cfg, { paths, modelsLock = null, env = process.en
   // Only the own runtime with a providers block gets the field, so every other effective file stays as it was.
   const apiProvider = apiProviderOf(cfg);
   if (apiProvider) effective.apiProvider = apiProvider;
+  // Only with search on, so every effective file written with it off stays as it was.
+  if (searchOnInConfig(cfg)) {
+    effective.search = searchOf(cfg);
+    effective.budget.searchKeyDailyLimitUsd = b.searchKeyDailyLimitUsd;
+    for (const [id, g] of Object.entries(cfg.qq.groups)) groups[id].search = g.search === true;
+  }
   return effective;
+}
+
+// The effective search block: the provider, its one model, where it is sent, and the limits with their defaults.
+function searchOf(cfg) {
+  const block = isObj(cfg.search) ? cfg.search : {};
+  const provider = searchProviderOf(cfg);
+  const out = { provider, model: SEARCH_MODEL[provider], baseUrl: block.baseUrl ?? openrouterBaseOf(cfg) };
+  for (const f of SEARCH_BLOCK_LIMITS) out[f] = block[f] ?? SEARCH_DEFAULTS[f];
+  out.searchMs = cfg.timeouts.searchMs ?? SEARCH_DEFAULTS.searchMs;
+  return out;
 }
 
 const ownWithProviders = (cfg) => runtimeOf(cfg) === 'own' && cfg.providers !== undefined;
@@ -550,6 +605,8 @@ function isEffectiveShape(e) {
   // A runtime or a provider kind this build does not know reads as no config at all, so nothing runs on a guess.
   return isObj(e) && e.version === 1 && (e.mode === 'dry-run' || e.mode === 'live') && (e.runtime === undefined || RUNTIMES.includes(e.runtime))
     && (e.apiProvider === undefined || (isObj(e.apiProvider) && PROVIDER_KINDS.includes(e.apiProvider.kind)))
+    // A search block this build does not know, or one on a runtime without search, reads the same way.
+    && (e.search === undefined || (isObj(e.search) && SEARCH_PROVIDERS.includes(e.search.provider) && e.search.provider !== SEARCH_OFF && SEARCH_RUNTIMES.includes(runtimeOf(e))))
     && isObj(e.qq) && isObj(e.qq.groups) && isObj(e.budget) && isObj(e.limits) && isObj(e.window) && isObj(e.paths);
 }
 
@@ -588,6 +645,8 @@ export function liveConfigProblems(cfg) {
   if (!(allowed.length > 0 && allowed.every((id) => groups[id]?.noticeGiven === true))) failed.push('notice');
   if (cfg?.acks?.q0Recorded !== true) failed.push('q0');
   if (!hasText(cfg?.acks?.d3)) failed.push('d3');
+  // Search turned on by hand while live would spend before its rules are recorded.
+  if (searchOnInConfig(cfg) && !searchRulesRecorded()) failed.push('search_rules');
   return failed;
 }
 
@@ -599,8 +658,9 @@ export function liveConfigProblems(cfg) {
 //   key_valid: facts.keyValid is true (checkAnthropicModels passed for both locked ids);
 //   provider_rules: facts.providerRulesRecorded is true and the registry says the rules are recorded for the kind.
 // The provider comes from config.json itself, never from a fact. A config that names no usable one fails 'provider'.
-// rulesRecorded is the registry's, and only a test passes another.
-export function livePreconditions(cfg, facts = {}, { rulesRecorded = providerRulesRecorded } = {}) {
+// rulesRecorded is the registry's, and only a test passes another. With search on, search_rules needs the search
+// registry's record (searchRules, which only a test replaces), so live is refused until the probe's rules have landed.
+export function livePreconditions(cfg, facts = {}, { rulesRecorded = providerRulesRecorded, searchRules = searchRulesRecorded } = {}) {
   const provider = providerOfConfig(cfg);
   const failed = [];
   const check = (code, ok) => { if (!ok) failed.push(code); };
@@ -643,7 +703,8 @@ export function livePreconditions(cfg, facts = {}, { rulesRecorded = providerRul
   check('numbers', noLocalNumbers(cfg?.contentPolicy?.crisis?.localNumbers));
   check('doctor', facts.doctorOk === true);
   const entryUrls = isObj(cfg?.providers) ? Object.values(cfg.providers).map((e) => (isObj(e) ? e.baseUrl : undefined)) : [];
-  const urls = [qq.apiBaseUrl, qq.tokenBaseUrl, cfg?.openrouter?.baseUrl, ...entryUrls].filter((u) => u !== undefined && u !== '');
+  if (searchOnInConfig(cfg)) check('search_rules', searchRules() === true);
+  const urls = [qq.apiBaseUrl, qq.tokenBaseUrl, cfg?.openrouter?.baseUrl, cfg?.search?.baseUrl, ...entryUrls].filter((u) => u !== undefined && u !== '');
   check('base_urls', urls.length === 0 || testMode);
   check('no_paid_pause', !facts.paidPaused);
   // Holds refuse an unlocked price anyway, so this only gives a clearer refusal at the console.

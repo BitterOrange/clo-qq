@@ -410,7 +410,8 @@ test('own: a fresh install passes with no openclaw.json, runs none of the host c
   assert.deepEqual(report.failed, [], formatDoctor(report));
   assert.equal(report.runtime, 'own');
   for (const id of HOST_ONLY) assert.ok(!ids(report).includes(id), id);
-  for (const id of [...OWN_ONLY, 'effective_runtime', 'lock_versions', 'private_node', 'claude_md_baseline', 'forbidden_plugins', 'dm_closed', 'search_off', 'db_version', 'live_gate']) assert.ok(ids(report).includes(id), id);
+  for (const id of [...OWN_ONLY, 'effective_runtime', 'lock_versions', 'private_node', 'claude_md_baseline', 'forbidden_plugins', 'dm_closed', 'search_config', 'db_version', 'live_gate']) assert.ok(ids(report).includes(id), id);
+  assert.ok(!ids(report).includes('search_off'), 'the own runtime checks search its own way');
 
   // Positive control: the same install switched to openclaw needs the host config it does not have.
   const cfgFile = join(root, 'config.json');
@@ -419,6 +420,57 @@ test('own: a fresh install passes with no openclaw.json, runs none of the host c
   assert.ok(failedIds(host).includes('openclaw_json'), formatDoctor(host));
   assert.ok(failedIds(host).includes('effective_runtime'), 'effective.json still says own');
   for (const id of OWN_ONLY) assert.ok(!ids(host).includes(id), id);
+  assert.ok(ids(host).includes('search_off') && !ids(host).includes('search_config'), 'the host keeps search_off');
+});
+
+// What `clo search enable` will write: the switch, its record, and the search Key's daily limit.
+function searchOn(cfg) {
+  cfg.searchProvider = 'openrouter-sonar';
+  cfg.acks = { ...cfg.acks, search: { provider: 'openrouter-sonar', at: '2026-11-17T00:00:00.000Z' } };
+  cfg.budget = { ...cfg.budget, searchKeyDailyLimitUsd: 0.5 };
+  return cfg;
+}
+const editConfig = (root, fn) => {
+  const file = join(root, 'config.json');
+  writeFileSync(file, JSON.stringify(fn(JSON.parse(readFileSync(file, 'utf8')))));
+};
+
+test('own: search_config agrees with config.json on and off, and the bot env holds the search Key name only when on', async () => {
+  const { root, env } = await preparedOwn('own-search');
+  const off = doctor(root, {}, env);
+  assert.deepEqual(off.failed, [], formatDoctor(off));
+  assert.equal(off.checks.find((c) => c.id === 'search_config').detail, '搜索关闭', 'control: off by default');
+
+  editConfig(root, searchOn);
+  // Not applied yet: effective.json still has no search block.
+  const stale = doctor(root, {}, env);
+  assert.ok(failedIds(stale).includes('search_config'), formatDoctor(stale));
+  assert.match(stale.checks.find((c) => c.id === 'search_config').detail, /effective\.json 的搜索设置/);
+
+  const applied = await clo(root, ['apply'], { env });
+  assert.equal(applied.code, 0, applied.err);
+  const on = doctor(root, {}, env);
+  assert.deepEqual(on.failed, [], formatDoctor(on));
+  assert.equal(on.checks.find((c) => c.id === 'search_config').detail, '搜索打开（openrouter-sonar）');
+  assert.ok(on.checks.find((c) => c.id === 'bot_env').ok, 'the search Key is not a model Key, so bot_env still sees exactly one');
+
+  // Turned off by hand and applied: off again, nothing left over.
+  editConfig(root, (c) => ({ ...c, searchProvider: 'none' }));
+  assert.equal((await clo(root, ['apply'], { env })).code, 0);
+  assert.deepEqual(doctor(root, {}, env).failed, []);
+});
+
+test('openclaw: search on fails config_valid and search_off, and says search is only on the own runtime', async () => {
+  const root = await prepared('host-search');
+  assert.deepEqual(doctor(root).failed, [], 'control: the same install with search off');
+  editConfig(root, searchOn);
+  const r = doctor(root);
+  assert.ok(failedIds(r).includes('config_valid'), formatDoctor(r));
+  assert.ok(failedIds(r).includes('search_off'), formatDoctor(r));
+  assert.match(r.checks.find((c) => c.id === 'search_off').detail, /OpenClaw 运行时这一版没有搜索.*搜索只在 own 运行时/);
+  const applied = await clo(root, ['apply']);
+  assert.notEqual(applied.code, 0, 'apply refuses it');
+  assert.match(applied.err, /searchProvider: search runs on the own runtime only; the OpenClaw runtime has no search in this build/);
 });
 
 test('own: the system prompt is checked whole, by its policy section and by its markers', async () => {

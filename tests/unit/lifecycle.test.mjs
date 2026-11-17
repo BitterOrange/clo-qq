@@ -121,7 +121,8 @@ test('parseEnvFile reads named keys only, with quotes, BOM and CRLF, and survive
   roots.push(r);
   const f = join(r.root, 'x.env');
   writeFileSync(f, `\uFEFF# comment\r\nCLO_QQ_APP_ID="abc"\r\nCLO_QQ_APP_SECRET='s p'\r\nCLO_CHAT_API_KEY= k \r\nOPENROUTER_API_KEY=old\r\nOTHER_SECRET=nope\r\nCLO_SEARCH_API_KEY=nope\r\nCLO_SEARCH_OPENROUTER_KEY=old\r\nHTTP_PROXY=nope\r\n`);
-  assert.deepEqual(parseEnvFile(f), { CLO_QQ_APP_ID: 'abc', CLO_QQ_APP_SECRET: 's p', CLO_CHAT_API_KEY: 'k' });
+  // The search key is read too; only the own runtime's env builder passes it on, and only with search on.
+  assert.deepEqual(parseEnvFile(f), { CLO_QQ_APP_ID: 'abc', CLO_QQ_APP_SECRET: 's p', CLO_CHAT_API_KEY: 'k', CLO_SEARCH_API_KEY: 'nope' });
   assert.deepEqual(renamedEnvNames(f).sort(), ['CLO_SEARCH_OPENROUTER_KEY', 'OPENROUTER_API_KEY'], 'old names are found, and only their names come back');
   writeFileSync(f, 'OPENROUTER_API_KEY=\nCLO_SEARCH_OPENROUTER_KEY=\n');
   assert.deepEqual(renamedEnvNames(f), [], 'an empty old line holds nothing to move');

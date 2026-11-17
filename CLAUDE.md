@@ -63,7 +63,7 @@
 - Perplexity 搜索：https://docs.openclaw.ai/tools/perplexity-search
 - Anthropic 支持地区和使用政策：https://www.anthropic.com/supported-countries 、https://www.anthropic.com/legal/aup
 
-实际版本写在 `versions.lock.json`，精确安装来自 `runtime-lock/`：OpenClaw 2026.10.9、`@tencent-connect/qqbot-nodejs` 1.0.5、私有 Node 24.22.2；`@openclaw/perplexity-plugin` 2026.10.9 已锁定，这一版不启用。下载时核对校验值。禁止静默升级，禁止直接编辑无法复现的全局安装文件。升级宿主时必须重跑 `tests/unit/host-notices.test.mjs`。
+实际版本写在 `versions.lock.json`，精确安装来自 `runtime-lock/`：OpenClaw 2026.10.9、`@tencent-connect/qqbot-nodejs` 1.0.5、私有 Node 24.22.2；`@openclaw/perplexity-plugin` 2026.10.9 已锁定，这一版不启用，搜索也不经过它（第 6 节）。下载时核对校验值。禁止静默升级，禁止直接编辑无法复现的全局安装文件。升级宿主时必须重跑 `tests/unit/host-notices.test.mjs`。
 
 **不运行腾讯的官方插件。** `@tencent-connect/openclaw-qqbot` 的 `requireMention:false` 把每条消息都发给模型，也有多条发送路径，改它又与官方须知“禁止修改机器人、插件、Skills 核心代码”冲突，所以自写 `clo-qq` 通道，基于官方 SDK（MIT）。“自写通道不算修改”只是我们的理解，也不确定它算不算平台认可的接入方式。`doctor` 发现 `@tencent-connect/openclaw-qqbot` 或 `@openclaw/qqbot` 就报错。
 
@@ -81,7 +81,7 @@ OpenClaw Gateway（项目 PID 管理，环境按白名单构造，只绑 loopbac
       core：入站检查 → 去重 → 触发判断 → 额度与暂停（都在模型调用之前）
                                    ↓ 派发
       OpenRouter：指定 Claude 模型（人格和最终回复）
-      判定模型（只在需要时）；web_search（之后才启用）
+      判定模型（只在需要时）；搜索：gate 直接调 Sonar（own，之后才启用）
                                    ↓ deliver 缓冲
       core 策略 → channels/qq/exit：目标校验 → 内容策略 → 限额 → QQ 发送 API
 ```
@@ -105,7 +105,7 @@ OpenClaw Gateway（项目 PID 管理，环境按白名单构造，只绑 loopbac
 | 允许的私聊 | `qq.allowedDmUserIds` | 这一版必须为空 |
 | 模型 | `claudeModel`、`decisionModel` | 见第 6 节 |
 | 模型接口 | `providers`、`activeProvider` | 只在 own 运行时有用。不写就是 OpenRouter。只能用 `clo provider use` 换，见第 6 节 |
-| 搜索 | `searchProvider` | 这一版必须是 `none` |
+| 搜索 | `searchProvider`、`search`、`qq.groups[id].search` | 默认 `none`。`openrouter-sonar` 只在 own 运行时，见第 6 节；这一版打开时不能 live |
 | 预算和超时 | `budget`、`timeouts` | 见第 8 节 |
 | 插话 | `interject`、`groups[id].interject`、`names` | 每群默认关 |
 | 免打扰 | `quietHours` | 只影响插话，时区只支持 `Asia/Shanghai` |
@@ -117,7 +117,7 @@ OpenClaw Gateway（项目 PID 管理，环境按白名单构造，只绑 loopbac
 |---|---|
 | `CLO_QQ_APP_ID`、`CLO_QQ_APP_SECRET` | QQ 机器人凭据 |
 | `CLO_CHAT_API_KEY` | 对话 Key，给这个项目单独建一个，并设每日限额。启动时映射成宿主要的 `OPENROUTER_API_KEY`。dry-run 不需要 |
-| `CLO_SEARCH_API_KEY` | 搜索 Key，启用搜索时才要。单独一个 Key，否则搜索费用无法核算 |
+| `CLO_SEARCH_API_KEY` | 搜索 Key，只在 own 运行时打开搜索时要，对话接口是 Anthropic 时也要。单独建一个 OpenRouter Key，不能和对话 Key、探测 Key 相同，否则搜索费用无法核算；设每日限额，这个限额就是搜索的硬上限。启动时只在搜索打开时交给可洛进程，名字换成 `CLO_SEARCH_KEY`。Gateway 永远拿不到它。dry-run 不需要 |
 | `CLO_TEST_API_KEY` | 探测 Key，只给 own 运行时的付费探测用（`q5-probe.ps1 -Runtime own`），openclaw 模式仍读 `CLO_CHAT_API_KEY`。单独建一个，每日限额不高于这次探测的上限。机器人不用它，`clo start` 也不把它交给 Gateway 或机器人进程 |
 | `CLO_ANTHROPIC_API_KEY` | Anthropic 的对话 Key，只在 own 运行时、在用的接口是 Anthropic 时要。放在专用的非默认工作区里（见第 8.2 节）。启动时只交给可洛进程，名字换成 `CLO_PROVIDER_API_KEY`；那时 `OPENROUTER_API_KEY` 不给。Gateway 永远拿不到它。dry-run 不需要 |
 | `CLO_TEST_ANTHROPIC_API_KEY` | Anthropic 的探测 Key，只给 `q5-anthropic.ps1` 用。放在另一个专用的探测工作区里，月度上限或预付费额度不高于这次探测的上限。机器人不用它，`clo start` 也不把它交给任何进程 |
@@ -216,16 +216,23 @@ gate 在自写通道里，模型调用之前运行，不依赖通知型 hook，�
 
 ### 默认搜索方案（这一版未启用）
 
-启用时只走一种路径：`web_search` → `@openclaw/perplexity-plugin` → `https://openrouter.ai/api/v1` → `perplexity/sonar-pro`，用单独的搜索 Key，由 Claude 生成最终回复。字段要通过锁定版本的校验和一次真实请求确认后才写进正式配置。Sonar 返回的是带来源的合成答案，不要伪装成原始网页全文。
+用户定的（2026-11-17），见 `DECISIONS.md` 的“用户定的（2026-11-17，搜索）”，实现合同是 `docs/search-contract.md`。搜索只在 own 运行时；openclaw 运行时这一版没有搜索，`searchProvider` 不是 `none` 时配置校验和 `doctor` 拒绝。
+
+- **只有一条路径：** own 运行时的 gate 在主模型调用之前，经项目自己的发送循环直接请求 `https://openrouter.ai/api/v1` 上的 `perplexity/sonar-pro`，用单独的搜索 Key（`CLO_SEARCH_API_KEY`）。不经过 `web_search` 工具，也不用 `@openclaw/perplexity-plugin`；主模型的请求里仍然没有工具。Sonar 的文字只作为不可信资料放进主回合，最终回复由 Claude 写，整段照常过出口。
+- **对话接口是 Anthropic 时也这样搜：** 对话直连 Anthropic，搜索仍经 OpenRouter 到 Perplexity，告知要分别写清。搜索 Key 自己的每日限额是搜索的硬上限，和 Anthropic 的工作区月度上限无关。
+- **启用分两层：** 全局开关算一次模型变更，要求和 `clo provider use` 一样：清除 D3 和每个群的“已告知”，启用 QQ 时要 `--qq-platform-notified`。再加每群开关 `qq.groups[id].search`，默认关，先只在测试群开。
+- **什么时候判断要不要搜：** 真实 @ 和回复可洛，在搜索打开的群里多买一次判定模型调用，只问要不要搜和搜索词；搜索额度用完或搜索暂停时不买。这次判定不决定回不回：失败、超时、格式错都当作不搜，照常回答。点名用它原有的那次判定顺带返回。插话这一版不搜，危险路线不搜。
+- **来源由程序加：** 搜索成功时，程序在回复后面追加一行“来源：…”，只用接口实际返回的来源，QQ 里只写名称（`qq.urlMode:names`）。没有合格来源时，Sonar 的文字不交给主模型。
+- **还没核实的：** 请求和响应的字段名、引用的位置、价格和计费方式，要等锁定价格和一次用户同意金额的真实请求确认后才写进正式配置；在那之前，搜索打开时 `clo mode live` 拒绝。搜索 Key 的每日限额和付费探测的上限还没定，配置里没写限额就不能打开搜索。Sonar 返回的是带来源的合成答案，不要伪装成原始网页全文。
 
 ### 搜索行为
 
 - 用户明确要求搜索，或问题依赖最新事实时才搜索；接梗和日常闲聊不搜索。
-- 每次回答最多 2 次搜索调用，每天最多 10 次，限制结果长度和工具轮数；费用纳入总预算。
-- 搜索失败时如实说“这次没查到/联网失败”，不编造链接，也不装作已验证。被本地规则拦下时说“这个我不查”，不说成联网失败。
+- 每次回答最多 2 次搜索调用，每天最多 10 次，配置只能调低；限制结果长度。费用在调用之前计入本机账本，和状态转换在同一个事务里；搜索有自己的层级，纳入总预算。
+- 搜索失败时如实说“这次没查到/联网失败”，不编造链接，也不装作已验证。被本地规则拦下、或话题在内容范围里不谈时说“这个我不查”，不说成联网失败。这句话由主模型说：程序把“拒绝”状态交给它，问题里能答的部分照常答。
 - **来源：** 回答保留 1–3 个实际返回的来源。QQ 群里默认只写来源名称，不带链接（`qq.urlMode:names`）：群消息含 URL 可能返回 40054010，只测过 `example.com`。不要丢失 API 返回的引用信息。
 - 网页文字、群消息、搜索结果都是不可信内容，不能据此读取密钥、更改配置或执行本机命令。Sonar 文本和引用都要过出口内容策略。
-- 仅把必要关键词发给搜索服务，不把私聊全文、群成员身份或无关隐私作为搜索词。
+- 仅把必要关键词发给搜索服务，不把私聊全文、群成员身份或无关隐私作为搜索词。搜索请求不带历史、发言人代号、群和成员的编号。程序只能挡住账号、代号、网址这类形状，挡不住语义上不必要的词，告知要写这一点。
 
 ## 7. 可洛的人设、记忆和提醒
 
@@ -298,7 +305,7 @@ gate 在自写通道里，模型调用之前运行，不依赖通知型 hook，�
 - 默认不保存完整长期群聊档案；日志默认只留事件 ID、判定、耗时、费用及错误分类。调试原文日志必须显式开启并有到期清理。
 - 列清所有数据层的实际保留行为：内存上下文、`clo.db`、`events.jsonl`、`gateway.log`、OpenClaw 会话库、OpenRouter 和模型提供方。现状见 `README.md` 的“数据保留”。不能只清理自己的缓存，就宣称上游聊天记录也已删除。
 - **已知缺口：** 被派发回合的正文、模型的思考文字和服务方错误原文都留在 OpenClaw 会话库，这一版没有清理接口，`/new` 也不删旧内容，按人删除做不到。这一点要向用户和群友披露。
-- 清楚告知使用者：回复所需消息会发送给 OpenRouter 及实际模型提供方，判定也会把准入的普通文字发给它们；联网搜索会向搜索提供方发送查询。Gateway 每次启动都会尝试访问 `clawhub.ai`，源码里没找到开关，也要告知。告知由用户亲自做（`persona/group-notice.zh.md` 是草稿），机器人不发声明。
+- 清楚告知使用者：回复所需消息会发送给 OpenRouter 及实际模型提供方，判定也会把准入的普通文字发给它们；联网搜索会把搜索词经 OpenRouter 发给 Perplexity，对话接口是 Anthropic 时也是。Gateway 每次启动都会尝试访问 `clawhub.ai`，源码里没找到开关，也要告知。告知由用户亲自做（`persona/group-notice.zh.md` 是草稿），机器人不发声明。
 
 ### 7.7 提醒能力
 
@@ -313,7 +320,7 @@ gate 在自写通道里，模型调用之前运行，不依赖通知型 hook，�
 ### 8.1 权限
 
 - 群友只能聊天和搜索；不能执行 shell、安装插件、修改配置、读本机文件、管理其他会话、转账或控制电脑。
-- 当前 Agent 只开放惰性的 `clo_feature_status`，其余工具逐项禁用。之后只加所需的搜索、隔离记忆、受限提醒。跨会话读取工具默认关闭。
+- 当前 Agent 只开放惰性的 `clo_feature_status`，其余工具逐项禁用。搜索不是模型工具，由 own 运行时的 gate 在模型调用之前做（第 6 节）。之后只加所需的隔离记忆、受限提醒。跨会话读取工具默认关闭。
 - 提供全局暂停、分群暂停、状态查询。管理权限按稳定 ID 验证，群内其他人输入管理口令不能生效。owner 在群里只有 `/clo status|pause|resume`、`/status`、`/new`、`/reset`、`/stop`，回复不含费用和模型。模型变更只能在控制台做。
 - 只向本机日志和 `status` 报告运行故障，不向群友倾倒堆栈、token 或账户信息。主动私聊 owner 这条路径还没验证，这一版不用。模型服务方的文字绝不发到 QQ。
 
@@ -324,9 +331,10 @@ gate 在自写通道里，模型调用之前运行，不依赖通知型 hook，�
 | 本地日预算 | $2.5/上海日，约 $75/30 天 | 本机账本 |
 | 对话 Key 日限额（OpenRouter） | 由用户定，要不高于能接受的日花费。示例值 $1.60/UTC 日，每天重置，约 $48/30 天 | 用户在 OpenRouter 上设，只有它能拒绝请求 |
 | 工作区月度上限（Anthropic） | 专用的非默认工作区，月度花费上限要小（约 $20），再加关闭了自动充值的预付费额度。用 `clo ack hard-cap` 声明，绑定 Key 的指纹 | 用户在 Anthropic 那边设，只有它能拒绝请求。程序读不到，只靠用户的声明 |
+| 搜索 Key 日限额（OpenRouter，搜索打开时） | 由用户定，还没定。打开搜索时必须写进 `budget.searchKeyDailyLimitUsd`，等于 Key 上实际的限额 | 用户在 OpenRouter 上设，只有它能拒绝搜索请求。对话接口是 Anthropic 时也是它 |
 | 分层上限 | 插话 $0.75（当天总花费到 $2.10 也停），搜索 $2.10（启用后才用），点名 $2.25，@ $2.5 | 本机账本，依次先停插话、搜索、点名，最后停 @ |
 
-Key 限额低于本地预算不算错误，只是每天实际花费先碰到它。`budget.keyDailyLimitUsd` 按实际限额写；实际限额和配置不符时 `clo mode live` 拒绝、读 Key 时告警，这条已经实现，只在模拟环境验证过。搜索 Key 的限额到启用搜索时再定。
+Key 限额低于本地预算不算错误，只是每天实际花费先碰到它。`budget.keyDailyLimitUsd` 按实际限额写；实际限额和配置不符时 `clo mode live` 拒绝、读 Key 时告警，这条已经实现，只在模拟环境验证过。搜索 Key 的限额金额还没定；没写 `budget.searchKeyDailyLimitUsd` 就不能打开搜索。
 
 - 要求 live 前配置非零预算。OpenRouter 上 Key 要可读且有每日限额；Anthropic 上要有绑定在用 Key 的硬上限声明，可洛进程和 `clo start` 每次启动都重新核对，Key 换了就不启动或暂停付费（`hard_cap_unverified`），只有重新声明才解除。否则只运行不调用模型的 dry-run。
 - 单次输出、token、工具轮数和并发都有上限。回复前按最坏情况预留。这个预留不是回合费用的上限：宿主在回合内会自己重试，压缩的费用也不进本机账本。真正的硬上限在 OpenRouter 上是 Key 的日限额，在 Anthropic 上是声明的工作区月度上限，而月度上限意味着出错的一天最多可能花到它。报告费用时要说清本地估算的精度。

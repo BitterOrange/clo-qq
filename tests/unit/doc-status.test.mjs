@@ -151,7 +151,7 @@ test('the temp-root text says what happens when it cannot be deleted', () => {
 });
 
 // The repo is public. These hold what was decided for the public text.
-const PUBLIC_DOCS = ['README.md', 'DEPLOYMENT.md', 'DECISIONS.md', 'docs/group-chat-design.md', 'docs/q0a-guide.zh.md', 'docs/wiring-trial.md', 'docs/own-runtime.md', 'docs/cost-options.md', 'docs/provider-contract.md'];
+const PUBLIC_DOCS = ['README.md', 'DEPLOYMENT.md', 'DECISIONS.md', 'docs/group-chat-design.md', 'docs/q0a-guide.zh.md', 'docs/wiring-trial.md', 'docs/own-runtime.md', 'docs/cost-options.md', 'docs/provider-contract.md', 'docs/search-contract.md'];
 
 test('public docs do not send a reader to files that are not in the repo, or name private things', () => {
   const documentation = /^(?:127\.0\.0\.1|0\.0\.0\.0|192\.0\.2\.\d+|198\.51\.100\.\d+|203\.0\.113\.\d+)$/;
@@ -1015,4 +1015,45 @@ test('merged tree: the D6 row matches the own-runtime OpenRouter settlement and 
   const recorded = /COST_ABOVE_COMPUTED_ALERT|cost_above_computed/.test(read('src/clo-plugin/lib/core/gate.js'));
   const row = DECISIONS_TEXT().split('\n').find((l) => l.startsWith('| OpenRouter 在 own 上怎么结算（规划 D6） |'));
   assert.equal(row.includes('结算的地方还没有把它记下来'), !recorded, 'the row says the alert is unrecorded exactly while gate.js does not record it');
+});
+
+// Search (2026-11-17): the decided path is written where the rules are, nothing claims it ran, and the live refusal the
+// docs describe is the one the code has.
+test('CLAUDE.md section 6 and DECISIONS.md record the decided search path, own runtime only, and no doc claims search ran', async () => {
+  const { SEARCH_RULES_RECORDED, SEARCH_MODEL, SEARCH_KEY_ENV, SEARCH_CHILD_KEY } = await import('../../src/clo-plugin/lib/core/providers/searchRegistry.js');
+  const CLAUDE = read('CLAUDE.md');
+  const plan = sectionOf(CLAUDE, '### 默认搜索方案', '### 搜索行为');
+  const behaviour = sectionOf(CLAUDE, '### 搜索行为', '## 7. ');
+  assert.ok(plan.length > 0 && behaviour.length > 0, 'positive control: both sections were found');
+  for (const item of ['用户定的（2026-11-17）', '`docs/search-contract.md`', 'own 运行时', `\`${SEARCH_MODEL['openrouter-sonar']}\``, `\`${SEARCH_KEY_ENV}\``, '不经过 `web_search` 工具', '`@openclaw/perplexity-plugin`', '主模型的请求里仍然没有工具', '对话直连 Anthropic', '`--qq-platform-notified`', '`qq.groups[id].search`', '插话这一版不搜', '“来源：…”', '`clo mode live` 拒绝']) {
+    assert.ok(plan.includes(item), `the search plan has ${item}`);
+  }
+  for (const item of ['每次回答最多 2 次搜索调用，每天最多 10 次', '“这个我不查”', '由主模型说', '过出口内容策略', '挡不住语义上不必要的词']) assert.ok(behaviour.includes(item), `search behaviour has ${item}`);
+  // The old path is gone from the rules; a planted copy would be caught.
+  const oldPath = ['`web_search` → `@openclaw/perplexity-plugin`', '这一版必须是 `none`', 'web_search（之后才启用）', '之后只加所需的搜索'];
+  assert.throws(() => assertGone(`${CLAUDE}\n启用时只走一种路径：\`web_search\` → \`@openclaw/perplexity-plugin\`。`, oldPath, 'planted'), /still says/);
+  assertGone(CLAUDE, oldPath, 'CLAUDE.md');
+  const keyRow = CLAUDE.split('\n').find((l) => l.startsWith(`| \`${SEARCH_KEY_ENV}\` |`));
+  assert.ok(keyRow.includes(`\`${SEARCH_CHILD_KEY}\``) && keyRow.includes('Gateway 永远拿不到它') && keyRow.includes('不能和对话 Key、探测 Key 相同'), 'the key table row');
+  assert.match(sectionOf(CLAUDE, '### 8.2 预算', '### 8.3 '), /\| 搜索 Key 日限额（OpenRouter，搜索打开时） \| 由用户定，还没定。.*`budget\.searchKeyDailyLimitUsd`/);
+
+  const DECISIONS = DECISIONS_TEXT();
+  const decided = sectionOf(DECISIONS, '## 用户定的（2026-11-17，搜索）', '## 开发时定的，用户还没有确认（2026-11-17，搜索）');
+  assert.ok(decided.length > 0, 'the section exists');
+  for (const d of ['| D0 搜索的路径 |', '| 先做哪个运行时 |', '| D1 ', '| D2 ', '| D3 ', '| D4 ', '| D5 ', '| D6 ', '| D7 ', '| 金额 |']) assert.ok(decided.includes(d), d);
+  const row = DECISIONS.split('\n').find((l) => l.startsWith('| 搜索 |'));
+  assert.match(row, /^\| 搜索 \| 已定（2026-11-17）/);
+  assert.doesNotMatch(row, /^\| 搜索 \| 启用搜索时再定。倾向/);
+  assert.match(sectionOf(DECISIONS, '## 开发时定的，用户还没有确认（2026-11-17，搜索）', '## 待定（决策点 D）'), /`SEARCH_RULES_RECORDED` 现在是 false/);
+
+  // The live refusal the docs describe is the code's, and nothing says search ran or is enabled.
+  assert.equal(SEARCH_RULES_RECORDED, false, 'the docs say live is refused while search is on');
+  assert.match(read('src/cli/clo.mjs'), /search_rules: '搜索打开时还不能 live/, 'positive control: the console explains the refusal');
+  const CONTRACT = read('docs/search-contract.md');
+  assert.match(CONTRACT, /`SEARCH_RULES_RECORDED`[^\n]*is false/);
+  assert.match(CONTRACT, /\*\*None made\.\*\* Nothing here has run against the real Sonar API/);
+  const ran = ['搜索已启用', '搜索已上线', '在真实 Sonar 上跑过', 'search is live', 'ran against real Sonar', 'search ran for real'];
+  assert.throws(() => assertGone(`${CONTRACT}\nsearch is live.`, ran, 'planted'), /still says/);
+  for (const name of PUBLIC_DOCS) assertGone(read(name), ran, name);
+  assertGone(CLAUDE, ran, 'CLAUDE.md');
 });

@@ -8,6 +8,7 @@ import { providerOfConfig, runtimeOf } from '../clo-plugin/lib/core/config.js';
 import { checkSentinels, sha256Hex } from '../clo-plugin/lib/core/contentPolicy.js';
 import { extractPolicySection } from '../clo-plugin/lib/core/render.js';
 import { CHILD_KEY, MODEL_ID_RULES } from '../clo-plugin/lib/core/providers/registry.js';
+import { SEARCH_CHILD_KEY, SEARCH_OFF, searchOfEffective, searchOnInConfig, searchProviderOf } from '../clo-plugin/lib/core/providers/searchRegistry.js';
 import { SCHEMA_VERSION } from '../clo-plugin/lib/core/store.js';
 import { isTestMode, lockMatches, privateFiles, readConfig, readModelsLock, readVersionsLock, renderAll, secretFiles } from './common.mjs';
 import { duplicateLinesHint, ensureGatewayEnvClean, ensureOwnEnvClean, forbiddenOwnArgs, gatewayEnvForCheck, hostCliEnv, inspectArgs, modelKeyNames, oldLinesHint, ownArgs, ownEntry, ownEnvForCheck, parseEnvFile, privateNode, renamedEnvNames, requireSecrets } from './lifecycle.mjs';
@@ -288,10 +289,26 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
     if (!cfg) return '没有配置';
     return (Array.isArray(cfg.qq?.allowedDmUserIds) && cfg.qq.allowedDmUserIds.length === 0) || 'allowedDmUserIds 必须为空';
   });
-  attempt('search_off', () => {
-    if (!cfg) return '没有配置';
-    return cfg.searchProvider === 'none' || 'searchProvider 必须是 none';
-  });
+  if (host) {
+    // The OpenClaw runtime has no search in this build: config_valid refuses it too, with the reason.
+    attempt('search_off', () => {
+      if (!cfg) return '没有配置';
+      return cfg.searchProvider === SEARCH_OFF || 'OpenClaw 运行时这一版没有搜索，searchProvider 必须是 none（搜索只在 own 运行时）';
+    });
+  } else {
+    // On or off, the bot's env and effective.json agree with config.json: the search Key's name is there exactly when
+    // search is on.
+    attempt('search_config', () => {
+      if (!cfg) return '没有配置';
+      const on = searchOnInConfig(cfg);
+      const child = ownEnvForCheck(paths, env, { kind: kind ?? 'openrouter', search: on });
+      const has = Object.hasOwn(child, SEARCH_CHILD_KEY);
+      if (on && !has) return `搜索打开了，可洛进程的环境里却没有 ${SEARCH_CHILD_KEY} 这个名字，搜索 Key 传不过去`;
+      if (!on && has) return `搜索没有打开，可洛进程的环境里却有 ${SEARCH_CHILD_KEY}`;
+      if ((searchOfEffective(readJson(paths.effectiveJson)) !== null) !== on) return 'effective.json 的搜索设置与 config.json 不一致，运行 clo apply';
+      return { ok: true, detail: on ? `搜索打开（${searchProviderOf(cfg)}）` : '搜索关闭' };
+    });
+  }
   if (host) {
     attempt('gateway_env', () => {
       const child = gatewayEnvForCheck(paths, env);
@@ -304,7 +321,7 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
   } else {
     attempt('bot_env', () => {
       if (!kind) return '没有能用的模型接口，不知道该给可洛进程哪个 Key';
-      const child = ownEnvForCheck(paths, env, { kind });
+      const child = ownEnvForCheck(paths, env, { kind, search: cfg ? searchOnInConfig(cfg) : false });
       const bad = [...ensureOwnEnvClean(child), ...Object.keys(child).filter((k) => k.startsWith('OPENCLAW_'))];
       if (bad.length) return `可洛进程的环境含有不该有的变量：${bad.join('、')}`;
       // Exactly one model Key, the one of the kind it runs on.

@@ -87,7 +87,7 @@ bash scripts/setup.sh --runtime
 | `CLO_QQ_APP_ID` | 启动就要 |
 | `CLO_QQ_APP_SECRET` | 启动就要 |
 | `CLO_CHAT_API_KEY` | 只有 live 要。这是 OpenRouter Key，启动时映射成宿主要的 `OPENROUTER_API_KEY` |
-| `CLO_SEARCH_API_KEY` | 可选，给还没实现的搜索预留，现在没有代码读它 |
+| `CLO_SEARCH_API_KEY` | 只有新运行时打开了搜索、又要 live 时要。搜索还没做完，打开时 `clo mode live` 一律拒绝。单独建一个 OpenRouter Key，不能和 `CLO_CHAT_API_KEY`、`CLO_TEST_API_KEY` 相同，设好它自己的每日限额，`budget.searchKeyDailyLimitUsd` 写同一个数。`clo start` 只在搜索打开时把它交给可洛进程（名字是 `CLO_SEARCH_KEY`），Gateway 拿不到 |
 | `CLO_TEST_API_KEY` | 只有付费探测要（own 运行时的 Q5）。单独建一个 OpenRouter Key，日限额不高于这次探测的上限。机器人不用它，`clo start` 也不把它交给 Gateway 或机器人进程 |
 | `CLO_ANTHROPIC_API_KEY` | 只有新运行时、在用的接口是 Anthropic 时要：`clo ack hard-cap` 和 live 都要它。放在专用的非默认工作区里。`clo start` 只把它交给可洛进程，Gateway 拿不到；用 Anthropic 时可洛进程也拿不到 OpenRouter 的 Key |
 | `CLO_TEST_ANTHROPIC_API_KEY` | 只有 Anthropic 的付费探测（`q5-anthropic.ps1`）要，它还没有跑过。放在另一个专用的探测工作区里。机器人不用它，`clo start` 也不把它交给任何进程 |

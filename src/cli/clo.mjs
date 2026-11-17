@@ -117,6 +117,7 @@ const LIVE_HINTS = {
   hard_cap: '这个接口读不到 Key 的花费和限额，要有你本人对硬上限的声明（clo ack hard-cap）：专用、非默认工作区的月度花费上限，加上关闭自动充值的预付费额度，金额至少够一次必答回复的预留，而且声明绑定的就是 .env 里现在这个 Key，也是运行中进程用的 Key。换过 Key 要先停进程，再重新声明',
   key_valid: '用这个 Key 读不到锁定的两个模型，或模型不支持这里要用的设置（D3 没有记录时不会去读）',
   provider_rules: '这个接口进入 live 的项目规则还没有记录：CLAUDE.md §8.2 和 DECISIONS.md 要先写进你同意的规则。在那之前只能 dry-run',
+  search_rules: '搜索打开时还不能 live：Sonar 的字段、价格和计费方式要等一次你同意金额的真实探测确认，规则写进 CLAUDE.md 和 DECISIONS.md 之后才放行。在那之前搜索只能在 dry-run 和离线测试里用；要 live，先关掉搜索（searchProvider 改回 none，再 clo apply）',
   identity: '机器人身份没有确认（看 clo status，再 clo ack identity）',
   notice: '有群没有确认告知（clo group notice-done <群>）',
   q0: 'Q0 没有确认：你还没有确认看过自己的群能收到什么（clo ack q0）',
