@@ -23,6 +23,13 @@ if (job.kind === 'open') while (Date.now() < job.startAt) { /* barrier before th
 const store = openStore(job.db, { runGen: job.name });
 const eff = { budget: { dailyUsd: 2.5, interjectUsd: 0.75, searchUsd: 2.1, namedUsd: 2.25, addressedUsd: 2.5 } };
 const ledger = createLedger({ store, getEffective: () => eff, fetch: async () => { throw new Error('no network'); }, getKey: () => null });
+// Search: the own runtime, search on, a locked price (one hold is 26000 micros), at most 10 a day.
+const searchEff = {
+  runtime: 'own', mode: 'live', openrouter: { baseUrl: 'http://127.0.0.1:9/api/v1' },
+  budget: { ...eff.budget, searchUsd: job.searchUsd ?? 2.1 },
+  search: { provider: 'openrouter-sonar', model: 'perplexity/sonar-pro', baseUrl: 'http://127.0.0.1:9/api/v1', perAnswer: 2, perDay: 10, maxTokens: 600, resultMaxChars: 1500, queryMaxChars: 80, searchMs: 20000, price: { inputPerM: 3, outputPerM: 15, requestUsd: 0.005 } },
+};
+const searchLedger = createLedger({ store, getEffective: () => searchEff, fetch: async () => { throw new Error('no network'); }, getKey: () => null, runtime: 'own' });
 while (Date.now() < job.startAt) { /* barrier: both processes start together */ }
 const out = { attempts: 0, won: 0, ids: [], refused: {} };
 for (let i = 0; i < job.iterations; i += 1) {
@@ -33,6 +40,8 @@ for (let i = 0; i < job.iterations; i += 1) {
     if (r.ok) out.ids.push(r.id);
   } else if (job.kind === 'reserve') {
     r = ledger.reserve({ tier: 'interject', category: 'decision', heldMicros: 10000, eventKey: job.name + i });
+  } else if (job.kind === 'search') {
+    r = searchLedger.claimSearch({ eventKey: job.name + i });
   } else if (job.kind === 'counter') {
     r = store.bumpCounter('name_dec:G:1', Date.now() + 3600000, 25);
   } else if (job.kind === 'open') {
@@ -50,11 +59,11 @@ process.stdout.write(JSON.stringify(out));
 const workerFile = join(dir, 'worker.mjs');
 writeFileSync(workerFile, WORKER);
 
-function race(kind, iterations, db = join(dir, `${kind}.db`)) {
+function race(kind, iterations, db = join(dir, `${kind}.db`), extra = {}) {
   if (kind !== 'open') openStore(db, { runGen: 'prep' }).close();
   const startAt = Date.now() + 1500;
   const run = (name) => new Promise((res, rej) => {
-    const child = spawn(NODE, [workerFile, JSON.stringify({ db, name, kind, iterations, startAt })], {
+    const child = spawn(NODE, [workerFile, JSON.stringify({ db, name, kind, iterations, startAt, ...extra })], {
       cwd: dir,
       env: { SystemRoot: process.env.SystemRoot, NODE_NO_WARNINGS: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -101,6 +110,34 @@ test('tier reservation: the cap holds across processes, and both had to be refus
   assert.equal((a.refused.tier ?? 0) + (b.refused.tier ?? 0), 45);
   const store = openStore(db, { runGen: 'check' });
   assert.equal(store.q('SELECT SUM(held_micros) AS m FROM reservations').get().m, 750000);
+  store.close();
+});
+
+test('search: two processes making 12 claims get exactly the 10 a day, one row and one count each', { timeout: 60000 }, async () => {
+  const { results, db } = await race('search', 6);
+  const [a, b] = results;
+  assert.equal(a.attempts + b.attempts, 12);
+  assert.equal(a.won + b.won, 10);
+  assert.equal((a.refused.day_cap ?? 0) + (b.refused.day_cap ?? 0), 2);
+  const store = openStore(db, { runGen: 'check' });
+  const rows = store.q("SELECT COUNT(*) AS n, SUM(held_micros) AS m FROM reservations WHERE tier='search' AND provider='search'").get();
+  assert.equal(rows.n, 10);
+  assert.equal(rows.m, 10 * 26000);
+  const counter = store.q("SELECT value FROM counters WHERE key LIKE 'search_day:%'").all();
+  assert.deepEqual(counter.map((c) => c.value), [10], 'the day count is the number of rows');
+  store.close();
+});
+
+test('search: a hold the budget refuses rolls its count back in each process, so the count matches the rows', { timeout: 60000 }, async () => {
+  // Room for 7 holds of $0.026 under the search line, fewer than the 10 a day the count would allow.
+  const { results, db } = await race('search', 6, join(dir, 'search-budget.db'), { searchUsd: 0.19 });
+  const [a, b] = results;
+  assert.equal(a.won + b.won, 7);
+  assert.equal((a.refused.total ?? 0) + (b.refused.total ?? 0), 5, 'refused by the budget, not by the count');
+  const store = openStore(db, { runGen: 'check' });
+  assert.equal(store.q("SELECT COUNT(*) AS n FROM reservations WHERE tier='search'").get().n, 7);
+  assert.deepEqual(store.q("SELECT value FROM counters WHERE key LIKE 'search_day:%'").all().map((c) => c.value), [7], 'the refused five took no count');
+  assert.equal(store.q("SELECT COUNT(*) AS n FROM counters WHERE key LIKE 'search_event:%'").get().n, 7, 'nor a per-answer count');
   store.close();
 });
 

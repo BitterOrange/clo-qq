@@ -177,6 +177,49 @@ test('apply under own writes effective.json and the system prompt, and no host f
   assert.equal(readFileSync(openclawJsonOf(s.root), 'utf8'), before, 'a switch to own leaves the host file as it was');
 });
 
+test('search: start gives the bot the search Key as CLO_SEARCH_KEY only while search is on', { timeout: 120000 }, async () => {
+  const s = await stack('search');
+  const SEARCH_VALUE = 'FAKE-SEARCH-KEY-FOR-TEST';
+  appendFileSync(join(s.root, '.env'), `CLO_SEARCH_API_KEY=${SEARCH_VALUE}\n`);
+  const cfgFile = join(s.root, 'config.json');
+  const report = join(s.root, 'fake-bot.json');
+  const startOnce = async (searchOn) => {
+    const cfg = configOf(s.root);
+    cfg.searchProvider = searchOn ? 'openrouter-sonar' : 'none';
+    if (searchOn) {
+      cfg.acks = { ...cfg.acks, search: { provider: 'openrouter-sonar', at: '2026-11-17T00:00:00.000Z' } };
+      cfg.budget = { ...cfg.budget, searchKeyDailyLimitUsd: 0.5 };
+    }
+    writeFileSync(cfgFile, JSON.stringify(cfg, null, 2));
+    rmSync(report, { force: true });
+    const started = await s.run(['start']);
+    assert.equal(started.code, 0, `${started.out}${started.err}`);
+    assert.ok(!`${started.out}${started.err}`.includes(SEARCH_VALUE), 'printed the search Key');
+    const info = await fakeBot(s.root);
+    assert.equal((await s.run(['stop'])).code, 0);
+    return info;
+  };
+  const off = await startOnce(false);
+  assert.equal(off.env.CLO_SEARCH_KEY, undefined, 'off: no search Key, though .env has one');
+  assert.equal(off.env.OPENROUTER_API_KEY, FAKE_KEY, 'control: the chat Key passes');
+  // Search turned on by hand, with no record of `clo search enable`: start refuses before any process.
+  const hand = configOf(s.root);
+  hand.searchProvider = 'openrouter-sonar';
+  hand.acks = { ...hand.acks, search: { provider: 'openrouter-sonar', at: '2026-11-17T00:00:00.000Z' } };
+  hand.budget = { ...hand.budget, searchKeyDailyLimitUsd: 0.5 };
+  writeFileSync(cfgFile, JSON.stringify(hand, null, 2));
+  const refused = await s.run(['start']);
+  assert.notEqual(refused.code, 0);
+  assert.match(`${refused.out}${refused.err}`, /clo search enable/);
+  // What `clo search enable` records, then the same config starts.
+  withDb(s.root, (store) => store.setControl('search_enabled', 'openrouter-sonar', 'test'));
+  const on = await startOnce(true);
+  assert.equal(on.env.CLO_SEARCH_KEY, SEARCH_VALUE, 'on: from the temp .env, not the parent');
+  assert.equal(on.env.OPENROUTER_API_KEY, FAKE_KEY);
+  for (const k of ['CLO_SEARCH_API_KEY', 'PERPLEXITY_API_KEY']) assert.equal(on.env[k], undefined, k);
+  assert.deepEqual(effectiveOf(s.root).search?.provider, 'openrouter-sonar', 'start applied the search block');
+});
+
 test('start, status, second start, stop under own: private Node, allowlisted env, no port, own PID only', { timeout: 120000 }, async () => {
   const s = await stack('start');
   const other = bystander();

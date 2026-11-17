@@ -43,7 +43,11 @@ test('.env.example holds placeholders only, under the current names', () => {
   assert.deepEqual(names, ['CLO_QQ_APP_ID', 'CLO_QQ_APP_SECRET', 'CLO_CHAT_API_KEY', 'CLO_SEARCH_API_KEY', 'CLO_TEST_API_KEY', 'CLO_ANTHROPIC_API_KEY', 'CLO_TEST_ANTHROPIC_API_KEY']);
   assert.match(text, /only with OpenRouter/);
   assert.match(text, /OpenAI-compatible endpoints are not\s+(# )?supported yet/);
-  assert.match(text, /Nothing reads it/);
+  // The search key is read now, only with search on, and goes to the bot alone under its child name.
+  assert.doesNotMatch(text, /Nothing reads it/);
+  assert.match(text, /only for the own runtime with search turned on/);
+  assert.match(text, /never the same as CLO_CHAT_API_KEY or CLO_TEST_API_KEY/);
+  assert.match(text, /clo start gives it only to the\s+(# )?bot, as CLO_SEARCH_KEY/);
 });
 
 test('config.example.json has the example Key limit', () => {

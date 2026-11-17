@@ -4,7 +4,7 @@
 
 下面的“已观察”除非写明，都是离线的：mock QQ、mock OpenRouter、临时目录、假密钥。这些测试证明的是接线，不是平台行为。怎么安装和运行见 [README.md](README.md)。决定和理由见 [DECISIONS.md](DECISIONS.md)。
 
-**上面和下面的真实记录都来自 OpenClaw 路线**（配置项 `runtime` 的默认值 `openclaw`，现在跑的也是它）。项目自己的运行时（`runtime: "own"`）已经写好，还不是默认，真实 QQ 上的验收一项都没有做。它只在真实 OpenRouter 上跑过一次付费探测（Q5，两个回合，不接 QQ），见下面“自己的运行时”和 [docs/own-runtime.md](docs/own-runtime.md)。
+**下面阶段表里的真实记录来自 Windows 上的 OpenClaw 路线**（配置项 `runtime` 的默认值 `openclaw`）。项目自己的运行时（`runtime: "own"`）已经写好，还不是默认；2026-11-17 在用户的 Ubuntu 机器上，它在测试群里走过 Q3、Q4、Q6、Q7，每种情况只看了一两条消息。它在真实 OpenRouter 上跑过两次付费探测（Q5 探测工具，两个回合，不接 QQ）。见下面“自己的运行时”和 [docs/own-runtime.md](docs/own-runtime.md)。
 
 **模型接口：** 新运行时上可以用 `clo provider use` 从 OpenRouter 换成直连 Anthropic。这条路只有离线测试（mock QQ、mock Anthropic），**真实 Anthropic 上一次都没有跑过**，Anthropic 的付费探测也没有跑过。决定见 [DECISIONS.md](DECISIONS.md) 的“用户定的（2026-11-07，Provider）”，用法见 README 的“模型接口”。
 
@@ -24,8 +24,9 @@
 | Q7 打开点名和插话 | 测试群里都打开过，每种情况只测了一次。真实的群还没有 |
 | Q8 真实群 | **未做，要先完成告知** |
 | Q9 验收，Q10 一周观察 | **未做** |
-| 自己的运行时（own）上的 Q3 到 Q7 | **未做**。真实 QQ 上一项都没有做，只有离线测试。下一行的探测也不算 own 的 Q5：Q5 要真实模型加 mock QQ，探测里没有 QQ，也没有 gate、出口和账本 |
-| own 的付费探测（Q5 探测工具，不接 QQ） | 跑过一次（2026-11-07），真实 OpenRouter，两个回合，实际 $0.0338。一次样本，只说明回合程序和 OpenRouter 客户端能跑通，见下面“付费探测工具”的 own 版本 |
+| 自己的运行时（own）上的 Q3 到 Q7 | 2026-11-17 在用户的 Ubuntu 机器上、测试群里做了 Q3、Q4（dry-run）、Q6（live，只回应真实 @）、Q7（点名、插话），每种情况只看了一两条消息，见 `DECISIONS.md`。own 的 Q5 阶段**未做**：下一行的探测不算 own 的 Q5，Q5 要真实模型加 mock QQ，探测里没有 QQ，也没有 gate、出口和账本 |
+| own 的付费探测（Q5 探测工具，不接 QQ） | 跑过一次（2026-11-07），真实 OpenRouter，两个回合，实际 $0.0338；2026-11-17 在 Ubuntu 上又跑了一次，实际 $0.0316。两次样本，只说明回合程序和 OpenRouter 客户端能跑通，见下面“付费探测工具”的 own 版本 |
+| own 上的联网搜索 | **未做**。只有离线测试（mock QQ、mock 模型、mock 搜索），真实 Sonar 上一次都没有跑过，搜索的付费探测（`scripts\search-probe.ps1`）也没有跑过。搜索打开时 `clo mode live` 一律拒绝 |
 | own 上直连 Anthropic | **未做**。只有离线测试（mock Anthropic），真实 Anthropic 上一次都没有跑过。Anthropic 的付费探测（`q5-anthropic.ps1`）也没有跑过，见下面“付费探测工具”的 Anthropic 版本 |
 
 ## 在哪里验证过
@@ -349,14 +350,15 @@
 | 项目 | 状态 |
 |---|---|
 | 默认 | 仍是 `openclaw`。切换和回退要停一次进程、改 `config.json` 的 `runtime`、`clo apply`、再启动 |
-| 真实 QQ | **没有跑过** |
-| 真实模型、真实 OpenRouter | 只有一次付费探测（Q5，2026-11-07）：两个回合，回合程序和 OpenRouter 客户端在探测进程里跑，不接 QQ，没有 gate、出口和账本。见上面“付费探测工具”里的 own 版本 |
+| 真实 QQ | 只在一个测试群里做过 Q3、Q4、Q6、Q7（2026-11-17，用户的 Ubuntu 机器，每种情况一两条消息）。真实群没有跑过 |
+| 真实模型、真实 OpenRouter | 测试群里 Q6、Q7 的回合（2026-11-17，共约 $0.055），加两次付费探测（2026-11-07、2026-11-17）。探测是两个回合，回合程序和 OpenRouter 客户端在探测进程里跑，不接 QQ，没有 gate、出口和账本。见上面“付费探测工具”里的 own 版本 |
 | 离线 e2e（`tests/e2e-own/`） | 整合和修复之后，28 个文件以并发 4 跑全量，239 项全过。没有串行跑过全量 |
 | 没有 PID 记录的 bot | 比如启动时控制台被杀，bot 还在跑但没有记录。它的租约还新鲜、进程还在时，插件拒绝连接，`clo start` 拒绝启动，`clo stop` 请它自己退出。从启动到写 PID 记录之间约 1.5 秒的窗口还在。只离线测过 |
 | 内存 | 只在 mock 上量过一次，见上面“内存” |
 | 模型接口 | OpenRouter（默认）或直连 Anthropic，用 `clo provider use` 换，换一次算一次模型变更。直连 Anthropic 只离线测过，真实 Anthropic 上没有跑过。离线 e2e 里 `provider-anthropic.test.mjs` 总是走 mock Anthropic，其余和接口有关的文件设 `CLO_TEST_PROVIDER=anthropic` 时也走它 |
 | 会话库、`clawhub.ai`、按成员删除 | **缺口都没有关闭**。按代码 own 下没有会话库，也不访问 `clawhub.ai`，离线测试里也没看到，但真实运行没有确认；以前的会话库切换后照样留着；按成员删除仍做不到 |
-| 付费探测 | 按 2026-11-06 的新计划：两个回合，第 2 回合放得下才发，最坏 $0.094144，最多 2 次模型调用，读 `CLO_TEST_API_KEY`，`scripts\q5-probe.ps1 -Runtime own`。在真实 OpenRouter 上跑过一次（2026-11-07），两回合都完成，合计 $0.0338，一次样本。见上面“付费探测工具”里的 own 版本 |
+| 付费探测 | 按 2026-11-06 的新计划：两个回合，第 2 回合放得下才发，最坏 $0.094144，最多 2 次模型调用，读 `CLO_TEST_API_KEY`，`scripts\q5-probe.ps1 -Runtime own`。在真实 OpenRouter 上跑过两次：2026-11-07 合计 $0.0338，2026-11-17 在 Ubuntu 上合计 $0.0316，两回合都完成。见上面“付费探测工具”里的 own 版本 |
+| 联网搜索 | 只在 own 上有。`clo search enable` 打开（算一次模型变更），每群 `clo group set <群> --search on`。只离线测过，真实 Sonar 没有跑过；搜索打开时 `clo mode live` 拒绝，直到付费探测做完、规则写进来。探测工具 `scripts\search-probe.ps1` 按工具里的价格上限最坏 $0.0619，还没有跑过。见 README 的“联网搜索” |
 | `/stop` 同一秒的消息 | own 下跳过，不调模型，不发失败句，不预留（带危险词的除外）。openclaw 下的情况见“还没解决，要部署者决定”里 `/stop` 那一条。切换时要在 README 里改写这一条 |
 
 ## 测试结果

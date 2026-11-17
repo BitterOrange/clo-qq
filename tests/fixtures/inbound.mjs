@@ -11,6 +11,7 @@ import { loadPolicy } from '../../src/clo-plugin/lib/core/contentPolicy.js';
 import { createGate } from '../../src/clo-plugin/lib/core/gate.js';
 import { createLedger } from '../../src/clo-plugin/lib/core/ledger.js';
 import { openStore } from '../../src/clo-plugin/lib/core/store.js';
+import { createSearchStep } from '../../src/clo-plugin/lib/core/search.js';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 // 12:00 in Shanghai.
@@ -94,6 +95,21 @@ export const ANTHROPIC_BASE = 'http://127.0.0.1:9';
 // with their locked prices. hardCap is the copied ack, null when there is none.
 // The prices are fresh copies set after the merge: merging into the shared default price objects would change them for
 // every later test.
+// The search block as config.js writes it with search on (docs/search-contract.md section 2), with mock prices.
+export const SEARCH_PRICE = Object.freeze({ inputPerM: 3, outputPerM: 15, requestUsd: 0.005 });
+export const searchBlock = (over = {}) => ({
+  provider: 'openrouter-sonar', model: 'perplexity/sonar-pro', baseUrl: 'http://127.0.0.1:9/api/v1', perAnswer: 2, perDay: 10, maxTokens: 600,
+  resultMaxChars: 1500, queryMaxChars: 80, searchMs: 20000, price: { ...SEARCH_PRICE }, ...over,
+});
+
+// An effective file of the own runtime with search on, and on in both groups unless over says otherwise.
+export function searchEffective(over = {}) {
+  const eff = makeEffective({ runtime: 'own', budget: { searchKeyDailyLimitUsd: 0.5 } });
+  eff.search = searchBlock();
+  for (const g of Object.values(eff.qq.groups)) g.search = true;
+  return deepMerge(eff, over);
+}
+
 export function anthropicEffective(over = {}, { hardCap = null } = {}) {
   const { models, ...rest } = over;
   const eff = makeEffective({ runtime: 'own', apiProvider: { name: 'anthropic', kind: 'anthropic', baseUrl: ANTHROPIC_BASE, hardCap }, ...rest });
@@ -195,7 +211,9 @@ export function fakeExit(over = {}) {
 }
 
 // runtime: the process's own runtime for the gate and the ledger; left out, their default (openclaw), as before.
-export function makeHarness({ effective, decide, dispatch, exit, dbFile, start = T0, attach = true, runGen = 'gen-1', log, runtime } = {}) {
+// searchClient: with runtime 'own', the gate gets the real search step (search.js) over this client, the harness's
+// ledger and the real policy. searchSecrets: what the step treats as the process's secrets.
+export function makeHarness({ effective, decide, dispatch, exit, dbFile, start = T0, attach = true, runGen = 'gen-1', log, runtime, searchClient, searchSecrets = [] } = {}) {
   const clock = { t: start };
   const now = () => clock.t;
   const eff = { current: effective === undefined ? makeEffective() : effective };
@@ -246,6 +264,7 @@ export function makeHarness({ effective, decide, dispatch, exit, dbFile, start =
     now,
     timers,
     ...pinned,
+    ...(searchClient ? { search: createSearchStep({ client: searchClient, ledger, policy, getEffective, log: logFn, now, secrets: () => searchSecrets }) } : {}),
   });
   if (attach) gate.attachExit(exitObj);
 

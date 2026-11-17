@@ -77,6 +77,11 @@ export function collectStatus(ctx) {
   report.heartbeatFresh = heartbeatAt !== null && at - heartbeatAt <= HEARTBEAT_FRESH_MS;
   report.alive = report.pidState === 'running' && report.heartbeatFresh;
   report.budget = effective?.budget ?? null;
+  // Search as the running process reads it: on only when the effective file carries the block (own runtime only).
+  const search = effective?.search ?? null;
+  report.search = search
+    ? { on: true, perDay: search.perDay, priceLocked: Boolean(search.price), keyDailyLimitUsd: effective.budget?.searchKeyDailyLimitUsd ?? null, groupsOn: Object.values(effective.qq?.groups ?? {}).filter((g) => g.search === true).length }
+    : { on: false };
   return report;
 }
 
@@ -130,8 +135,16 @@ export function formatStatus(s) {
   const us = (m) => `$${(m / 1e6).toFixed(4)}`;
   const b = s.budget;
   lines.push(`今日花费（上海日）：插话 ${us(d.spendToday.interject)}${b ? `/$${b.interjectUsd}` : ''}，点名 ${us(d.spendToday.named)}${b ? `/$${b.namedUsd}` : ''}，@ ${us(d.spendToday.addressed)}${b ? `/$${b.addressedUsd}` : ''}，未归属 ${us(d.spendToday.none)}`);
+  // Search: shown while it is on, and while anything of it is left (a pause, today's spend).
+  const sr = s.search ?? { on: false };
+  if (sr.on || d.searchPaused || (d.spendToday.search ?? 0) > 0) {
+    const count = sr.on ? `${d.searchCountToday ?? 0}/${sr.perDay} 次` : `${d.searchCountToday ?? 0} 次`;
+    const price = sr.on && !sr.priceLocked ? '；价格还没锁定（clo search lock），不会搜索' : '';
+    const key = sr.on ? `；搜索 Key 日限额（配置）$${sr.keyDailyLimitUsd}，只有它能拒绝请求` : '';
+    lines.push(`搜索：${sr.on ? `打开（${sr.groupsOn} 个群）` : '关闭'}；今日 ${count}，花费 ${us(d.spendToday.search ?? 0)}${b ? `（当天总花费到 $${b.searchUsd} 停）` : ''}；搜索暂停：${d.searchPaused ?? '否'}${price}${key}`);
+  }
   // ref_key is null both when ref_idx is missing and when it is not a string. Only exit_post's refState tells them apart.
-  lines.push(`未结算：${d.unsettled} 笔，${us(d.unsettledMicros)}；发送结果不确定：${d.sendsUncertain} 条；bot_refs：${d.botRefsSeen}（已发送但没有可用 ref_idx：${d.sendsNoRef} 条）；今日判定跳过（总数）：${d.skipClassToday}`);
+  lines.push(`未结算：${d.unsettled} 笔，${us(d.unsettledMicros)}；发送结果不确定：${d.sendsUncertain} 条；bot_refs：${d.botRefsSeen}（已发送但没有可用 ref_idx：${d.sendsNoRef} 条）；今日按内容类别跳过：${d.skipClassToday}`);
   const events = Object.entries(d.eventsToday).map(([k, v]) => `${k} ${v}`).join('，');
   lines.push(`今日事件：${events || '无'}`);
   if (d.alerts.length === 0) lines.push('告警：无');

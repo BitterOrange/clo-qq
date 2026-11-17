@@ -5,8 +5,8 @@
 ## 现状
 
 - **新运行时已经写好，放在配置项 `runtime: "own"` 后面。默认仍是 `openclaw`。** `config.example.json` 写的是 `openclaw`，没写这一项的 `config.json` 也按 `openclaw` 算。
-- **现在真正在跑的仍是 OpenClaw 这条路。** README 和 DEPLOYMENT 里的真实 QQ 记录（Q3 到 Q7）全部是在 OpenClaw Gateway 上得到的，对新运行时不算数。
-- **新运行时在真实 QQ 上的验收一项都没有做。** 没有连过真实 QQ。真实模型和真实 OpenRouter 只有一次付费探测（Q5，2026-11-07，两个回合，不接 QQ，见下面“付费探测”）。除了那一节，下面所有的“已观察”都是离线的：mock QQ、mock OpenRouter、临时目录、假密钥。
+- **配置的默认值仍是 OpenClaw 这条路。** DEPLOYMENT 阶段表里 Windows 上的真实 QQ 记录（Q3 到 Q7）是在 OpenClaw Gateway 上得到的，对新运行时不算数。用户 2026-11-17 定了之后的实现和测试优先用新运行时。
+- **新运行时在真实 QQ 上只在一个测试群里做过 Q3、Q4、Q6、Q7**（2026-11-17，用户的 Ubuntu 机器，每种情况只看了一两条消息，见 `DECISIONS.md`）。own 的 Q5 阶段没有做，真实群验收（Q8 到 Q10）没有做。真实模型和真实 OpenRouter 另有两次付费探测（2026-11-07、2026-11-17，两个回合，不接 QQ，见下面“付费探测”）。除了这些，下面所有的“已观察”都是离线的：mock QQ、mock OpenRouter、临时目录、假密钥。
 - **模型接口：** 新运行时可以走 OpenRouter（默认），也可以换成直连 Anthropic，见下面“模型接口”。直连 Anthropic 只在离线测试（mock Anthropic）里跑过，**真实 Anthropic 上一次都没有跑过**。
 - 按决定，要在测试群里把 Q3 到 Q7 在新运行时上重做一遍，才把默认改成 `own`；改完默认之后，才删 OpenClaw 的代码和依赖，那时再改写 `CLAUDE.md` 里提到宿主的规则。在那之前，`CLAUDE.md` 写的宿主规则仍然适用于 `openclaw` 这条路。
 
@@ -86,6 +86,15 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 - **数据去哪里：** 用 OpenRouter 时，消息经 OpenRouter 到实际的模型服务方；直连 Anthropic 时，消息直接发给 Anthropic。告知草稿“消息发给谁”那一句按在用的接口填。本机这边，`clo.db` 升到第 2 版（预算记录多一列接口类型），升级前的整份旧库留成 `clo.db.v1.bak`，保留多久见 README 的“数据和隐私”。
 - **没有确认的：** Haiku 关闭思考加 effort low 能不能用、错误的真实形状（余额用完、花费上限、403）、响应里的地区和速度字段、出错或中止的请求收不收费，都等付费探测（`scripts\q5-anthropic.ps1`，还没有跑过）。
 
+## 联网搜索
+
+只在 own 运行时有，openclaw 运行时这一版没有。用户 2026-11-17 的决定见 [DECISIONS.md](../DECISIONS.md) 的“用户定的（2026-11-17，搜索）”，合同在 [search-contract.md](search-contract.md)（英文），命令和说明见 README 的“联网搜索”。
+
+- **只离线验证过。** 真实 Sonar 上没有跑过，付费探测（`scripts\search-probe.ps1`、`scripts/search-probe.sh`）也没有跑过。搜索打开时 `clo mode live` 一律拒绝（`search_rules`）。
+- **打开和关闭：** `clo search lock --confirm-price`，`clo search enable --confirm`（启用 QQ 时加 `--qq-platform-notified`），每群 `clo group set <群> --search on`；关用 `clo search disable`。打开算一次模型变更，清除每个群的“已告知”和 D3 记录；打开一个群的开关清除这个群的“已告知”。手改 `searchProvider` 被 `clo apply`、`clo start` 和 `clo mode live` 拒绝。
+- **进程拿到哪个 Key：** 搜索打开时，可洛进程多拿一个搜索 Key（`.env` 里是 `CLO_SEARCH_API_KEY`，进程里叫 `CLO_SEARCH_KEY`），不算模型 Key；Gateway 永远拿不到。进程每次启动在 `clo.db` 记下它的加盐散列，`clo mode live` 拿来和 `.env` 比。
+- **钱：** 硬上限是搜索 Key 自己的每日限额，金额由部署者定，写进 `budget.searchKeyDailyLimitUsd`；本机账本另有搜索层级和次数。对话直连 Anthropic 时搜索照样经 OpenRouter。
+
 ## 内存
 
 **只在离线测试里量过**：Windows，私有 Node，mock QQ，mock 模型，用这份代码的 `src/bot/main.mjs`，一次样本。
@@ -136,7 +145,7 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 - 这一次看到的：系统块是 4359 个真实 token；请求形状（系统块上带 `cache_control` 的 content part、effort low、`max_tokens` 1200、`require_parameters`、没有工具）被接受；缓存先写后读；报告的费用等于 token 乘目录价；服务方是 anthropic，`finish_reason` 是 stop。
 - 没有看到的：own 下的判定调用、真实 QQ、拒答、1 小时缓存、中止的请求怎么计费。探测进程里没有 gate、出口和账本，回答内容也没有记录。
 
-所以这只说明回合程序和 OpenRouter 客户端能在真实 OpenRouter 上跑通一次，不算 own 在 QQ 上的验收。Q3 到 Q7 在 own 上仍然都没有做，这次探测也不算其中的 Q5：Q5 要真实模型加 mock QQ，探测里没有 QQ，也没有 gate、出口和账本。
+所以这只说明回合程序和 OpenRouter 客户端能在真实 OpenRouter 上跑通一次，不算 own 在 QQ 上的验收。当时 Q3 到 Q7 在 own 上都还没有做（2026-11-17 做了 Q3、Q4、Q6、Q7），这次探测也不算其中的 Q5：Q5 要真实模型加 mock QQ，探测里没有 QQ，也没有 gate、出口和账本。
 
 正式运行的省钱办法这一轮没有做，记在 [cost-options.md](cost-options.md)。
 
@@ -181,6 +190,8 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 | `tool-list.test.mjs` | `tool-list.test.mjs` | 证明请求里没有 `tools` 字段，调工具的回答按失败算 |
 | 没有 | `provider-anthropic.test.mjs` | 新增：直连 Anthropic，旁边一套 OpenRouter 作对照。按 token 结算、价格标记、拒答、403、429 和 529 的连败、花费上限和余额的形状（没确认）、启动时的硬上限检查、不对账 |
 | 没有 | `smoke.test.mjs` | 新增：一次 @、一次请求、结算、停机、不监听 |
+| 没有 | `search-stack.test.mjs` | 新增：搜索打开时（两种对话接口）可洛进程照常启动和回复，用搜索 Key 在搜索地址读 Key；判定说不搜时不搜。openclaw 运行时没有搜索 |
+| 没有 | `search.test.mjs` | 新增：真实 @ 的搜索（成功带来源名、没有网址；未准入的群不搜；超时和没有来源如实说；本地拒绝什么都不发；判定失败照常回答；网页文字不能触发任何动作；对话在 Anthropic、搜索在 OpenRouter）。都是 mock，不说明真实 Sonar 的行为 |
 
 只在宿主上有意义、移植时去掉的检查：宿主提示文字、宿主文件日志、宿主看门狗、`openclaw.json`、通道和插件重载、插件加载。单元测试里 `host-notices`、`host-output-filter`、`render-validate` 和 `render` 的 `openclaw.json` 部分只守 openclaw 路线，切换之前继续跑。
 

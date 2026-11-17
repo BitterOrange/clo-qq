@@ -153,7 +153,7 @@ test('the temp-root text says what happens when it cannot be deleted', () => {
 });
 
 // The repo is public. These hold what was decided for the public text.
-const PUBLIC_DOCS = ['README.md', 'DEPLOYMENT.md', 'DECISIONS.md', 'docs/group-chat-design.md', 'docs/q0a-guide.zh.md', 'docs/wiring-trial.md', 'docs/own-runtime.md', 'docs/cost-options.md', 'docs/provider-contract.md'];
+const PUBLIC_DOCS = ['README.md', 'DEPLOYMENT.md', 'DECISIONS.md', 'docs/group-chat-design.md', 'docs/q0a-guide.zh.md', 'docs/wiring-trial.md', 'docs/own-runtime.md', 'docs/cost-options.md', 'docs/provider-contract.md', 'docs/search-contract.md'];
 
 test('public docs do not send a reader to files that are not in the repo, or name private things', () => {
   const documentation = /^(?:127\.0\.0\.1|0\.0\.0\.0|192\.0\.2\.\d+|198\.51\.100\.\d+|203\.0\.113\.\d+)$/;
@@ -407,30 +407,35 @@ test('fixed gaps have left the open lists, and what still awaits a decision stay
 const OWN_DOC = read('docs/own-runtime.md');
 const DESIGN_DOC = read('docs/group-chat-design.md');
 
-test('the own runtime is described as built, not the default, and not accepted on real QQ', () => {
+test('the own runtime is described as built, not the default, tried in one test group only, and without its Q5 stage', () => {
   assert.equal(JSON.parse(read('config.example.json')).runtime, 'openclaw', 'the template still names the default');
   for (const [name, text] of [['README', README], ['DEPLOYMENT', DEPLOYMENT], ['own-runtime', OWN_DOC]]) {
     assert.match(text, /runtime: "own"/, `${name} names the switch`);
     assert.match(text, /默认仍是 `openclaw`|仍是 `openclaw`|默认值 `openclaw`/, `${name} says what the default is`);
   }
-  assert.match(README, /现在跑的也是它，上面这些真实记录都是在 OpenClaw 上得到的/);
-  assert.match(README, /新运行时在真实 QQ 上的验收一项都没有做/);
-  assert.match(DEPLOYMENT, /\| 自己的运行时（own）上的 Q3 到 Q7 \| \*\*未做\*\*。真实 QQ 上一项都没有做/);
+  // 2026-11-17: Q3, Q4, Q6 and Q7 ran on own in one test group; its Q5 stage and the real-group stages did not.
+  assert.match(README, /own 运行时在测试群里走过了 Q3、Q4、Q6、Q7，Q5 探测工具又跑了一次（不接 QQ，不算 own 的 Q5 阶段/);
+  assert.match(DEPLOYMENT, /\| 自己的运行时（own）上的 Q3 到 Q7 \| 2026-11-17 在用户的 Ubuntu 机器上、测试群里做了 Q3、Q4（dry-run）、Q6（live，只回应真实 @）、Q7（点名、插话）[^|]*own 的 Q5 阶段\*\*未做\*\*/);
   assert.match(DEPLOYMENT, /\| own 的付费探测（Q5 探测工具，不接 QQ） \| 跑过一次（2026-11-07），真实 OpenRouter/);
   // The probe has no QQ, gate, exit or ledger, so it is not stage Q5 on own: no doc may carve Q5 out of the undone
   // Q3 to Q7 or list own Q5 as a finished stage. Positive control: the scan catches the carve-out when planted.
   const ownQ5Done = ['Q3 到 Q7（Q5 除外）', '（own）上的 Q5 | 已运行', 'own 的 Q5 已做', 'own 上的 Q5 已'];
   assert.throws(() => assertGone(`${DEPLOYMENT}\n| 自己的运行时（own）上的 Q3 到 Q7（Q5 除外） | **未做** |`, ownQ5Done, 'DEPLOYMENT with a planted carve-out'), /still says/);
   for (const [name, text] of [['DEPLOYMENT', DEPLOYMENT], ['own-runtime', OWN_DOC], ['README', README], ['DECISIONS', DECISIONS_TEXT()], ['design', DESIGN_DOC]]) assertGone(text, ownQ5Done, name);
-  assert.match(DEPLOYMENT, /下一行的探测也不算 own 的 Q5：Q5 要真实模型加 mock QQ/);
+  assert.match(DEPLOYMENT, /下一行的探测不算 own 的 Q5，Q5 要真实模型加 mock QQ/);
   assert.match(OWN_DOC, /这次探测也不算其中的 Q5：Q5 要真实模型加 mock QQ/);
   assert.match(DECISIONS_TEXT(), /这次探测不算 own 的 Q5 阶段（Q5 要真实模型加 mock QQ），Q3 到 Q7 在 own 上都没有做/);
-  assert.match(DEPLOYMENT, /\| 真实 QQ \| \*\*没有跑过\*\* \|/);
-  assert.match(DEPLOYMENT, /\| 真实模型、真实 OpenRouter \| 只有一次付费探测（Q5，2026-11-07）/);
-  assert.match(OWN_DOC, /新运行时在真实 QQ 上的验收一项都没有做/);
-  assert.match(OWN_DOC, /现在真正在跑的仍是 OpenClaw 这条路/);
+  assert.match(DEPLOYMENT, /\| 真实 QQ \| 只在一个测试群里做过 Q3、Q4、Q6、Q7（2026-11-17[^|]*真实群没有跑过 \|/);
+  assert.match(DEPLOYMENT, /\| 真实模型、真实 OpenRouter \| 测试群里 Q6、Q7 的回合（2026-11-17[^|]*加两次付费探测/);
+  assert.match(OWN_DOC, /新运行时在真实 QQ 上只在一个测试群里做过 Q3、Q4、Q6、Q7/);
+  assert.match(OWN_DOC, /own 的 Q5 阶段没有做，真实群验收（Q8 到 Q10）没有做/);
+  assert.match(OWN_DOC, /配置的默认值仍是 OpenClaw 这条路/);
   assert.match(DESIGN_DOC, /that is still the default \(`runtime: 'openclaw'`\) and what runs/);
-  assert.match(DESIGN_DOC, /no real QQ acceptance has been done on it/);
+  assert.match(DESIGN_DOC, /on real QQ in one test group only \(Q3, Q4, Q6 and Q7 on 2026-11-17[^)]*\); no real-group acceptance has been done on it/);
+  // No doc may count own's Q5 stage as done, or say Q3 to Q7 all ran on own. Positive control: a planted claim is caught.
+  const ownAllDone = ['own 运行时在测试群里走过了 Q3 到 Q7', '在测试群里走过 Q3 到 Q7', 'own 的 Q5 阶段已'];
+  assert.throws(() => assertGone(`${README}\nown 运行时在测试群里走过了 Q3 到 Q7`, ownAllDone, 'README with a planted claim'), /still says/);
+  for (const [name, text] of [['DEPLOYMENT', DEPLOYMENT], ['own-runtime', OWN_DOC], ['README', README], ['DECISIONS', DECISIONS_TEXT()]]) assertGone(text, ownAllDone, name);
   for (const [name, text] of [['README', README], ['DEPLOYMENT', DEPLOYMENT], ['own-runtime', OWN_DOC], ['design', DESIGN_DOC]]) {
     assertGone(text, ['默认是 `own`', '已切换到 own', 'own 运行时已上线', 'own 已验收', 'default is `own`'], name);
   }
@@ -553,7 +558,7 @@ test('the own probe figures are the ones its plan prints, and its one real run i
     assert.match(text, /不算 own 在 QQ 上的验收|这不是 own 在 QQ 上的验收/, `${name} says the run is not QQ acceptance`);
     for (const gap of ['拒答', '1 小时缓存', '中止的请求怎么计费', '判定']) assert.ok(text.includes(gap), `${name} says ${gap} was not observed`);
   }
-  assert.match(OWN_DOC, /Q3 到 Q7 在 own 上仍然都没有做/);
+  assert.match(OWN_DOC, /当时 Q3 到 Q7 在 own 上都还没有做（2026-11-17 做了 Q3、Q4、Q6、Q7），这次探测也不算其中的 Q5/);
   assert.match(read('docs/cost-options.md'), /own 的系统块在 own 的 Q5 里实测 4359 token（一次样本/);
   // Nothing says the own runtime was accepted or deployed on QQ. Positive control: the scan catches such a claim.
   const accepted = ['own 已在真实 QQ', '新运行时已验收', 'own 已验收', 'own 在 QQ 上已验收', '新运行时在真实 QQ 上跑过', 'own 的 Q6 已', '已完成部署'];
@@ -1017,4 +1022,79 @@ test('merged tree: the D6 row matches the own-runtime OpenRouter settlement and 
   const recorded = /COST_ABOVE_COMPUTED_ALERT|cost_above_computed/.test(read('src/clo-plugin/lib/core/gate.js'));
   const row = DECISIONS_TEXT().split('\n').find((l) => l.startsWith('| OpenRouter 在 own 上怎么结算（规划 D6） |'));
   assert.equal(row.includes('结算的地方还没有把它记下来'), !recorded, 'the row says the alert is unrecorded exactly while gate.js does not record it');
+});
+
+// Search (2026-11-17): the decided path is written where the rules are, nothing claims it ran, and the live refusal the
+// docs describe is the one the code has.
+test('CLAUDE.md section 6 and DECISIONS.md record the decided search path, own runtime only, and no doc claims search ran', async () => {
+  const { SEARCH_RULES_RECORDED, SEARCH_MODEL, SEARCH_KEY_ENV, SEARCH_CHILD_KEY } = await import('../../src/clo-plugin/lib/core/providers/searchRegistry.js');
+  const CLAUDE = read('CLAUDE.md');
+  const plan = sectionOf(CLAUDE, '### 默认搜索方案', '### 搜索行为');
+  const behaviour = sectionOf(CLAUDE, '### 搜索行为', '## 7. ');
+  assert.ok(plan.length > 0 && behaviour.length > 0, 'positive control: both sections were found');
+  for (const item of ['用户定的（2026-11-17）', '`docs/search-contract.md`', 'own 运行时', `\`${SEARCH_MODEL['openrouter-sonar']}\``, `\`${SEARCH_KEY_ENV}\``, '不经过 `web_search` 工具', '`@openclaw/perplexity-plugin`', '主模型的请求里仍然没有工具', '对话直连 Anthropic', '`--qq-platform-notified`', '`qq.groups[id].search`', '插话这一版不搜', '“来源：…”', '`clo mode live` 拒绝']) {
+    assert.ok(plan.includes(item), `the search plan has ${item}`);
+  }
+  for (const item of ['每次回答最多 2 次搜索调用，每天最多 10 次', '“这个我不查”', '由主模型说', '过出口内容策略', '挡不住语义上不必要的词']) assert.ok(behaviour.includes(item), `search behaviour has ${item}`);
+  // The old path is gone from the rules; a planted copy would be caught.
+  const oldPath = ['`web_search` → `@openclaw/perplexity-plugin`', '这一版必须是 `none`', 'web_search（之后才启用）', '之后只加所需的搜索'];
+  assert.throws(() => assertGone(`${CLAUDE}\n启用时只走一种路径：\`web_search\` → \`@openclaw/perplexity-plugin\`。`, oldPath, 'planted'), /still says/);
+  assertGone(CLAUDE, oldPath, 'CLAUDE.md');
+  const keyRow = CLAUDE.split('\n').find((l) => l.startsWith(`| \`${SEARCH_KEY_ENV}\` |`));
+  assert.ok(keyRow.includes(`\`${SEARCH_CHILD_KEY}\``) && keyRow.includes('Gateway 永远拿不到它') && keyRow.includes('不能和对话 Key、探测 Key 相同'), 'the key table row');
+  assert.match(sectionOf(CLAUDE, '### 8.2 预算', '### 8.3 '), /\| 搜索 Key 日限额（OpenRouter，搜索打开时） \| 由用户定，还没定。.*`budget\.searchKeyDailyLimitUsd`/);
+
+  const DECISIONS = DECISIONS_TEXT();
+  const decided = sectionOf(DECISIONS, '## 用户定的（2026-11-17，搜索）', '## 开发时定的，用户还没有确认（2026-11-17，搜索）');
+  assert.ok(decided.length > 0, 'the section exists');
+  for (const d of ['| D0 搜索的路径 |', '| 先做哪个运行时 |', '| D1 ', '| D2 ', '| D3 ', '| D4 ', '| D5 ', '| D6 ', '| D7 ', '| 金额 |']) assert.ok(decided.includes(d), d);
+  const row = DECISIONS.split('\n').find((l) => l.startsWith('| 搜索 |'));
+  assert.match(row, /^\| 搜索 \| 已定（2026-11-17）/);
+  assert.doesNotMatch(row, /^\| 搜索 \| 启用搜索时再定。倾向/);
+  assert.match(sectionOf(DECISIONS, '## 开发时定的，用户还没有确认（2026-11-17，搜索）', '## 待定（决策点 D）'), /`SEARCH_RULES_RECORDED` 现在是 false/);
+
+  // The live refusal the docs describe is the code's, and nothing says search ran or is enabled.
+  assert.equal(SEARCH_RULES_RECORDED, false, 'the docs say live is refused while search is on');
+  assert.match(read('src/cli/clo.mjs'), /search_rules: '搜索打开时还不能 live/, 'positive control: the console explains the refusal');
+  const CONTRACT = read('docs/search-contract.md');
+  assert.match(CONTRACT, /`SEARCH_RULES_RECORDED`[^\n]*is false/);
+  assert.match(CONTRACT, /\*\*None made\.\*\* Nothing here has run against the real Sonar API/);
+  const ran = ['搜索已启用', '搜索已上线', '在真实 Sonar 上跑过', 'search is live', 'ran against real Sonar', 'search ran for real'];
+  assert.throws(() => assertGone(`${CONTRACT}\nsearch is live.`, ran, 'planted'), /still says/);
+  for (const name of PUBLIC_DOCS) assertGone(read(name), ran, name);
+  assertGone(CLAUDE, ran, 'CLAUDE.md');
+});
+
+test('the console, the notice draft and the probe are described as offline only, and the stale "not written" text is gone', () => {
+  const DECISIONS = DECISIONS_TEXT();
+  const CONTRACT = read('docs/search-contract.md');
+  const notice = read('persona/group-notice.zh.md');
+  // What the console and the probe are now.
+  const searchSection = sectionOf(README, '### 联网搜索（只在新运行时）', '### 在线条件和重启');
+  assert.ok(searchSection.length > 0, 'positive control: README has the search section');
+  for (const item of ['**只离线验证过。**', 'clo.ps1 search enable --confirm --qq-platform-notified', 'group set 测试群 --search on', 'search disable', '`search_key_limit`', '拦不住人名或私事', '**还没有跑过，要你先同意金额。**']) {
+    assert.ok(searchSection.includes(item), `README search section has ${item}`);
+  }
+  assert.match(README, /\| OpenRouter、Perplexity（新运行时打开搜索时） \| 检索词和一句固定的说明 \|/, 'a data-retention row for the new recipients');
+  assert.match(README, /\| 搜索在本机留下的（新运行时打开搜索时） \|[^\n]*没有扫过真实运行留下的文件 \|/, 'and for what stays on this machine');
+  assert.match(DEPLOYMENT, /\| own 上的联网搜索 \| \*\*未做\*\*/);
+  // The notice: the search item per group, who receives the terms, and what the program cannot hold back.
+  assert.match(notice, /- \*\*联网搜索（这个群现在：<开\/关>）：\*\*/);
+  assert.match(notice, /经 OpenRouter 发给 Perplexity/);
+  assert.match(notice, /拦不住人名或私事被写进检索词/);
+  assert.match(notice, /@ 它和回复它的消息也会先这样发给判定模型一次/);
+  assert.match(notice, /还没有在真实的 Perplexity 上用过/);
+  assert.match(sectionOf(DECISIONS, '## 用户定的（2026-11-17，搜索）', '## 开发时定的，用户还没有确认（2026-11-17，搜索）'), /告知草稿改过了，按 D5 要你本人看过再用/);
+  const devRows = sectionOf(DECISIONS, '## 开发时定的，用户还没有确认（2026-11-17，搜索）', '## 待定（决策点 D）');
+  for (const row of ['| 打开搜索（`clo search enable', '| 手改 `searchProvider` |', '| 关搜索（`clo search disable`） |', '| 每群开关（', '| `clo mode live` 的搜索检查 |', '| 付费探测工具 |']) assert.ok(devRows.includes(row), row);
+  assert.match(CONTRACT, /## 8\. Turning it on, the live checks and the probe \(implemented\)/);
+  assert.match(CONTRACT, /The probe has never run with `--approve`/);
+  // The probe's worst case in the docs is the tool's own figure.
+  assert.match(read('src/tools/search-probe.mjs'), /search: Object\.freeze\(\{ inputPerM: 5, outputPerM: 20, requestUsd: 0\.02 \}\)/);
+  for (const [name, text] of [['README', README], ['DEPLOYMENT', DEPLOYMENT], ['contract', CONTRACT], ['DECISIONS', DECISIONS]]) {
+    if (name !== 'DECISIONS') assert.ok(text.includes('$0.0619'), `${name} names the probe's worst case`);
+  }
+  const stale = ['搜索还没做完', '名字沿用了还没做的搜索额度', '以后由 `clo search enable` 写', '**Not written yet**', 'Live checks (console step, not written)', '还没有写，现在只能手改配置打开', 'Still to write with their steps', '**Must be `none` in this build**'];
+  assert.throws(() => assertGone(`${README}\n搜索还没做完`, stale, 'planted'), /still says/);
+  for (const name of PUBLIC_DOCS) assertGone(read(name), stale, name);
 });

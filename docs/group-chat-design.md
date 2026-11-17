@@ -8,7 +8,7 @@ Precedence: `DECISIONS.md` and the review notes in `docs/wiring-trial.md` overri
 
 When this was written, nothing here had run on real QQ or real OpenRouter. `DEPLOYMENT.md` says what has run since. Offline tests prove wiring, not platform behaviour.
 
-**Two runtimes.** This contract was written for the OpenClaw Gateway, and that is still the default (`runtime: 'openclaw'`) and what runs. A second runtime, `runtime: 'own'` (`src/bot/main.mjs`, `core/turn.js`, `core/openrouterChat.js`), replaces the host with the project's own process; see `DECISIONS.md` (去掉 OpenClaw，改用自己的运行时) and [own-runtime.md](own-runtime.md). It has run offline, with mock QQ and a mock model, and once against real OpenRouter in the paid probe (Q5: two turns through the turn runner and its client, no QQ, gate, exit or ledger; see `DEPLOYMENT.md`); no real QQ acceptance has been done on it. Sections 7.4 and 8 and the host rows of section 10 apply to `openclaw` only. The own runtime's deltas are under "From the own runtime" at the end. This document is rewritten for one runtime at the cutover, not before.
+**Two runtimes.** This contract was written for the OpenClaw Gateway, and that is still the default (`runtime: 'openclaw'`) and what runs. A second runtime, `runtime: 'own'` (`src/bot/main.mjs`, `core/turn.js`, `core/openrouterChat.js`), replaces the host with the project's own process; see `DECISIONS.md` (去掉 OpenClaw，改用自己的运行时) and [own-runtime.md](own-runtime.md). It has run offline, with mock QQ and a mock model, twice against real OpenRouter in the paid probe (two turns through the turn runner and its client, no QQ, gate, exit or ledger; see `DEPLOYMENT.md`), and on real QQ in one test group only (Q3, Q4, Q6 and Q7 on 2026-11-17, one or two messages each); no real-group acceptance has been done on it. Sections 7.4 and 8 and the host rows of section 10 apply to `openclaw` only. The own runtime's deltas are under "From the own runtime" at the end. This document is rewritten for one runtime at the cutover, not before.
 
 ## 0. Assumptions and open items
 
@@ -521,7 +521,7 @@ Reload of the plugin generation goes through the same path. `gate.stop()` marks 
 | `named` | `effective + hold ≤ namedUsd` |
 | `addressed` | `effective + hold ≤ addressedUsd` (equal to `dailyUsd`) |
 
-`effective = max(local settled + held + unsettled for the Shanghai day, provider figure for the same period)`. `paid_paused` refuses every tier. Validator requires `interjectUsd ≤ searchUsd ≤ namedUsd ≤ addressedUsd = dailyUsd`. `searchUsd` has no search behind it in this build; it stays as interjection's global stop so the plan's stop order holds.
+`effective = max(local settled + held + unsettled for the Shanghai day, provider figure for the same period)`. `paid_paused` refuses every tier. Validator requires `interjectUsd ≤ searchUsd ≤ namedUsd ≤ addressedUsd = dailyUsd`. `searchUsd` is also interjection's global stop, so the plan's stop order holds; on the own runtime with search on it is the search tier's line as well (`docs/search-contract.md` section 7).
 
 **State machine:** `held → settled | released | unsettled`, `unsettled → settled` (key delta or late usage, or manual).
 
@@ -590,7 +590,7 @@ The crisis list only ever adds one decision, within its caps, including past an 
 
 **Decision result handling (all forced locally, whatever the model says):**
 - Order in `routeDecision`: invalid, `crisis_route`, `crisis:true` with a cap slot, `skipClass`, `action`.
-- `parseAnswer` keeps the model's `action` and `skip_class` under `crisis:true`, because past the caps they decide. A non-`none` `skip_class` with `crisis:false` forces `action:'skip'`. `need_search` is ignored; it is always false in this build.
+- `parseAnswer` keeps the model's `action` and `skip_class` under `crisis:true`, because past the caps they decide. A non-`none` `skip_class` with `crisis:false` forces `action:'skip'`. `need_search` is ignored unless the decision was asked with the search schema (own runtime, search on in the group); that case is in `docs/search-contract.md` section 5.
 - A non-`none` `skip_class` bumps `skip_class:<localDay>` only on a real skip. A crisis reply on a flagged topic leaves no class count.
 - `ordinary`, `action:'reply'`, `skipClass:'none'`: continue as `interject`.
 - `ordinary` or `name`, `crisis:true`, cap slot taken: continue as `crisis`. Release any interject claim. Past the caps, crisis means nothing: the class and action decide.
@@ -693,7 +693,7 @@ Text = buffer joined with `\n\n`. Then:
    1. `getEffective()` readable. 2. `mode==='live'`. 3. `terminal_close` unset. 4. `appId` matches. 5. Turn in `dispatching`, group still admitted. 6. Not paused (global or group). 7. `now < deadlineAt`, otherwise `failed:deadline`. Never converts to proactive.
 4. `policy.checkLeak` on the whole text with current secrets and this turn's raw IDs, then `policy.check`, also on `checkFormForQq(whole, turn.inboundUrls)` when that form differs from the shaped text. Only `shapeForQq`'s result is posted. A throw counts as a hit. **Hit:** state `policy_dropped`. Required class sends `policyDropped` once. `interject` is silent. Bump `policy_drop:<day>:<ruleId>:<path>`. No retry, no rewrite, no re-generation, no split, no alternate path.
 5. Plain text: strip Markdown emphasis, headings and fences; `[a](b)` becomes `a b`. Fenced and inline code keep their characters, and a one-line fence keeps its content. `msg_type` stays 0. This and step 6 run after the policy check, so the policy sees the model's own text.
-6. URL guard: any `http(s)` URL not in `turn.inboundUrls` becomes `[链接已移除]`. Search is out of scope, so no other source of URLs exists. The guard also covers code and runs on the check form, so markup inside code cannot hide an address. It leaves a CIDR block, and a bare host followed by an ASCII call when no `/`, `?` or `#` follows the closing bracket. `findUrls`, `extractUrls` and `removeUrls` do not have these exceptions.
+6. URL guard: any `http(s)` URL not in `turn.inboundUrls` becomes `[链接已移除]`. Search material never carries URLs: the search adapter keeps them (`docs/search-contract.md` section 4), source names carry no dot, and the program's source line is checked with the rest of the text, so no other source of URLs exists. The guard also covers code and runs on the check form, so markup inside code cannot hide an address. It leaves a CIDR block, and a bare host followed by an ASCII call when no `/`, `?` or `#` follows the closing bracket. `findUrls`, `extractUrls` and `removeUrls` do not have these exceptions.
 7. Split: group `maxPartsGroup` parts of at most `maxPartChars`, on paragraph then sentence boundaries, then truncated. `interject`: 1 part, cut at the last sentence end within `interjectMaxChars`.
 8. `insertSendParts` atomically (rate). State `delivering`. Refused: a required turn waits for room once, inside the deadline, then rechecks the hard stops. An interjection does not wait. Still refused: `failed:send_rate`, alert, and on a required turn the failure line if nothing was sent. A wait ends early on `exit.stop()` or `/stop` (polled every 250 ms).
 9. For each part, first the hard stops in this order: exit stopped, deadline, owner `/stop`, then mode, terminal, account, group admission, pause. Any of them ends the turn with its reason (`exit_refused`, `deadline`, `aborted`, `paused`) and marks the remaining parts `aborted`. A reply written for a person in danger does not stop on `/stop`, because the gate's `ownerStopped` stays false for it. Then `crashpoint('before_post')`, `markSend(sending)`, `bot.api.post(path, {content, msg_type:0, msg_id, msg_seq})`, `crashpoint('after_post')`, record the result. Stop at the first non-success; remaining parts `aborted`. A connect retry also honours `/stop`: `failed:aborted`, no `send_not_connected` alert. A POST already on the wire cannot be recalled.
@@ -777,7 +777,7 @@ Optional per-group `cooldownMinutes`, `perHour`, `perDay` override `interject`. 
 | `allowedDmUserIds` | `qq.allowedDmUserIds` | **Must be empty in this build** |
 | `allowedGroupIds` | `qq.allowedGroupIds` | Empty means closed. Each ID needs a `qq.groups` entry and the reverse. These are group IDs, never sender IDs. Any admitted-group member may chat |
 | `claudeModel`, `decisionModel` | same | §3.7 |
-| `searchProvider` | same | **Must be `none` in this build** |
+| `searchProvider` | same | `none`, the default and the only value the OpenClaw runtime accepts. `openrouter-sonar` on the own runtime, set only by `clo search enable` (`docs/search-contract.md`) |
 | budget, timeouts | `budget`, `timeouts` | Tier ordering §4.5. Timeouts positive |
 | Interjection rules | `interject`, `groups[id].interject`, `names` | Off per group by default |
 | Quiet hours | `quietHours` | Timezone `Asia/Shanghai` only |
@@ -1002,7 +1002,7 @@ Replacements for the weak tests:
 | Concurrent ordinary, atomic quota | `unit/quota-atomic` (two processes on real SQLite), `unit/window` | In scope |
 | Real @ during cooldown | `unit/gate-limits`, `e2e/qq-interject` | In scope |
 | Pause, no budget, owner impersonation | `unit/gate-limits`, `seam/failure-line`, `unit/gate-commands` | In scope |
-| Search success, timeout, no source | none | **Deferred (search)** |
+| Search success, timeout, no source | own runtime only: `e2e-own/search`, `unit/gate-search`, `unit/search-adapter`; the console in `unit/cli-search`, the probe in `unit/search-probe` | In scope on the own runtime, offline only (`docs/search-contract.md` section 10). The OpenClaw runtime has no search |
 | Injection for keys or cross-group history | `unit/prompt-injection-policy`, `unit/qq-policy-exit` (leak), `e2e/qq-identity` (cross-group) | In scope for group paths |
 | Restart, uncertain send | `e2e/qq-crash-matrix`, `unit/qq-send-results` | In scope |
 | DM memory vs group memory | none. Group context isolation is in `e2e/qq-identity`, `e2e/qq-context` | **Deferred (memory, DM)** |

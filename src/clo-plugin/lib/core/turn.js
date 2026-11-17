@@ -5,6 +5,7 @@
 import { checkSentinels } from './contentPolicy.js';
 import { estimateTokens } from './context.js';
 import { openrouterAdapter } from './providers/openrouterAdapter.js';
+import { readSearchNote as readNoteFile, withSourceLine } from './search.js';
 
 // An optional reply this close to the passive window's end would be paid for and then cut off.
 const MIN_OPTIONAL_TURN_MS = 15000;
@@ -33,18 +34,37 @@ export function frameLine(turn) {
 
 // Line 1 is the frame. Everything else is one JSON object, so member text cannot start a line or fake a frame.
 // History labels are pseudonyms or speaker labels from the gate, never raw IDs.
+// A turn that searched also carries search: { status, items } (docs/search-contract.md section 6). Its items are the
+// material and the queries that went out, never a URL or a source name: the program writes the source line itself.
+// Without a search the key is absent, so such a turn sends the bytes it always did.
 export function renderUserMessage(turn) {
   const recent = (turn.history ?? []).map((h) => ({
     who: h.own === true ? OWN_LABEL : String(h.sender ?? ''),
     text: String(h.body ?? ''),
   }));
   const speaker = turn.speakerLabel ?? turn.senderLabel ?? null;
-  return `${frameLine(turn)}\n${JSON.stringify({ recent, speaker, text: String(turn.text ?? '') })}`;
+  const message = { recent, speaker, text: String(turn.text ?? '') };
+  if (turn.search && typeof turn.search === 'object') message.search = searchMaterial(turn.search);
+  return `${frameLine(turn)}\n${JSON.stringify(message)}`;
 }
 
-function turnBodyOf(adapter, eff, system, turn) {
+// Only the fields the notes describe, as strings.
+function searchMaterial(search) {
+  const items = (Array.isArray(search.items) ? search.items : []).map((i) => {
+    const out = { status: String(i?.status ?? 'failed') };
+    if (typeof i?.query === 'string') out.query = i.query;
+    if (out.status === 'ok' && typeof i?.text === 'string') out.text = i.text;
+    return out;
+  });
+  return { status: String(search.status ?? 'failed'), items };
+}
+
+// note: the search notes, for a turn that carries search material only. Left out, the body is what it always was.
+function turnBodyOf(adapter, eff, system, turn, note = null) {
   const { primary } = eff.models;
-  return adapter.turnBody({ model: primary.id, effort: primary.effort, maxTokens: primary.maxTokens, system, user: renderUserMessage(turn) });
+  return adapter.turnBody({
+    model: primary.id, effort: primary.effort, maxTokens: primary.maxTokens, system, user: renderUserMessage(turn), ...(note ? { systemNote: note } : {}),
+  });
 }
 
 // The OpenRouter request, as the goldens and the Q5 probe build it.
@@ -54,7 +74,8 @@ export function buildTurnRequest(eff, system, turn) {
 
 const failed = (usage) => ({ started: true, hostError: true, aborted: false, usage });
 
-export function createTurnRunner({ client, getEffective, readSystemPrompt, getExit, log = () => {}, now = Date.now, ledger = null, addAlert = null, beforeRetry = null }) {
+// readSearchNote(eff): the search notes; by default persona/search-notes.zh.md beside the decision prompt.
+export function createTurnRunner({ client, getEffective, readSystemPrompt, getExit, log = () => {}, now = Date.now, ledger = null, addAlert = null, beforeRetry = null, readSearchNote = readNoteFile }) {
   const alert = (kind, data) => {
     try {
       addAlert?.(kind, data);
@@ -108,12 +129,28 @@ export function createTurnRunner({ client, getEffective, readSystemPrompt, getEx
     }
 
     // The markers are read on the very string that goes into the request. A checker that fails counts as missing.
+    // A turn with search material sends the search notes too. Without them the material would contradict the
+    // system prompt, so the turn goes on as one without search: no material, no source line.
+    let shown = turn;
+    let note = null;
+    if (turn.search) {
+      try {
+        note = readSearchNote(eff);
+      } catch {
+        note = null;
+      }
+      if (!note) {
+        log('search_note_missing', { eventKey });
+        shown = { ...turn, search: undefined, searchSources: [] };
+      }
+    }
+
     let system = null;
     let body = null;
     let check;
     try {
       system = readSystemPrompt();
-      body = turnBodyOf(adapter, eff, system, turn);
+      body = turnBodyOf(adapter, eff, system, shown, note);
       check = checkSentinels(adapter.systemTextOf(body), eff.contentPolicy.version);
     } catch {
       check = { ok: false, reason: 'unreadable' };
@@ -209,7 +246,8 @@ export function createTurnRunner({ client, getEffective, readSystemPrompt, getEx
     if (typeof text !== 'string' || !text.trim()) return failed(usage);
     if (SILENT.test(text.trim())) return { started: true, hostError: false, aborted: false, usage };
     if (r.finishReason === 'length') log('turn_length', { eventKey, reason: 'length' });
-    getExit().collect(turn.turnId, { text, isError: false }, { kind: 'final' });
+    // With material, the program's source line goes on the end (decision D2), and the exit checks the whole text.
+    getExit().collect(turn.turnId, { text: withSourceLine(text, shown), isError: false }, { kind: 'final' });
     return { started: true, hostError: false, aborted: false, usage };
   };
 }

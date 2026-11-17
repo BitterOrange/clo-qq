@@ -113,6 +113,29 @@ test('a fresh db is created at v2 directly: the provider column, no backup, no m
   assert.equal(existsSync(backupFileOf(file)), false);
 });
 
+// Decision D3 (light): search needs no migration. Its rows live in reservations with provider 'search', its pause in
+// control, its counts in counters, so a v2 file takes them as it is and the schema stays at 2.
+test('search rows, counts and pause fit the v2 schema as it is: no new version, no new table or column', () => {
+  const file = join(dir, `search${++n}.db`);
+  const store = openStore(file, { now: () => T0 });
+  const before = { cols: columns(store.db), tables: store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((t) => t.name) };
+  const eff = {
+    runtime: 'own', mode: 'live', openrouter: { baseUrl: 'http://127.0.0.1:9/api/v1' },
+    budget: { dailyUsd: 2.5, interjectUsd: 0.75, searchUsd: 2.1, namedUsd: 2.25, addressedUsd: 2.5, residualMinUsd: 0.25, residualPct: 0.15 },
+    search: { provider: 'openrouter-sonar', model: 'perplexity/sonar-pro', baseUrl: 'http://127.0.0.1:9/api/v1', perAnswer: 2, perDay: 10, maxTokens: 600, resultMaxChars: 1500, queryMaxChars: 80, searchMs: 20000, price: { inputPerM: 3, outputPerM: 15, requestUsd: 0.005 } },
+  };
+  const ledger = createLedger({ store, getEffective: () => eff, fetch: async () => { throw new Error('no network'); }, getKey: () => null, now: () => T0, runtime: 'own' });
+  const c = ledger.claimSearch({ eventKey: 'E' });
+  assert.equal(c.ok, true, 'control: the claim wrote its row and counts');
+  ledger.pauseSearch('fail');
+  assert.equal(store.q("SELECT provider FROM reservations WHERE id=?").get(c.id).provider, 'search');
+  assert.equal(SCHEMA_VERSION, 2);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 2);
+  assert.deepEqual(columns(store.db), before.cols);
+  assert.deepEqual(store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((t) => t.name), before.tables);
+  store.close();
+});
+
 test('a v1 db with rows migrates to v2: old rows read as openrouter, the same salt, the same layout as a fresh db, and a v1 backup', () => {
   const { file } = v1Db();
   const store = openStore(file, { runGen: 'new', now: () => T0 + 5 });

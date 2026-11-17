@@ -5,3 +5,5 @@ export { FAKE_MODEL_KEY, FAKE_MODEL_KEY as FAKE_OPENROUTER_KEY } from './gateway
 export const FAKE_ANTHROPIC_KEY = 'sk-ant-FAKE-KEY-FOR-LOCAL-MOCK-ONLY';
 // For the Anthropic probe's own Key name, so a probe test can tell the two Anthropic Keys apart.
 export const FAKE_ANTHROPIC_PROBE_KEY = 'sk-ant-FAKE-PROBE-KEY-FOR-LOCAL-MOCK-ONLY';
+// The search Key (CLO_SEARCH_API_KEY in .env, CLO_SEARCH_KEY in the bot): an OpenRouter Key of its own.
+export const FAKE_SEARCH_KEY = 'sk-or-v1-FAKE-SEARCH-KEY-FOR-LOCAL-MOCK-ONLY';

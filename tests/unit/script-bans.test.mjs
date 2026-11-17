@@ -117,7 +117,7 @@ const SH_WRAPPERS = ['clo', 'start', 'stop', 'status', 'doctor'];
 
 test('every bash script is ASCII with LF line ends, and the run-able ones start with a bash shebang', () => {
   const names = readdirSync(join(ROOT, 'scripts')).filter((n) => n.endsWith('.sh'));
-  assert.deepEqual(names.sort(), ['_env.sh', 'clo.sh', 'doctor.sh', 'setup.sh', 'start.sh', 'status.sh', 'stop.sh'], 'positive control: the scripts are there');
+  assert.deepEqual(names.sort(), ['_env.sh', 'clo.sh', 'doctor.sh', 'search-probe.sh', 'setup.sh', 'start.sh', 'status.sh', 'stop.sh'], 'positive control: the scripts are there');
   const crlf = (bytes) => bytes.includes(13);
   assert.ok(crlf(Buffer.from('#!/usr/bin/env bash\r\n')), 'positive control: a CRLF script is caught');
   for (const name of names) {

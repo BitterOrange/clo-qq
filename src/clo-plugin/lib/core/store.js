@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { hmacKey, shanghaiDay, shanghaiDayStart } from './ids.js';
 import { sanitizeData } from './log.js';
 import { mkdirPrivate, PRIVATE_FILE_MODE, PRIVATE_MODES, tryNarrowMode } from './private-fs.js';
+import { SEARCH_PAUSE_KEY, searchDayCounter } from './providers/searchRegistry.js';
 
 export const SCHEMA_VERSION = 2;
 export const NON_TERMINAL_STATES = ['received', 'queued', 'deciding', 'approved', 'dispatching', 'delivering'];
@@ -461,7 +462,7 @@ export function openStore(dbFile, { runGen = randomUUID(), now = Date.now, onMig
   }
 
   function spendByTier(localDay) {
-    const out = { interject: 0, named: 0, addressed: 0, none: 0 };
+    const out = { interject: 0, named: 0, addressed: 0, search: 0, none: 0 };
     for (const r of q(`SELECT tier, COALESCE(SUM(CASE status WHEN 'settled' THEN actual_micros WHEN 'released' THEN 0 ELSE held_micros END), 0) AS m
                        FROM reservations WHERE local_day=? GROUP BY tier`).all(localDay)) {
       out[r.tier] = r.m;
@@ -576,6 +577,8 @@ export function openStore(dbFile, { runGen = randomUUID(), now = Date.now, onMig
         interject: getControl('interject_paused') !== null,
         paid: getControl('paid_paused'),
         terminal: getControl('terminal_close'),
+        // Search's own pause (docs/search-contract.md section 7): it stops search, never chat.
+        search: getControl(SEARCH_PAUSE_KEY),
       };
     },
 
@@ -662,6 +665,8 @@ export function openStore(dbFile, { runGen = randomUUID(), now = Date.now, onMig
         // A dedupe answer (qq_code set) is marked sent with no response body, so it says nothing about ref_idx.
         sendsNoRef: q("SELECT COUNT(*) AS n FROM sends WHERE state='sent' AND ref_key IS NULL AND qq_code IS NULL").get().n,
         skipClassToday: peekCounter(`skip_class:${day}`),
+        searchPaused: getControl(SEARCH_PAUSE_KEY),
+        searchCountToday: peekCounter(searchDayCounter(day)),
       };
     },
 

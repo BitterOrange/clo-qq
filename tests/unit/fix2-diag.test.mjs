@@ -87,6 +87,8 @@ test('status does not say the send carried no ref_idx: a non-string one and a mi
     assert.equal(h.lines('exit_post').find((l) => l.state === 'sent').refState, refState, 'the log line tells the two apart');
     const line = statusLine(h);
     assert.match(line, /bot_refs：0（已发送但没有可用 ref_idx：1 条）/);
+    assert.match(line, /今日按内容类别跳过：0/, 'the skip count is labelled as the content-class count it is');
+    assert.doesNotMatch(line, /总数/);
     assert.doesNotMatch(line, /没带/);
   }
 });

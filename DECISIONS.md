@@ -152,7 +152,7 @@
 | 拒答和审核 403 | F13 不变。402 和 Key 限额（limit_source）立即按余额或 Key 限额暂停，不计入连败 |
 | `/stop` 和同一秒的消息 | 保持现状：同一秒不算更新，跳过，带危险词的除外。改由 gate 明确实现 |
 | 不是命令的斜杠文本 | 只有列出的 owner 命令算命令，其他斜杠文本按普通文字走正常触发 |
-| 搜索 | 启用搜索时再定。倾向：判定返回 need_search 时，由 gate 先直接调 perplexity/sonar-pro，把结果当作不可信资料交给主回复，引用照样过出口内容策略 |
+| 搜索 | 已定（2026-11-17）：gate 直接调 perplexity/sonar-pro，把结果当作不可信资料交给主回复，引用照样过出口内容策略，只在 own 运行时。细节见下面“用户定的（2026-11-17，搜索）”。原来写的是“启用搜索时再定”加这条倾向 |
 | acorn | 作为测试用的固定版本 devDependency 加入，锁文件带校验值，单出口的静态检查要用它 |
 | Linux 和 VPS | 以后单独做，在 Windows 切换之后。新运行时本身不依赖 PowerShell |
 | 真实验收的花费 | Q3、Q4 $0；Q5 付费探测上限约 $0.10，按下面“用户定的（2026-11-06，Q5 和费用）”的两回合计划跑，计划最坏 $0.094144，开始前另外确认金额（2026-11-07 按 $0.10 跑过一次，实际 $0.0338）；Q6、Q7 测试群上限约 $0.40。只用现有测试群 |
@@ -279,7 +279,12 @@
 - own：同一个配置改成 `runtime: own`，连上 QQ，READY 用户名相同，进程不监听端口。用户的一次真实 @ 记成 `dry_run`/`would_at`。`stop` 正常。own 运行时上没有单独看名单为空时的丢弃（openclaw 上看过，两种运行时用同一段 gate 代码）。
 - 每种情况只看了一条消息。
 
-还没做的：Q5（付费探测）要用户同意金额；进 live 之前还要用户做 D3、告知群友，以及第 8 步的确认。
+2026-11-17 已观察：在同一台 Ubuntu 机器上，own 运行时的 Q6、Q7 在测试群里走通了，对话接口是 OpenRouter；Q5 探测工具又跑了一次。每种情况只看了一两条消息。
+- Q5 探测工具（`src/tools/q5-probe.mjs --runtime own`，用户定的上限 $0.1，用探测 Key）：这个工具的第二次真实运行（第一次在 2026-11-07）。真实 OpenRouter，不接 QQ，没有 gate、出口和账本，所以仍然不算 own 的 Q5 阶段（Q5 要真实模型加 mock QQ）。两个回合共 $0.0316，第一回合 $0.0246，第二回合 $0.0070（读缓存 4359 个 token）；实际服务方是 Anthropic，型号是锁定的那个；Key 的扣费在约 65 秒后和工具的记录对上。开发时建议把 `replyRequiredHoldUsd` 调到约 0.18，没有改。
+- Q6（live，只回应真实 @）：用户做了 D3、告知了群友、`clo ack q0`。一次真实 @ 回复了一条，约 12.6 秒，$0.0256，发出的消息拿到了 `ref_idx`；重启之后没有重复回复；owner 的暂停和恢复在群里生效。
+- Q7：打开点名后，对她说话的一句得到回复，只提到她名字的一句被判定跳过（`decision_skip`）。再打开插话后，一句合适的消息得到一次插话，紧接着的第二句因为冷却跳过。
+- 这一天对话 Key 共约 $0.055（插话 $0.0046、点名 $0.0246、@ $0.0256），没有告警，没有未结算。拒答、内容过滤命中、Key 到限额、分群暂停、有回合在跑时重启都还没有在真实 QQ 上看过。真实群验收（Q8 到 Q10）没有做。
+
 
 2026-11-17 用户定的：之后的实现和测试都优先用 own 运行时。openclaw 运行时保留，可以回退，但新功能和真实验收先在 own 上做。
 
@@ -324,7 +329,7 @@
 | 需要 root 的 e2e | `tests/e2e/qq-first-run.test.mjs` 在 Linux 上要读每个进程的 `fd` 目录，确认只有记录里的进程在听 Gateway 端口。普通用户读不了别人的进程，这个断言会失败，所以这个文件在 Linux 上要以 root 跑 | 只在 root 下跑过 |
 | `clo stop` 在 Linux 上查不到进程时 | 离线测试里“查不到就不发信号”只能在测试用的假 `/proc` 下造出来，而假 `/proc` 下本来就不发信号，所以那条测试在 Linux 上分不出 `stopGateway` 有没有在“不知道”时发信号，有分量的只有“记录保留”和退出码。真实 `/proc` 下造不出“不知道”，又不能为此改 Windows 也执行的 `stopGateway` | 已知缺口 |
 | Linux 的 Node 条目 | `versions.lock.json` 里另加 `nodeLinuxX64`，原来的 `node` 条目（Windows）一个字不改，两者版本相同。`setup.sh` 在私有 Node 还不存在时，用 sed 按已知的行格式读这个条目，只认恰好一个 64 位小写十六进制的校验值，文件名和下载地址必须是由版本号推出来的那两个；装好 Node 之后再按 JSON 读一遍，两边不一致就停 | 没有用 Python：第 1 节不许为胶水代码加 Python 依赖。`versions.lock.json` 的这段格式由测试固定 |
-| Linux 的安装脚本 | `scripts/setup.sh [--runtime]`，步骤和 `setup.ps1 -Runtime` 一样：下载、核对校验值（不对就删掉文件，什么都不装）、解压到 `.runtime/node`，根目录 `npm ci --ignore-scripts`，`.runtime/pkg` 按 `runtime-lock/` 执行 `npm ci`，再核对锁文件里的版本和完整性。和 Windows 不同的地方：锁文件缺失时直接停下，不会改用 `npm install`；只支持 x86_64；`curl -q` 不读用户的 curlrc；不拒绝以 root 运行（README 要求用普通用户） | 只用离线测试验证过：假的压缩包、假的 node，PATH 里没有 curl，npm 一次都没有真的跑过。在普通用户下、在 Ubuntu 26.04 上都没有跑过 |
+| Linux 的安装脚本 | `scripts/setup.sh [--runtime]`，步骤和 `setup.ps1 -Runtime` 一样：下载、核对校验值（不对就删掉文件，什么都不装）、解压到 `.runtime/node`，根目录 `npm ci --ignore-scripts`，`.runtime/pkg` 按 `runtime-lock/` 执行 `npm ci`，再核对锁文件里的版本和完整性。和 Windows 不同的地方：锁文件缺失时直接停下，不会改用 `npm install`；只支持 x86_64；`curl -q` 不读用户的 curlrc；不拒绝以 root 运行（README 要求用普通用户） | 写的时候只用离线测试验证过。2026-11-17 在用户的 Ubuntu 机器上以普通用户真的跑过一次，见上面那一节 |
 | Linux 的包装脚本 | `clo.sh`、`start.sh`、`stop.sh`、`status.sh`、`doctor.sh` 都先 source `_env.sh`，再用 `exec` 让私有 Node 运行 `src/cli/clo.mjs`。`_env.sh` 清掉和 `_env.ps1` 同一组代理变量，另外清 `NODE_OPTIONS`（`_env.ps1` 不清，没有改），测试模式下把状态目录移到 `CLO_TEST_ROOT`，PATH 只在 npm 的子 shell 里改。`start` 不需要 Windows 那种 `--output-file` 绕法：Gateway 的输出直接写日志文件，不占调用方的管道 | 离线测试（`lifecycle.test.mjs`）里看到：`clo.sh start` 很快返回，假 Gateway 在 bash 退出后还在运行，`stop.sh` 能结束它；路径带空格时也能用。只在以 root 运行的容器里跑过 |
 | 脚本禁用项 | `script-bans.test.mjs` 也扫描 `.sh`，新增的禁用项：按名字找进程（pgrep、pidof）、sudo 等提权、全局 npm 安装、apt 等系统包管理器、改 shell 配置文件、关闭 TLS 校验、Linux 防火墙、systemctl enable 和 crontab、屏蔽睡眠。每一项都有正向对照 | |
 | 提示词观察测试不再在临时目录留文件夹 | `tests/e2e/qq-prompt-observation.test.mjs` 和 `tests/e2e-own/` 下的同名测试原来每次都在临时目录留一个 `clo-prompt-observation-*` 文件夹给人看。现在默认把观察结果以 JSON 打印在测试输出里，不写磁盘；设了 `CLO_KEEP_PROMPT_OBSERVATION=1` 才照旧写文件夹并打印路径。断言没有改 | 两个平台都适用，Windows 上没有跑过。`docs/wiring-trial.md`、`docs/group-chat-design.md` 已同步 |
@@ -367,6 +372,77 @@
 | 6 | 13 个任务全部通过（Linux own 3 个、openclaw 4 片，Windows 6 片），运行 44127882250 | 这是第一次全绿。`qq-model-live` 在 Windows 上那一次失败之后连续两次通过，原因仍没有查清 |
 
 这些只说明离线测试在 GitHub 的 Linux 和 Windows 机器上的结果，不是真实 QQ 验收。
+
+## 用户定的（2026-11-17，搜索）
+
+用户同意搜索规划里的全部推荐答案（“按推荐”），并决定先只做 own 运行时。表里的 D0 到 D7 是这次搜索规划里的编号，和下面“待定（决策点 D）”、`CLAUDE.md` 里的 D2、D3、D5 不是一回事。用户原话里的“D5 走甲”按规划的推荐（仍搜）记。
+
+现状（2026-11-17）：写进了配置、生成的运行配置、启动时的环境、`doctor`，Sonar 的请求和响应读法（适配器）、可洛进程里的搜索客户端、搜索模型的价格锁定（`clo search lock`）、账本里的搜索层级、次数、搜索自己的暂停和对搜索 Key 的轻对账（见下一节），离线测试通过。判定里的搜索字段、gate 里的搜索步骤（真实 @ 的搜索判定、点名判定里的搜索字段、搜索词清洗、调用和结算、交给主模型的资料）、来源行和带搜索资料时另加的说明（`persona/search-notes.zh.md`）也写了，离线测试通过（mock QQ、mock 模型、mock 搜索）。打开和关闭搜索的控制台命令（`clo search enable`、`disable`、`show`，每群的 `clo group set <群> --search on|off`）、`clo mode live` 对搜索的检查、告知草稿里的搜索一条，以及付费探测工具（`scripts/search-probe.ps1`、`scripts/search-probe.sh`）也写了，离线测试通过；探测工具没有带 `--approve` 跑过。任何真实请求都没有发过，真实 Sonar 上一次都没有跑过。搜索打开时 `clo mode live` 一律拒绝（`search_rules`），直到真实探测做完、规则写进来。告知草稿改过了，按 D5 要你本人看过再用。
+
+| 项目 | 决定 |
+|---|---|
+| D0 搜索的路径 | 改写 `CLAUDE.md` §6“默认搜索方案”：own 运行时的 gate 在主模型之前直接调 OpenRouter 上的 `perplexity/sonar-pro`，用单独的搜索 Key（`CLO_SEARCH_API_KEY`），不经过 `web_search` 工具和 `@openclaw/perplexity-plugin`。主模型的请求里仍然没有工具。`CLAUDE.md` §7.1–7.5 不动 |
+| 先做哪个运行时 | 只做 own。openclaw 运行时这一版没有搜索：`searchProvider` 不是 `none` 时配置校验、`clo apply` 和 `doctor` 都拒绝，并说明搜索只在 own 运行时 |
+| D1 真实 @ 怎么知道要不要搜 | 每条真实 @ 和回复可洛，在搜索打开的群里多买一次 Haiku 判定，只问要不要搜和搜索词。搜索额度用完或搜索暂停时不买。这次判定不决定回不回，失败就当不搜 |
+| D2 来源怎么进回复 | 程序在模型文字后面追加一行“来源：…”，只用接口实际返回的来源，QQ 里只写名称（`qq.urlMode:names`） |
+| D3 搜索 Key 的对账 | 轻方案：搜索 Key 的每日限额是硬上限；本地有自己的层级和次数；按 UTC 日拿 `/key` 的 `usage_daily` 和当天的搜索行比；`clo.db` 不迁移，仍是第 2 版。未结算的搜索行到期按预留额结清，只多算不少算 |
+| D4 插话搜不搜 | 第一版不搜。危险路线也不搜 |
+| D5 对话接口是 Anthropic 时 | 仍搜，经 OpenRouter 到 Perplexity，用搜索 Key 自己的日限额作硬上限。告知草稿要写清：对话直连 Anthropic，搜索经 OpenRouter |
+| D6 “这个我不查”谁来说 | 主模型说：程序把“拒绝”状态交给它，问题里能答的部分照常答 |
+| D7 启用的范围 | 全局开关算一次模型变更：清 D3 和每个群的“已告知”，启用 QQ 时要 `--qq-platform-notified`。再加每群开关，先只在测试群开 |
+| 金额 | 搜索 Key 的每日限额和付费探测的上限还没定。配置要求写明 `budget.searchKeyDailyLimitUsd`，没写就不能打开搜索；不替用户填数 |
+
+## 开发时定的，用户还没有确认（2026-11-17，搜索）
+
+都只在离线测试里验证过。用户不同意的话，按用户的决定改代码。实现合同是 `docs/search-contract.md`。
+
+| 项目 | 现在的值或行为 | 说明 |
+|---|---|---|
+| 配置的形状 | `searchProvider` 取 `none` 或 `openrouter-sonar`。打开时还要 `acks.search`（`{provider, at}`，由 `clo search enable` 写，手改 `searchProvider` 不够）和正数的 `budget.searchKeyDailyLimitUsd`。可选的 `search` 块：`perAnswer`、`perDay`、`maxTokens`、`resultMaxChars`、`queryMaxChars`，另有 `timeouts.searchMs` 和每群的 `qq.groups[id].search` | 模型不能配置，换模型就是模型变更 |
+| 次数和长度的上限 | 每次回答 2 次、每天 10 次，配置只能调低。默认和上限：`maxTokens` 600（上限 1000），`resultMaxChars` 1500（上限 3000），`queryMaxChars` 80（上限 80），`searchMs` 20000（上限 30000） | 任务书写的是“每次回答最多 2 次，每天最多 10 次”，这里理解成上限，允许更严。其余数字是开发时选的，没有真实数据支撑 |
+| 生成的运行配置 | 搜索关着时 `effective.json` 一个字节都不变：不写 `search` 块、每群的 `search`、`searchKeyDailyLimitUsd`、`searchMs`。打开时才写，读取方发现不认识的搜索块，或搜索块出现在 openclaw 运行时上，就当作没有配置 | 和 `apiProvider` 一样 |
+| 搜索的地址 | 默认 `https://openrouter.ai/api/v1`。测试模式可以用 `search.baseUrl` 指到本机；没写时跟着 OpenRouter 的测试地址 | 正式运行不能改地址 |
+| 子进程里的名字 | 搜索 Key 只在搜索打开时交给可洛进程，名字是 `CLO_SEARCH_KEY`；`.env` 里的名字 `CLO_SEARCH_API_KEY` 照旧不许进任何子进程，Gateway 两个名字都拿不到 | 它不算模型 Key，可洛进程里仍然恰好一个模型 Key |
+| 和对话 Key 相同 | live 下搜索打开时，`clo start` 和 `doctor` 发现搜索 Key 和 `CLO_CHAT_API_KEY` 是同一个就拒绝，不打印值 | 和探测 Key 的比较在 `clo mode live` 的 `search_key` 检查里，`clo start` 不读探测 Key |
+| live 的拦截 | 新增 `search_rules`：搜索打开时 `clo mode live` 拒绝，live 下手改打开搜索时 `clo apply` 也拒绝。常量 `SEARCH_RULES_RECORDED` 现在是 false，真实探测确认 Sonar 的字段和价格、规则写进来之后才改 | 照 `provider_rules` 的写法 |
+| `doctor` | openclaw 运行时保留 `search_off`，提示搜索只在 own 运行时。own 运行时换成 `search_config`：可洛进程的环境里有搜索 Key 的名字，当且仅当搜索打开，并且 `effective.json` 和 `config.json` 一致 | |
+| 搜索请求的内容 | 只有模型、`stream:false`、`max_tokens`、`usage:{include:true}`、一段固定的系统指令和一条搜索词。没有历史、发言人代号、群和成员编号、`user` 字段和归属请求头 | 字段名没有用真实请求核实 |
+| 来源从哪里读 | 三种写法都读：`choices[0].message.annotations[]` 里的 `url_citation`、顶层的 `search_results`、顶层的 `citations`。来源名只用网址主机名的主要部分（比如 `reuters`，不带点，所以不会被当成网址），不用标题：标题是网页上的任意文字，来源行由程序直接追加，没有模型看过，而本地规则不含政治词（审查后改，2026-11-17）。没有可用主机名的引用不出名字。重复的只留一个，最多 5 个。网址本身不出适配器 | 哪一种是真的没有核实。一个可用来源都没有时，适配器把这次结果标成 `no_source`，Sonar 的文字不交出去 |
+| 搜索模型的价格 | `clo search lock` 从 OpenRouter 模型目录读 `perplexity/sonar-pro` 的价格（不带 Key），写进 `versions.lock.json` 的 `models.locks.search`。`prompt`、`completion` 按每百万 token 换算，`request` 和 `web_search` 当作每次调用的固定费用加在一起。目录里还有别的不为零的价格字段，就拒绝锁定。第一次锁定、价格有任何变化（涨或降）、输出价超过每百万 $30，都要 `--confirm-price`。锁价不算模型变更，不记进 `models.changes`；打开搜索时才算 | 按次收费的字段名没有核实。没有锁价时运行配置里的搜索价格是 null，账本不给搜索预留，所以不会搜索 |
+| 一次搜索的预留 | 按 4000 个输入 token、`maxTokens` 个输出 token 和每次的固定费用算最坏数。用 mock 价格（输入 $3、输出 $15 每百万，每次 $0.005）是 $0.026 | 4000 是给检索内容留的余量：Sonar 算不算进输入 token 不知道。结算超过预留就只停搜索（`cost_above_hold`），由 owner 解除 |
+| 结算的算法 | 有上报的费用就按上报的（这是搜索 Key 实际被扣的）；没有就按 token 乘锁定价再加每次的固定费用；都没有就记未结算，按预留额计 | 上报的费用含不含按次费用没有核实 |
+| 搜索行 | 层级 `search`，类别 `search`，`provider` 列写 `search`。所以对话 Key 的对账既不拿它解释读数，也不会把它结清或按 0 结清。当天有效花费 = max(对话行合计, 对话 Key 读数) + 搜索行合计：对话 Key 的读数不含搜索，不能拿它盖掉搜索花费（审查后改，2026-11-17）。只在 own 运行时、搜索打开、没有搜索暂停、当天总花费加上这次预留不超过 `searchUsd` 时才能预留。全局付费暂停和当前对话接口的硬上限暂停也挡住搜索 | 搜索没有对话就没有用处，所以对话停了搜索也停 |
+| 次数怎么数 | 每次回答的次数和每天的次数（上海日）都是计数器，和预留在同一个事务里：任何一项被拒，整个回滚，计数不变 | 两个进程同时抢也只成 10 次（`tests/unit/quota-atomic.test.mjs`） |
+| 搜索自己的暂停 | 控制项 `search_paused`，只停搜索，不碰付费暂停。连续 3 次失败停（`fail`），10 分钟后放一次试探，成功就解除，owner 也可以解除；402 或 OpenRouter 的限额来源停（`key_limit`），读到搜索 Key 还有余额才解除；读不到搜索 Key（启动时一次，之后连续两次）停（`key_read_failed`），读到就解除；对账差额连续两次超过阈值停（`residual`），读到对得上就解除；结算超过预留停（`cost_above_hold`），只有 owner 能解除。等级高的不会被低的覆盖 | owner 用 `clo budget clear-search-pause` 解除，只能解除 `cost_above_hold` 和 `fail` |
+| 轻对账 | live 下可洛进程启动后的第一次心跳、之后有新的搜索行或结算、有没结清的搜索行、有读 Key 才能解除的暂停时、或者每 10 分钟，用搜索 Key 读 `搜索地址/key`。拿 `usage_daily` 和本机当天（UTC 日）搜索行的合计比（结清的按实际，释放的按 0，其余按预留额）。阈值和对话那边一样：$0.25 和读数的 15% 取大的。读数里没有 `usage_daily` 算读取失败。Key 的限额和 `budget.searchKeyDailyLimitUsd` 不一样、或不是按日重置，告警一次。不写 `key_snapshots`，不把差额记成行 | 依赖 `usage_daily`，没有核实这个字段存在、多久更新 |
+| 到期的未结算搜索行 | 未结算超过 15 分钟（`budget.unsettledClearMs`）就按预留额结清，来源记 `search_hold`。之后没有别的未结算行时，崩溃或缺用量造成的付费暂停照常解除 | 对话接口是 Anthropic 时也一样 |
+| 可洛进程里的搜索 Key | 只有运行配置里搜索打开时才用；和对话 Key（OpenRouter 或 Anthropic）相同就不用。出口把它当作密钥，含它的文字不发 | 和 `clo start` 的检查重复，防的是不经 `clo start` 启动的情况 |
+| 运行中的规则检查 | 可洛进程发搜索请求前不再检查 `SEARCH_RULES_RECORDED`，只靠 `clo mode live` 和 `clo apply` 拒绝 | 运行时也拦的话，离线的端到端测试没法在 live 下测搜索。手改运行配置成 live 绕过控制台的情况，对话那边的 Anthropic 有运行时检查，搜索这里没有 |
+| 状态显示 | `clo status` 和 `clo budget show` 在搜索打开、或有搜索暂停、或当天有搜索花费时多一行：当天次数、花费、`searchUsd`、搜索暂停、配置的搜索 Key 日限额 | |
+| 判定里的搜索字段 | 搜索打开的群里，判定请求换成另一套 schema：原来四个字段之外加两个字符串 `search_query_1`、`search_query_2`，不要的写空字符串。不用带 `maxItems` 的数组，因为严格 schema 接不接受它没有核实。提示词是原来的 `persona/decision-prompt.zh.md` 原样加上新文件 `persona/decision-search-addendum.zh.md`。搜索关着、openclaw 运行时，请求逐字节不变 | 附加段要求检索词只放关键词、不超过 30 字、不写代号名字 QQ 号网址和私事，这只是提示，程序另外清洗 |
+| 判定里的危险和话题分类 | `crisis=true` 时一律不搜。`skip_class` 不是 `none` 而模型说要搜时，不联网，交给主模型的状态是 `refused`。为此附加段说明原提示词“skip_class 不是 none 时 need_search 必须是 false”一句在搜索时不适用 | 这样政治类话题也能得到“这个我不查”，本地短表里没有政治词 |
+| 搜索判定的预留 | 搜索判定按 11500 个输入 token 预留（`SEARCH_DECISION_INPUT_TOKENS`），普通判定仍是 10500，不变。最坏输入用同一个估算量过：附加段之后约 10900 | 测试 `tests/unit/search-decision.test.mjs` 固定它 |
+| 真实 @ 的搜索判定 | 只在 own 运行时、本群搜索开关开、live、本群和全局都没暂停、消息不在危险短表上、消息本身没有命中本地规则（反正不会搜，买了只是把这条消息和上下文多发一次）、能搜（价格已锁、没有付费暂停、没有搜索暂停或失败暂停的试探已到、当天次数没满、当天总花费加上搜索判定的预留、回复的预留和一次搜索预留不超过 `searchUsd`）时才买。按点名的写法计入每群每小时和每天的判定上限，从 @ 的层级付钱，判定熔断打开时不买。判定失败、超时、格式错都当作不搜，照常回答；判定期间 owner 发了 `/stop` 就跳过 | 判定失败计入判定熔断，不计入主模型连败。危险短表上的消息不买，是为了不让求助的人多等一次判定 |
+| 点名 | 点名本来就买判定；搜索打开、能搜时这次判定换成带搜索字段的那套，并按搜索判定的预留（11500 个输入 token）预留，否则按普通判定。插话和危险路线的判定永远不带 | |
+| 搜索词清洗 | 不截短、不改写，整条拒绝：超过 `queryMaxChars` 个字、含网址、含 `<@` 标记、含 `U` 加数字的代号（大小写都算）、含 6 位以上连续数字、含本群已知的两个字以上的显示名、命中泄露检查（本回合的原始 ID、进程里的密钥、泄露形状）或本地规则。只有命中本地规则的那条是 `refused`（主模型说“这个我不查”）；因长度、形状或隐私检查被拒的那条是 `withheld`，主模型如实说这次没查，不说成不查这个话题，也不说成联网失败，这条词也不交给主模型（审查后改，2026-11-17） | `U2` 乐队、10 万这类正常词也会因形状被挡，所以不能说成话题拒绝。程序挡得住这些形状，挡不住人名或私事被写进检索词，告知要写这一点 |
+| Sonar 的文字 | 命中本地规则：`refused`，文字不交给主模型。含泄露形状、密钥或原始 ID：`failed`，文字不交。来源名同样过本地规则和泄露检查，一个都不剩就是 `no_source` | |
+| 时间 | 离被动窗口结束还不够“`searchMs` + 主回合最短 45 秒 + 发送 15 秒”时不发请求，状态 `failed`，不预留不计数。每次调用的期限就是 `searchMs` | |
+| 失败时的钱 | 没发出去：预留释放，但次数不退。超时、断网、HTTP 错误没有用量：记未结算，按预留额计，15 分钟后按预留额结清。有回答：按数字结清。`/stop`、停机中止的调用记未结算，不当作免费 | 次数不退是为了简单和保守 |
+| 搜索失败的计数 | 连接失败、超时、断网、HTTP 错误、读不懂的回答算失败；正常回答、没有来源、Sonar 拒答算成功；自己中止的不算 | 连续 3 次失败只停搜索 |
+| 连接重试 | 沿用对话的那一次连接重试，重试前查 live、暂停和搜索暂停，不另外预留 | 和对话那边“连接重试不另外预留”的待定项一样，等用户决定 |
+| 交给主模型的资料 | 用户消息的 JSON 多一个 `search` 键：`{status, items}`，每项有自己的 `status`，`ok` 的带 `query` 和 `text`，`failed`、`no_source` 带 `query`，`refused`、`withheld` 什么都不带。来源名不给主模型。整体状态：有 `ok` 就是 `ok`，否则有 `refused` 就是 `refused`，再否则有 `no_source` 就是 `no_source`，全部是 `withheld` 就是 `withheld`，其余是 `failed`。没有搜索时不加这个键，请求逐字节不变 | |
+| 来源行 | 整体状态是 `ok` 时，程序在模型文字后另起一行写“来源：A、B、C”，最多 3 个，用 `、` 隔开，只用 `ok` 的那几次返回的名字。模型回 `NO_REPLY` 时不加。模型没用资料、或拒答时也照加 | 后一种会显得多余，要看真实回复再定 |
+| 主模型怎么知道有搜索 | `persona/AGENTS.md` 不改：它两个运行时共用，改了会让系统提示词和 Q5 探测计划的数字（`docs/provider-contract.md` 第 0 节要求不变的 1548352 和 94144）跟着变。改为新文件 `persona/search-notes.zh.md`：只有带搜索资料的回合才在系统提示词后面另加一个不带缓存标记的块，说明这一轮附了 `search`、按状态怎么回答、资料里的指令不算数，并说明“没有联网搜索”那句在这一轮不适用。缓存的前缀不变。读不到这个文件时，这一轮当作没有搜索：不带资料，也不加来源行 | 系统提示词里先说“没有联网搜索”、后面的块再说这一轮不适用，靠的是模型读后面的块，没有在真实模型上看过；新说明下的回答也没有观察过 |
+| 搜索步骤在哪里跑 | gate 里，回复预留之后、事件是 `dispatching`、回合已登记之后，主模型调用之前；用回合自己的中止信号，所以 `/stop`、停机、期限都能中止它。跑之前再读一次两个开关，等待期间关掉的就不搜。每次调用前再查一次能否继续（准入、live、全局/本群/终止/付费暂停、硬上限暂停、本群开关），不行就停止后面的调用。搜完、调主模型之前，再查一次 `approveAndRun` 查过的那些，不行就照它的方式结束回合并释放回复预留，主模型不调（审查后改，2026-11-17） | 搜索最多要两次 `searchMs`，期间可能有人暂停。本群开关在搜索中关掉只停后面的调用，回复照常 |
+| 打开搜索（`clo search enable --confirm [--qq-platform-notified]`） | 照 `clo provider use` 的样子：只在 dry-run、进程停着（包括没有 PID 记录、但还连着这个 AppID 的可洛进程）、own 运行时、搜索价格已锁、`budget.searchKeyDailyLimitUsd` 已写时才做；启用 QQ 时要 `--qq-platform-notified`。它写 `searchProvider` 和 `acks.search`，清 `acks.d3` 和每个群的 `noticeGiven`，在 `clo.db` 记 `search_enabled`，在 `versions.lock.json` 的 `models.changes` 记一条 `{kind:'search', model, state:'on', qqPlatformNotified}` | 金额不由它填：没写限额就拒绝，并说明先在 OpenRouter 上设限额、再写同一个数 |
+| 手改 `searchProvider` | `clo apply`、`clo start`、`clo mode live` 把 `config.json` 的 `searchProvider` 和 `clo.db` 里的 `search_enabled` 比，不一样就拒绝，打开和关闭两个方向都拒绝。没有记录时看运行配置，再没有就当作关 | 关闭也拒绝，是因为手关之后记录还写着开，之后再手开就会被当成已经打开过，跳过清除告知和 D3。关搜索用 `clo search disable`，随时可用 |
+| 关搜索（`clo search disable`） | live 下、进程在跑时都可以，不要平台标志。写 `searchProvider:"none"`，删 `acks.search`，记 `search_enabled=none`，`models.changes` 记一条 `state:'off'`。不清告知和 D3，各群的搜索开关留着、不起作用。提示部署者自己更新报给平台的模型信息和告知 | 运行中的进程下一条消息读运行配置时就不再搜；它手里的搜索 Key 留着不用 |
+| 每群开关（`clo group set <群> --search on\|off`） | 打开时清这个群的 `noticeGiven`，live 下拒绝打开；已经开着再开、或者关掉，都不清。全局搜索关着时也能开，只提醒不起作用。`clo group list` 多一列“搜索” | 新加的群不写这个字段，等于关 |
+| `clo search show` | 全局和各群的状态、价格锁定和单次最坏预留、搜索 Key 填没填（和对话 Key 或探测 Key 相同时说不能用，不打印值）、配置的日限额（没写时说金额由你定）、次数上限、检索词的接收方、live 规则没记录的提醒 | 不联网 |
+| `clo mode live` 的搜索检查 | 搜索打开时多查：`search_runtime`（own）、`search_ack`（`acks.search` 和 `clo.db` 的记录都是这个搜索服务）、`search_lock`、`search_key`（`.env` 里有，且不等于 `CLO_CHAT_API_KEY`、`CLO_TEST_API_KEY`）、`search_key_limit`（用搜索 Key 读 `/key`：有每日限额、按天重置、和 `budget.searchKeyDailyLimitUsd` 完全相等、不少于一次搜索的预留、有 `usage_daily`）、`search_process_key`（运行中的可洛进程拿的就是这个 Key）、`search_rules` | 搜索 Key 只在搜索规则已记录、D3 已记录、Key 本身合格时才发给 OpenRouter 读 `/key`；现在规则没记录，所以不读，`search_key_limit` 显示“没有检查” |
+| 进程拿的搜索 Key | 可洛进程每次启动在 `clo.db` 记 `search_key`：它拿到的 `CLO_SEARCH_KEY` 的加盐散列，没有就是 `none`。写在 `src/bot/main.mjs`，不在和 Gateway 共用的启动代码里 | 和对话 Key 的 `gateway_key` 同一做法 |
+| 告知草稿的搜索一条 | `persona/group-notice.zh.md` 加了“联网搜索（这个群现在：<开/关>）”一条和开头的填写说明；“判定时发什么”加一句：开了搜索的群，@ 和回复她的消息也会先发给判定模型一次。写明检索词经 OpenRouter 到 Perplexity（对话直连 Anthropic 时也一样）、程序拦得住哪些形状、拦不住人名和私事、次数上限、插话不查、来源只写名称、本机按设计不记检索词和结果（只看过代码和模拟测试）、真实 Perplexity 上没用过 | 告知仍由你本人做，草稿要你看过 |
+| 付费探测工具 | `src/tools/search-probe.mjs`（`scripts/search-probe.ps1`、`scripts/search-probe.sh`）。不带 `--approve` 只打印计划，不读 `.env`、不联网。带上时只读 `CLO_TEST_API_KEY`，这个 Key 没有每日限额或限额高于 `--max-usd` 就拒绝；先读 `/key`，再不带 Key 读目录，目录里没有两个型号、有不认识的非零价格字段、或价格高于工具里写死的上限（搜索输入 $5/百万、输出 $20/百万、每次 $0.02；判定输入 $2/百万、输出 $10/百万）就拒绝。然后发两次：一次带搜索 schema 的判定，一次 Sonar，用固定文字，发之前和计划逐字节比对，不重试；花费超过这一次的上限就停。最后再读一次 `/key` 比对。结果只记字段名、类型、数字和分类，不记检索词、回答、标题和网址。按上限算最坏 $0.0619 | 规划里第二次 Sonar 调用（试 `search_context_size` 之类的参数）没有做。探测要你同意金额后才跑，还没有跑过 |
 
 ## 待定（决策点 D）
 

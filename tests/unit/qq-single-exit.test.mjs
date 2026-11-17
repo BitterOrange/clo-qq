@@ -32,7 +32,7 @@ const FETCH_CALL_FILES = new Set(['lib/core/ledger.js', 'lib/core/models.js', 'l
 // The own runtime builds its clients from an injected fetch and never calls it.
 const BOT_FETCH_FILES = new Set(['main.mjs', 'services.mjs']);
 // The probe tools. They run alone, never beside the Gateway or the bot, and are the only tools that reach a network.
-const TOOL_PROBE_FILES = new Set(['q5-probe.mjs', 'q5-anthropic.mjs', 'qq-listener.mjs', 'qq-send-probe.mjs']);
+const TOOL_PROBE_FILES = new Set(['q5-probe.mjs', 'q5-anthropic.mjs', 'qq-listener.mjs', 'qq-send-probe.mjs', 'search-probe.mjs']);
 const EXIT_FILE = 'lib/channels/qq/exit.js';
 const CONNECTION_FILE = 'lib/channels/qq/connection.js';
 // Per tree: who may name fetch, who may call it, who may import the QQ SDK, who may import a network module.
