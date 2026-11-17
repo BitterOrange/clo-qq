@@ -79,7 +79,9 @@ describe('running bot', () => {
     assert.equal(s.qq.opened(), opened, 'a stopped bot stays stopped');
     await s.start();
     assert.equal(s.qq.peak(), 1);
-    assert.equal(s.control('connected'), 'true');
+    // start() returns once connection_ready is logged; the bot writes connected a moment after that line. Seen once
+    // on the CI runner: read straight away, it was still false.
+    await until(() => s.control('connected') === 'true', 'READY sets connected after the new start', 15000);
     await oneMessageOneReply(s);
   });
 

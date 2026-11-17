@@ -363,6 +363,7 @@
 | 1 | Windows：`doc-status` 2 个、`q5-anthropic` 的 LF 检查 2 个、`doctor` 的 `insideDir` 1 个、`lifecycle` 的空格路径 1 个（EXDEV）失败；`lifecycle`、`lifecycle-own` 共 4 个测试超时；`tests/e2e/q5-probe.test.mjs` 1 个失败（第一个 Gateway 回合后停在 `gateway_turn_failed`） | 换行：见上表“换行”。`insideDir`：Windows 上 Node 的 `path.relative` 本身不分大小写，`caseless:false` 在那里做不到区分，测试按平台断言。EXDEV：临时目录和检出不在同一个盘。超时和 q5-probe：查进程时没有 `PSModulePath`，每次 18–30 秒，测试进程被同步查询卡住，测试里的 mock 也就答不上 |
 | 2 | 只剩 `lifecycle`、`lifecycle-own` 的超时；q5-probe 这次通过 | 加了一个计时步骤：完整环境 0.3–0.4 秒，没有 `PSModulePath` 的 18–30 秒 |
 | 4 | 补上 `PSModulePath` 后，Windows own 三片从约 40 分钟降到 6–10 分钟，全部通过；Linux 全部通过。Windows openclaw 第 3 片 `qq-model-live` 有 1 个测试失败：QQ 收到了一条回复，模型却没有收到请求 | 同一个文件前两次在 Windows 上都通过，Linux 上都通过。只看到一次，原因没有查清。测试的失败信息改成带上发出去的内容，下次再出现能从日志看出是什么 |
+| 5 | Windows 六片全部通过（`qq-model-live` 这次也通过），Linux 除下一项外都通过。Linux 的 own（`CLO_TEST_PROVIDER=anthropic`）里 `tests/e2e-own/qq-lifecycle.test.mjs` 的“请求停止后重新启动”失败：新启动后立刻读 `connected`，还是 `false` | 测试的时序问题：测试等到可洛进程记下 `connection_ready` 就返回，而可洛进程在这一行之后才写 `connected`。改成等 `connected` 变成 `true`（15 秒内），和同一文件里 READY 那个测试的写法一样 |
 
 这些只说明离线测试在 GitHub 的 Linux 和 Windows 机器上的结果，不是真实 QQ 验收。
 
