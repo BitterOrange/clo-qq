@@ -364,6 +364,7 @@
 | 2 | 只剩 `lifecycle`、`lifecycle-own` 的超时；q5-probe 这次通过 | 加了一个计时步骤：完整环境 0.3–0.4 秒，没有 `PSModulePath` 的 18–30 秒 |
 | 4 | 补上 `PSModulePath` 后，Windows own 三片从约 40 分钟降到 6–10 分钟，全部通过；Linux 全部通过。Windows openclaw 第 3 片 `qq-model-live` 有 1 个测试失败：QQ 收到了一条回复，模型却没有收到请求 | 同一个文件前两次在 Windows 上都通过，Linux 上都通过。只看到一次，原因没有查清。测试的失败信息改成带上发出去的内容，下次再出现能从日志看出是什么 |
 | 5 | Windows 六片全部通过（`qq-model-live` 这次也通过），Linux 除下一项外都通过。Linux 的 own（`CLO_TEST_PROVIDER=anthropic`）里 `tests/e2e-own/qq-lifecycle.test.mjs` 的“请求停止后重新启动”失败：新启动后立刻读 `connected`，还是 `false` | 测试的时序问题：测试等到可洛进程记下 `connection_ready` 就返回，而可洛进程在这一行之后才写 `connected`。改成等 `connected` 变成 `true`（15 秒内），和同一文件里 READY 那个测试的写法一样 |
+| 6 | 13 个任务全部通过（Linux own 3 个、openclaw 4 片，Windows 6 片），运行 44127882250 | 这是第一次全绿。`qq-model-live` 在 Windows 上那一次失败之后连续两次通过，原因仍没有查清 |
 
 这些只说明离线测试在 GitHub 的 Linux 和 Windows 机器上的结果，不是真实 QQ 验收。
 
