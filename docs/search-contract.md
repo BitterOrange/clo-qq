@@ -9,7 +9,7 @@ This is the implementation contract for web search. The user's decisions are in 
 | Config, effective file, start env, `doctor`, the `search_rules` live refusal | Implemented, offline tests only (`tests/unit/search-config.test.mjs`, `tests/unit/doctor.test.mjs`) |
 | Adapter, the bot's search client and Key, price lock (`clo search lock`), ledger tier, counters, search pauses, light reconciliation, `clo budget` and `clo status` lines | Implemented, offline tests only (section 10) |
 | Decision schema and prompt addendum, query cleaning, the gate's search step, the material and the search notes in the primary turn, the source line | Implemented, offline tests only (section 10) |
-| `clo search enable`/`disable`, the live checks of the search Key, the probe | **Not written yet**: search can be turned on only by editing `config.json` |
+| `clo search enable`/`disable`/`show`, the per-group switch, the guard against hand edits, the live checks of the search Key, the probe tool | Implemented, offline tests only (sections 8 and 10). The probe has never run with `--approve` |
 | Any real request (OpenRouter, Perplexity, QQ) | **None made.** Nothing here has run against the real Sonar API |
 
 Until the paid probe in section 9 has run and its rules have landed, `SEARCH_RULES_RECORDED` in `src/clo-plugin/lib/core/providers/searchRegistry.js` is false and `clo mode live` refuses while search is on (`search_rules`). Search can be turned on in dry-run and in offline tests only.
@@ -29,7 +29,7 @@ Until the paid probe in section 9 has run and its rules have landed, `SEARCH_RUL
 | Field | Meaning |
 |---|---|
 | `searchProvider` | `none` (default) or `openrouter-sonar`. Required |
-| `acks.search` | `{ provider, at }`, with `provider` equal to `searchProvider`. Required while search is on. Written by the console's enable command (not written yet), so turning search on by editing `searchProvider` alone is refused |
+| `acks.search` | `{ provider, at }`, with `provider` equal to `searchProvider`. Required while search is on. Written by `clo search enable` (section 8), so turning search on by editing `searchProvider` alone is refused |
 | `budget.searchKeyDailyLimitUsd` | Positive. Required while search is on: the search Key's daily limit as set on OpenRouter. No default, and the project ships no value |
 | `search` (optional) | `perAnswer` (1–2, default 2), `perDay` (1–10, default 10), `maxTokens` (≤ 1000, default 600), `resultMaxChars` (≤ 3000, default 1500), `queryMaxChars` (≤ 80, default 80); `baseUrl` only in test mode, on loopback. Unknown fields are refused. The model is not configurable |
 | `timeouts.searchMs` (optional) | 1–30000, default 20000, per search call |
@@ -128,7 +128,7 @@ After the primary reply, with status `ok`, the program appends one line `来源�
 
 ## 7. Money (implemented)
 
-- Hard cap: the search Key's daily limit on OpenRouter, read with that Key's own `/key`. Live checks (console step, not written): readable, daily reset, equal to `budget.searchKeyDailyLimitUsd`, at least one search hold, and the Key differs from the chat and probe Keys.
+- Hard cap: the search Key's daily limit on OpenRouter, read with that Key's own `/key`. Live checks (section 8): readable, daily reset, equal to `budget.searchKeyDailyLimitUsd`, at least one search hold, and the Key differs from the chat and probe Keys.
 - Hold: `holdMicros('search')` = `SEARCH_HOLD_INPUT_TOKENS` (4000) × input rate + `search.maxTokens` × output rate + `requestUsd`. The 4000 leaves room for retrieved content in case Sonar counts it as prompt tokens (unverified).
 - Claim: `ledger.claimSearch({ eventKey })` commits, in one transaction, the per-answer count (`search_event:<event>`, `perAnswer`), the day's count (`search_day:<Shanghai day>`, `perDay`) and the hold; any refusal rolls all of it back. Reasons: `search_off`, `price`, `paid_paused`, `hard_cap_unverified`, `search_paused`, `answer_cap`, `day_cap`, `total`.
 - Local tier: `search` (`effective + hold ≤ searchUsd`), own runtime and search on only. Rows are `tier='search'`, `category='search'`, `provider='search'`, so they never explain the chat Key's reading and the chat Key's reads never settle them.
@@ -148,9 +148,31 @@ After the primary reply, with status `ok`, the program appends one line `来源�
   The global `paid_paused` and the active chat kind's hard-cap pause still stop search.
 - Timing: decision 8 s + 2 × 20 s search + 90 s turn = 138 s, inside 285 s − 15 s. The step's own time check is in section 6.
 
-## 8. Turning it on (planned)
+## 8. Turning it on, the live checks and the probe (implemented)
 
-The console's enable command follows `clo provider use`: dry-run only, no process running, own runtime, search model price locked, `--qq-platform-notified` when QQ is enabled. It writes `searchProvider` and `acks.search`, records the switch in `clo.db`, clears `acks.d3` and every group's `noticeGiven`, and adds a model change to `versions.lock.json`. Turning on one group's switch clears that group's `noticeGiven`. Disabling needs no platform flag; the deployer updates what was reported to the platform.
+`clo search enable --confirm [--qq-platform-notified]` (`src/cli/clo.mjs`) follows `clo provider use`. It refuses, writing nothing, without `--confirm`; in live; while a process runs (a recorded one, or a bot holding the account's lease with no record); off the own runtime; without a usable search lock; without `budget.searchKeyDailyLimitUsd` (the amount is the user's, and the command never fills one in); and with QQ enabled but no `--qq-platform-notified`. Then it writes `searchProvider` and `acks.search`, clears `acks.d3` and every group's `noticeGiven`, records `search_enabled` in `clo.db` (`SEARCH_ENABLED_CONTROL`), applies, and appends `{ at, kind: 'search', model, state: 'on', qqPlatformNotified }` to `models.changes` in `versions.lock.json`.
+
+Hand edits: `assertApplicable` (`src/cli/common.mjs`), and so `clo apply`, `clo start` and `clo mode live`, compares `searchProvider` with the record (without one, with the effective file; without that, off) and refuses a difference in either direction. Off is refused too: otherwise the record would still say on, and a later hand edit back on would pass as already recorded, skipping the cleared notices and D3. Only enable and disable pass `searchSwitch`.
+
+`clo search disable` is allowed at any time, in live and beside a running process, since it only takes something away. It needs no platform flag, writes `searchProvider: "none"`, removes `acks.search`, records `search_enabled = none` and a `state: 'off'` change, and leaves notices, D3 and the group switches as they are. The deployer updates what was reported to the platform and the notice. A running bot stops searching at its next read of the effective file.
+
+`clo group set <label> --search on|off`: on clears that group's `noticeGiven` and is refused in live; off, or on when already on, clears nothing. It may be set while search is off globally (a warning says it has no effect). `clo group list` shows it. `clo search show` prints the state, the lock and one hold, whether the search Key is filled (and whether it equals the chat or probe Key, never its value), the configured daily limit, the counts, the recipients and the live-rules note. It makes no request.
+
+With search on, `livePreconditions` (`config.js`) adds, from facts `gatherLiveFacts` collects:
+
+| Code | Passes when |
+|---|---|
+| `search_runtime` | the own runtime |
+| `search_ack` | `acks.search.provider` and the `clo.db` record both name `searchProvider` |
+| `search_lock` | `models.locks.search` is a usable lock for the search model |
+| `search_key` | `CLO_SEARCH_API_KEY` is in `.env` and equals neither `CLO_CHAT_API_KEY` nor `CLO_TEST_API_KEY` |
+| `search_key_limit` | the search Key's `/key` (read through `ledger.readSearchKey`) has a daily limit equal to `budget.searchKeyDailyLimitUsd`, reset daily, at least one search hold, and a `usage_daily` figure |
+| `search_process_key` | the `search_key` control the bot writes at each start (`src/bot/main.mjs`: the salted hash of the `CLO_SEARCH_KEY` it holds, or `none`) matches `.env` |
+| `search_rules` | `SEARCH_RULES_RECORDED` |
+
+The search Key is sent to `/key` only when the search rules are recorded, D3 is recorded and `search_key` passes. While the rules are unrecorded it is never read, and `search_key_limit` says it was not checked.
+
+The probe (`src/tools/search-probe.mjs`, run through `scripts/search-probe.ps1` or `scripts/search-probe.sh`) settles section 9. Without `--approve` it prints the plan and makes no request; `.env` is not read. With `--approve --max-usd <cap>` it reads only `CLO_TEST_API_KEY` and refuses when that Key has no daily limit or one above the cap, then reads the catalog with no Key and refuses on a missing model, an unknown non-zero price field, or a price above its fixed ceilings (search: $5/M input, $20/M output, $0.02 a call; decision: $2/M, $10/M). It then sends two calls, each compared byte for byte with the plan just before it leaves and never retried: one decision with the search schema and one Sonar call with a fixed query. A call that costs more than its bound stops the run. A closing `/key` read compares the spend. Results (`captures/search-probe-results.jsonl`) hold field names, types, numbers and classifications only: no query, answer, title or URL. The worst case at the ceilings is $0.0619. The plan's optional second Sonar call (to try parameters such as `search_context_size`) is not in it.
 
 ## 9. Unverified (to be settled by the paid probe, with the user's approval of the amount)
 
@@ -175,7 +197,9 @@ Every behaviour gets an offline test with its positive control in the same run, 
 
 - `tests/unit/search-config.test.mjs` (config, effective, the price in it, live refusal, env, secrets) and the search cases in `tests/unit/doctor.test.mjs`.
 - `tests/unit/search-adapter.test.mjs`: body, success in each citation shape, source names, no source, the text cut, every failure shape, HTTP errors without provider text, the send loop, the bot's search Key and base, the mock.
-- `tests/unit/provider-cost.test.mjs` (search figures), `tests/unit/cli-search.test.mjs` (`clo search lock`, budget and status lines, `clear-search-pause`).
+- `tests/unit/provider-cost.test.mjs` (search figures), `tests/unit/cli-search.test.mjs` (`clo search lock`, budget and status lines, `clear-search-pause`; enable's refusals and what it clears and records; QQ off needing no flag; hand edits refused both ways; disable leaving notices, D3 and group switches; the group switch; `search show`; `mode live` listing the search checks without sending the search Key; `gatherLiveFacts` reading it only once the rules are recorded, and catching a shared or different Key).
+- `tests/unit/search-config.test.mjs` also has each search live code failing alone, with all of them passing as the control; `tests/unit/bot-main.test.mjs` the `search_key` control; `tests/unit/lifecycle-own.test.mjs` a hand-edited search refused by `clo start`.
+- `tests/unit/search-probe.test.mjs`: the plan; no request and no `.env` read without `--approve`; refusals before any request; a full run against an injected fake with the bodies as planned, the probe Key only and nothing but names and numbers in the results; the Key's limit; no `usage_daily`; catalog refusals; a 402 not retried; a call above its bound; an unparsed decision; the pre-send check; the result filter; the address; the wrappers.
 - `tests/unit/ledger-search.test.mjs`: hold, claim, both caps, rollback, tier stop order, search off, settlement, failure and limit pauses, the trial, ranks, expiry at the hold, the search Key read, the light reconciliation, the tick, Anthropic chat.
 - `tests/unit/quota-atomic.test.mjs` (two processes: exactly 10 a day; a budget refusal rolls the count back), `tests/unit/ledger-reconcile.test.mjs` (search rows explain nothing on the chat Key), `tests/unit/store-migration.test.mjs` (schema stays 2), `tests/unit/qq-single-exit.test.mjs` (planted `fetch` in the adapter).
 - `tests/e2e-own/search-stack.test.mjs`: the real bot with search on, on both chat kinds; the search Key read at the search mock with that Key; an @ still answered; nothing searched yet.
@@ -186,4 +210,4 @@ Every behaviour gets an offline test with its positive control in the same run, 
 - `tests/unit/turn.test.mjs`: the material key and its absence; the search notes as a second block on both kinds, the cached block unchanged, and a turn without its notes going on without material; the source line only with material.
 - `tests/e2e-own/search.test.mjs` (the real bot, mock QQ, mock chat, mock search): success with the search Key, the query alone and source names without a URL, and a group not admitted searching nothing; timeout and no source said as such, with no source line; a rule-hit query and an id in a query leave nothing, and a failed decision still answers; web text with commands, a Key request, a URL and a turn marker does nothing past the exit; chat on Anthropic with search on OpenRouter.
 
-Still to write with their steps: the console's enable and disable, the live checks of the search Key, and the probe.
+Not written: a scan of every file the bot writes for search queries and results (the plan's `provider-refusal` extension). The logging is metadata only by design (`search_call` lines carry status, reason, counts and cost), but no test reads the files back yet.

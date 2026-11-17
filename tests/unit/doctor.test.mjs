@@ -9,7 +9,7 @@ import { makeContext } from '../../src/cli/common.mjs';
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, insideDir, inspectHooks, runDoctor } from '../../src/cli/doctor.mjs';
 import { ensureGatewayEnvClean, gatewayEnv, gatewayEnvForCheck } from '../../src/cli/lifecycle.mjs';
 import { FAKE_ANTHROPIC_KEY } from '../harness/fake-keys.mjs';
-import { APP_ID, baseConfig, clo, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, NET_GUARD, openclawOf, OWNER_ID, ROOT, testEnv, withProviders, writePriceBook } from './_cli-helper.mjs';
+import { APP_ID, baseConfig, clo, enabledConfig, fakeProvider, FAKE_KEY, FAKE_SECRET, GROUP_ID, makeRoot, NET_GUARD, openclawOf, OWNER_ID, ROOT, testEnv, withDb, withProviders, writePriceBook } from './_cli-helper.mjs';
 
 const roots = [];
 async function prepared(label, cfg = enabledConfig()) {
@@ -423,7 +423,8 @@ test('own: a fresh install passes with no openclaw.json, runs none of the host c
   assert.ok(ids(host).includes('search_off') && !ids(host).includes('search_config'), 'the host keeps search_off');
 });
 
-// What `clo search enable` will write: the switch, its record, and the search Key's daily limit.
+// What `clo search enable` writes to config.json: the switch, its ack, and the search Key's daily limit. Its record in
+// clo.db is written apart (recordSearchOn), where a test stands for that command.
 function searchOn(cfg) {
   cfg.searchProvider = 'openrouter-sonar';
   cfg.acks = { ...cfg.acks, search: { provider: 'openrouter-sonar', at: '2026-11-17T00:00:00.000Z' } };
@@ -442,6 +443,7 @@ test('own: search_config agrees with config.json on and off, and the bot env hol
   assert.equal(off.checks.find((c) => c.id === 'search_config').detail, '搜索关闭', 'control: off by default');
 
   editConfig(root, searchOn);
+  withDb(root, (store) => store.setControl('search_enabled', 'openrouter-sonar', 'test'));
   // Not applied yet: effective.json still has no search block.
   const stale = doctor(root, {}, env);
   assert.ok(failedIds(stale).includes('search_config'), formatDoctor(stale));
@@ -461,10 +463,10 @@ test('own: search_config agrees with config.json on and off, and the bot env hol
   assert.equal((await clo(root, ['apply'], { env })).code, 0);
   assert.equal(doctor(root, {}, env).checks.find((c) => c.id === 'search_config').detail, '搜索打开（openrouter-sonar）');
 
-  // Turned off by hand and applied: off again, nothing left over.
-  editConfig(root, (c) => ({ ...c, searchProvider: 'none' }));
-  assert.equal((await clo(root, ['apply'], { env })).code, 0);
+  // Turned off by the console: off again, nothing left over.
+  assert.equal((await clo(root, ['search', 'disable'], { env })).code, 0);
   assert.deepEqual(doctor(root, {}, env).failed, []);
+  assert.equal(doctor(root, {}, env).checks.find((c) => c.id === 'search_config').detail, '搜索关闭');
 });
 
 test('openclaw: search on fails config_valid and search_off, and says search is only on the own runtime', async () => {

@@ -1057,3 +1057,37 @@ test('CLAUDE.md section 6 and DECISIONS.md record the decided search path, own r
   for (const name of PUBLIC_DOCS) assertGone(read(name), ran, name);
   assertGone(CLAUDE, ran, 'CLAUDE.md');
 });
+
+test('the console, the notice draft and the probe are described as offline only, and the stale "not written" text is gone', () => {
+  const DECISIONS = DECISIONS_TEXT();
+  const CONTRACT = read('docs/search-contract.md');
+  const notice = read('persona/group-notice.zh.md');
+  // What the console and the probe are now.
+  const searchSection = sectionOf(README, '### 联网搜索（只在新运行时）', '### 在线条件和重启');
+  assert.ok(searchSection.length > 0, 'positive control: README has the search section');
+  for (const item of ['**只离线验证过。**', 'clo.ps1 search enable --confirm --qq-platform-notified', 'group set 测试群 --search on', 'search disable', '`search_key_limit`', '拦不住人名或私事', '**还没有跑过，要你先同意金额。**']) {
+    assert.ok(searchSection.includes(item), `README search section has ${item}`);
+  }
+  assert.match(README, /\| OpenRouter、Perplexity（新运行时打开搜索时） \| 检索词和一句固定的说明 \|/, 'a data-retention row for the new recipients');
+  assert.match(README, /\| 搜索在本机留下的（新运行时打开搜索时） \|[^\n]*没有扫过真实运行留下的文件 \|/, 'and for what stays on this machine');
+  assert.match(DEPLOYMENT, /\| own 上的联网搜索 \| \*\*未做\*\*/);
+  // The notice: the search item per group, who receives the terms, and what the program cannot hold back.
+  assert.match(notice, /- \*\*联网搜索（这个群现在：<开\/关>）：\*\*/);
+  assert.match(notice, /经 OpenRouter 发给 Perplexity/);
+  assert.match(notice, /拦不住人名或私事被写进检索词/);
+  assert.match(notice, /@ 它和回复它的消息也会先这样发给判定模型一次/);
+  assert.match(notice, /还没有在真实的 Perplexity 上用过/);
+  assert.match(sectionOf(DECISIONS, '## 用户定的（2026-11-17，搜索）', '## 开发时定的，用户还没有确认（2026-11-17，搜索）'), /告知草稿改过了，按 D5 要你本人看过再用/);
+  const devRows = sectionOf(DECISIONS, '## 开发时定的，用户还没有确认（2026-11-17，搜索）', '## 待定（决策点 D）');
+  for (const row of ['| 打开搜索（`clo search enable', '| 手改 `searchProvider` |', '| 关搜索（`clo search disable`） |', '| 每群开关（', '| `clo mode live` 的搜索检查 |', '| 付费探测工具 |']) assert.ok(devRows.includes(row), row);
+  assert.match(CONTRACT, /## 8\. Turning it on, the live checks and the probe \(implemented\)/);
+  assert.match(CONTRACT, /The probe has never run with `--approve`/);
+  // The probe's worst case in the docs is the tool's own figure.
+  assert.match(read('src/tools/search-probe.mjs'), /search: Object\.freeze\(\{ inputPerM: 5, outputPerM: 20, requestUsd: 0\.02 \}\)/);
+  for (const [name, text] of [['README', README], ['DEPLOYMENT', DEPLOYMENT], ['contract', CONTRACT], ['DECISIONS', DECISIONS]]) {
+    if (name !== 'DECISIONS') assert.ok(text.includes('$0.0619'), `${name} names the probe's worst case`);
+  }
+  const stale = ['搜索还没做完', '名字沿用了还没做的搜索额度', '以后由 `clo search enable` 写', '**Not written yet**', 'Live checks (console step, not written)', '还没有写，现在只能手改配置打开', 'Still to write with their steps', '**Must be `none` in this build**'];
+  assert.throws(() => assertGone(`${README}\n搜索还没做完`, stale, 'planted'), /still says/);
+  for (const name of PUBLIC_DOCS) assertGone(read(name), stale, name);
+});

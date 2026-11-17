@@ -86,6 +86,15 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 - **数据去哪里：** 用 OpenRouter 时，消息经 OpenRouter 到实际的模型服务方；直连 Anthropic 时，消息直接发给 Anthropic。告知草稿“消息发给谁”那一句按在用的接口填。本机这边，`clo.db` 升到第 2 版（预算记录多一列接口类型），升级前的整份旧库留成 `clo.db.v1.bak`，保留多久见 README 的“数据和隐私”。
 - **没有确认的：** Haiku 关闭思考加 effort low 能不能用、错误的真实形状（余额用完、花费上限、403）、响应里的地区和速度字段、出错或中止的请求收不收费，都等付费探测（`scripts\q5-anthropic.ps1`，还没有跑过）。
 
+## 联网搜索
+
+只在 own 运行时有，openclaw 运行时这一版没有。用户 2026-11-17 的决定见 [DECISIONS.md](../DECISIONS.md) 的“用户定的（2026-11-17，搜索）”，合同在 [search-contract.md](search-contract.md)（英文），命令和说明见 README 的“联网搜索”。
+
+- **只离线验证过。** 真实 Sonar 上没有跑过，付费探测（`scripts\search-probe.ps1`、`scripts/search-probe.sh`）也没有跑过。搜索打开时 `clo mode live` 一律拒绝（`search_rules`）。
+- **打开和关闭：** `clo search lock --confirm-price`，`clo search enable --confirm`（启用 QQ 时加 `--qq-platform-notified`），每群 `clo group set <群> --search on`；关用 `clo search disable`。打开算一次模型变更，清除每个群的“已告知”和 D3 记录；打开一个群的开关清除这个群的“已告知”。手改 `searchProvider` 被 `clo apply`、`clo start` 和 `clo mode live` 拒绝。
+- **进程拿到哪个 Key：** 搜索打开时，可洛进程多拿一个搜索 Key（`.env` 里是 `CLO_SEARCH_API_KEY`，进程里叫 `CLO_SEARCH_KEY`），不算模型 Key；Gateway 永远拿不到。进程每次启动在 `clo.db` 记下它的加盐散列，`clo mode live` 拿来和 `.env` 比。
+- **钱：** 硬上限是搜索 Key 自己的每日限额，金额由部署者定，写进 `budget.searchKeyDailyLimitUsd`；本机账本另有搜索层级和次数。对话直连 Anthropic 时搜索照样经 OpenRouter。
+
 ## 内存
 
 **只在离线测试里量过**：Windows，私有 Node，mock QQ，mock 模型，用这份代码的 `src/bot/main.mjs`，一次样本。

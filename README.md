@@ -4,7 +4,7 @@
 
 **现在能做：** 在 QQ 群里回应真实 @、回复她的消息、点名（叫她的名字），以及偶尔插话。点名和插话每个群单独打开，默认关。
 
-**还没有做：** 联网搜索、私聊陪伴、提醒、长期记忆，都没有实现。私聊一律不回。只处理文字，图片和语音不下载、不转写，也不发。
+**还没有做：** 私聊陪伴、提醒、长期记忆，都没有实现。联网搜索只在新运行时写了，只离线验证过，没有发过任何真实请求，打开时不能 live（见下面“联网搜索”）。私聊一律不回。只处理文字，图片和语音不下载、不转写，也不发。
 
 ## 现状
 
@@ -17,6 +17,8 @@
 **过渡期：两套运行时。** 用户已决定去掉 OpenClaw。项目自己的运行时已经写好，放在配置项 `runtime: "own"` 后面，**默认仍是 `openclaw`，现在跑的也是它，上面这些真实记录都是在 OpenClaw 上得到的**。新运行时在真实 QQ 上的验收一项都没有做，只有离线测试（mock QQ、mock 模型）和一次不接 QQ 的付费探测（Q5，真实 OpenRouter，两个回合）。这份 README 写的都是 openclaw 路线，另有说明的除外。怎么切换、怎么回退、改了什么，见 [docs/own-runtime.md](docs/own-runtime.md)。
 
 **模型接口（只在新运行时）：** 新运行时的模型调用可以走 OpenRouter（默认），也可以用 `clo provider use` 换成直连 Anthropic API。直连 Anthropic 这条路只在离线测试（mock QQ、mock Anthropic）里跑过，**真实 Anthropic 上一次都没有跑过**，Anthropic 的付费探测也没有跑过。怎么配、怎么换、钱怎么管，见下面“模型接口”。
+
+**联网搜索（只在新运行时）：** 代码写完了，只在离线测试（mock QQ、mock 模型、mock 搜索）里跑过，**真实的 Perplexity 和 OpenRouter 搜索一次都没有调用过**，付费探测（`scripts\search-probe.ps1`）也没有跑过。搜索打开时 `clo mode live` 一律拒绝，直到探测做完、规则写进来。openclaw 运行时这一版没有搜索。见下面“联网搜索”。
 
 ## 你需要准备什么
 
@@ -87,7 +89,7 @@ bash scripts/setup.sh --runtime
 | `CLO_QQ_APP_ID` | 启动就要 |
 | `CLO_QQ_APP_SECRET` | 启动就要 |
 | `CLO_CHAT_API_KEY` | 只有 live 要。这是 OpenRouter Key，启动时映射成宿主要的 `OPENROUTER_API_KEY` |
-| `CLO_SEARCH_API_KEY` | 只有新运行时打开了搜索、又要 live 时要。搜索还没做完，打开时 `clo mode live` 一律拒绝。单独建一个 OpenRouter Key，不能和 `CLO_CHAT_API_KEY`、`CLO_TEST_API_KEY` 相同，设好它自己的每日限额，`budget.searchKeyDailyLimitUsd` 写同一个数。`clo start` 只在搜索打开时把它交给可洛进程（名字是 `CLO_SEARCH_KEY`），Gateway 拿不到 |
+| `CLO_SEARCH_API_KEY` | 只有新运行时打开了搜索、又要 live 时要。搜索只离线验证过，打开时 `clo mode live` 一律拒绝。单独建一个 OpenRouter Key，不能和 `CLO_CHAT_API_KEY`、`CLO_TEST_API_KEY` 相同，设好它自己的每日限额，`budget.searchKeyDailyLimitUsd` 写同一个数。`clo start` 只在搜索打开时把它交给可洛进程（名字是 `CLO_SEARCH_KEY`），Gateway 拿不到 |
 | `CLO_TEST_API_KEY` | 只有付费探测要（own 运行时的 Q5）。单独建一个 OpenRouter Key，日限额不高于这次探测的上限。机器人不用它，`clo start` 也不把它交给 Gateway 或机器人进程 |
 | `CLO_ANTHROPIC_API_KEY` | 只有新运行时、在用的接口是 Anthropic 时要：`clo ack hard-cap` 和 live 都要它。放在专用的非默认工作区里。`clo start` 只把它交给可洛进程，Gateway 拿不到；用 Anthropic 时可洛进程也拿不到 OpenRouter 的 Key |
 | `CLO_TEST_ANTHROPIC_API_KEY` | 只有 Anthropic 的付费探测（`q5-anthropic.ps1`）要，它还没有跑过。放在另一个专用的探测工作区里。机器人不用它，`clo start` 也不把它交给任何进程 |
@@ -263,6 +265,31 @@ live 之后手改 `config.json` 再 `clo apply`：新群没告知、或确认项
 - **`status` 显示什么：** “模型接口：anthropic（anthropic）”；“对账：不可用（本地估算）”；声明的核对没过时还有一行“硬上限未核实”。
 - **不对账：** 花费只按价格表在本地算，真实数字以 Anthropic 控制台的账单为准，要你自己对照。没有结算的记录（HTTP 错误、中止、缺用量）一直按预留额计入，直到你运行 `clo budget accept-unsettled`。付费暂停（`provider_fail`、`anthropic_*`）用 `clo budget clear-pause` 解除，原因还在就立刻再暂停。有未结算记录时，先 `accept-unsettled` 再 `clear-pause`。
 
+### 联网搜索（只在新运行时）
+
+**只离线验证过。** 真实 Sonar 上一次都没有跑过，字段、价格和计费方式都是按文档猜的，要等一次你同意金额的付费探测确认。在那之前，搜索打开时 `clo mode live` 一律拒绝（`search_rules`），只能在 dry-run 和离线测试里用。设计和没有核实的地方见 [docs/search-contract.md](docs/search-contract.md)。
+
+```powershell
+.\scripts\clo.ps1 mode dry-run                    # 打开搜索要在 dry-run、进程停着时做
+.\scripts\stop.ps1
+# 在 OpenRouter 上单独建一个搜索 Key，设每日限额（每天重置），填进 .env 的 CLO_SEARCH_API_KEY
+# 把同一个限额写进 config.json 的 budget.searchKeyDailyLimitUsd（金额由你定）
+.\scripts\clo.ps1 search lock --confirm-price     # 从 OpenRouter 目录锁定 perplexity/sonar-pro 的价格，不用 Key
+.\scripts\clo.ps1 search enable --confirm --qq-platform-notified
+.\scripts\clo.ps1 group set 测试群 --search on    # 每群一个开关，先只开测试群
+# 按告知草稿重新告知这个群，再 clo group notice-done 测试群，再 clo ack d3 "<你的决定>"
+.\scripts\clo.ps1 search show                     # 全局和各群的状态、价格、Key 填没填、日限额
+.\scripts\clo.ps1 search disable                  # 随时可以关，live 下、进程在跑时也行
+```
+
+- **怎么搜：** 有人 @ 她、回复她或点名叫她时，在打开了搜索的群里先买一次 Haiku 判定，只问要不要搜和检索词；要搜时，程序直接调 OpenRouter 上的 `perplexity/sonar-pro`，把结果当作资料交给 Claude 写回答。主模型自己没有工具。插话和危险路线永远不搜。
+- **打开搜索算一次模型变更。** 多了一个模型和一个接收方，所以要 `--qq-platform-notified`（启用 QQ 时），并清除每个群的“已告知”和 D3 记录。打开一个群的搜索开关也会清除这个群的“已告知”，live 下不能打开。只能用 `clo search enable` 打开：手改 `config.json` 的 `searchProvider`，`clo apply`、`clo start`、`clo mode live` 都拒绝，手动关掉也拒绝，关用 `clo search disable`。只用模拟环境验证过
+- **发出去什么：** 只有检索词，每次回答最多 2 条，加一句固定的说明。不带聊天记录、发言人代号、群和成员的编号。检索词含网址、`<@…>` 标记、`U` 加数字的代号、6 位以上连续数字、本群已知的显示名，或命中本地规则、泄露检查时，整条不发。程序拦得住这些形状，拦不住人名或私事被写进检索词。
+- **次数和钱：** 每次回答最多 2 次，每天（上海日）最多 10 次，配置只能调低。搜索唯一的硬上限是搜索 Key 自己在 OpenRouter 上的每日限额；本机账本另有搜索层级（全部花费到 `searchUsd` 就停搜），每次搜索前按最坏情况预留。搜索失败、超时或花费超过预留时只停搜索，不停对话。对话直连 Anthropic 时，搜索照样经 OpenRouter，用搜索 Key。
+- **回答怎么说：** 查到时，程序在回答后面另起一行“来源：A、B、C”，只写接口返回的来源名称，不带链接。没查到或联网失败时，她按提示词如实说；她不查的话题说“这个我不查”。这些措辞靠提示词，真实回答没有看过。网页文字里的指令不算数，不能触发命令、改配置或读 Key。
+- **live 多查几项（搜索打开时）：** `search_ack`（打开记录对得上）、`search_lock`、`search_key`（搜索 Key 填了，而且不是对话 Key 或探测 Key）、`search_key_limit`（用搜索 Key 读到每日限额，等于 `budget.searchKeyDailyLimitUsd`，够一次搜索的预留）、`search_process_key`（运行中的进程拿的就是这个 Key）、`search_rules`。规则没记录时搜索 Key 不发出去读。
+- **付费探测：** `scripts\search-probe.ps1`（Linux 上 `scripts/search-probe.sh`）。不带 `-Approve` 只打印计划，不读 `.env`、不联网；带上时读专用的 `CLO_TEST_API_KEY`，它的每日限额不能高于 `-MaxUsd`，发一次带搜索 schema 的判定和一次 Sonar，按工具里写死的价格上限算最坏 $0.0619。**还没有跑过，要你先同意金额。**
+
 ### 在线条件和重启
 
 - **没有自启动。** 电脑关机、睡眠、断网时，可洛不工作。开机后要自己运行 `start.ps1`。项目不会改电源设置。
@@ -279,7 +306,8 @@ live 之后手改 `config.json` 再 `clo apply`：新群没告知、或确认项
 |---|---|---|
 | 本地日预算 | $2.5/上海日，约 $75/30 天 | 本机账本，到了就停 |
 | Key 日限额 | 由你定，要不高于你能接受的日花费。示例值 $1.60/UTC 日，每天重置，约 $48/30 天 | 你在 OpenRouter 上设，这是最后一道闸 |
-| 插话 | 它自己花到 $0.75，或全部花费到 $2.10（配置项 `searchUsd`，名字沿用了还没做的搜索额度），先到先停。`budget show` 只显示 $0.75 | 本机账本 |
+| 插话 | 它自己花到 $0.75，或全部花费到 $2.10（配置项 `searchUsd`），先到先停。`budget show` 只显示 $0.75 | 本机账本 |
+| 搜索（只在新运行时，打开时） | 全部花费到 `searchUsd`（$2.10）停搜；每次回答最多 2 次，每天最多 10 次。硬上限是搜索 Key 自己的每日限额，金额由你定，写进 `budget.searchKeyDailyLimitUsd`，没写不能打开搜索 | 本机账本；搜索 Key 的限额由你在 OpenRouter 上设 |
 | 点名 | 全部花费到 $2.25 停 | 本机账本 |
 | @ | 全部花费到 $2.5 停 | 本机账本 |
 | 被点名回复和 @ | 每人每小时 10 次，共用一个计数。带危险词的 @ 超过后只买一次判定，判定说危险才回复 | 本机 |
@@ -307,7 +335,9 @@ Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度�
 
 **发给第三方的：** 准入群里的消息，部分会发给 OpenRouter 和模型提供方。判定用 Haiku，回答用 Opus，服务方不一定是 Anthropic 本身。普通消息也可能要过一次判定，并带上近期发言；回答时带上近期群消息；回答过的内容之后还会再发给模型。发言人用代号，开了显示名开关的群，回答请求还带显示名。Gateway 每次启动都会尝试连接 `clawhub.ai`（OpenClaw 的插件目录），没有找到开关。新运行时直连 Anthropic 时，这些消息直接发给 Anthropic，不经过 OpenRouter，判定和回答都一样。
 
-**告知群友：** 草稿在 [persona/group-notice.zh.md](persona/group-notice.zh.md)，机器人不会发。
+**联网搜索（只在新运行时，打开时）：** 检索词经 OpenRouter 发给 Perplexity，对话直连 Anthropic 时也一样。打开了搜索的群里，@ 她和回复她的消息也会先发给判定模型一次（带近期发言），用来决定要不要搜。见上面“联网搜索”。
+
+**告知群友：** 草稿在 [persona/group-notice.zh.md](persona/group-notice.zh.md)，机器人不会发。打开了搜索的群，告知要包括草稿里“联网搜索”那一条。
 
 **留在本机的：**
 
@@ -324,6 +354,8 @@ Key 到限额时付费暂停（`openrouter_key_limit`），读到 Key 有额度�
 | OpenClaw 会话库（`.runtime/state/agents/main/agent/openclaw-agent.sqlite`） | **被派发的回合正文在这里，模型的思考文字、每回合的提示词副本和全文搜索索引也在这里，模型服务方的错误原文也在这里，包括审核返回的 `flagged_input`** | 由宿主管理，这一版**没有**删除接口，`/new` 也不会删除旧内容（Q6 核对过） |
 | OpenRouter、模型提供方 | 收到的消息。开了显示名开关的群，主模型（Opus）的回答请求还带当前发言人和近期发言人的显示名；判定模型（Haiku）只收代号 | 以它们的政策为准，本项目控制不了 |
 | Anthropic（新运行时直连时） | 收到的消息，和上一行一样，只是不经过 OpenRouter | 以 Anthropic 的政策为准，本项目控制不了 |
+| OpenRouter、Perplexity（新运行时打开搜索时） | 检索词和一句固定的说明 | 以它们的政策为准，本项目控制不了 |
+| 搜索在本机留下的（新运行时打开搜索时） | `clo.db` 里每次搜索一条预留行（接口列是 `search`，有费用和事件散列，没有检索词）和当天、每条消息的次数计数；`events.jsonl` 的 `search_call` 只有状态、原因、HTTP 状态、来源个数、费用和耗时。查到的资料和来源名只在这一回合的内存里；她的回答连同末尾的来源行进内存上下文，和别的回答一样 | 预留行 90 天，计数到期清，事件日志不自动清理。按设计不记检索词和查到的内容，只看过代码和模拟测试，没有扫过真实运行留下的文件 |
 
 **Linux 上的已知缺口：** 锁定版本的宿主在 Linux 上仍把 `/tmp/openclaw` 当作临时目录（权限 0700，本机所有运行共用），用来放媒体和上下文映射之类的临时文件，`clo` 不清理它。日志已经不写这里。没有受支持的配置项能把这个目录挪进 `.runtime`，我们也不改上游代码。
 

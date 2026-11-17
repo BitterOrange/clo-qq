@@ -203,6 +203,7 @@ test('the controls clo status and clo mode live read: connected, READY, heartbea
     assert.ok(Number(store.getControl('heartbeat_at')) > 0);
     assert.equal(store.getControl('gateway_key'), store.key(KEY));
     assert.notEqual(store.getControl('gateway_key'), store.key('ANOTHER-KEY'));
+    assert.equal(store.getControl('search_key'), 'none', 'no search Key held');
   });
   assert.ok(events(s).some((e) => e.event === 'recovery'));
   qq.sendReady();
@@ -217,9 +218,14 @@ test('the controls clo status and clo mode live read: connected, READY, heartbea
 
   // No Key in the environment reads as none, which clo mode live never matches.
   const s2 = site(qq);
-  const second = start(s2, { env: envFor(s2, { OPENROUTER_API_KEY: undefined }) });
+  // The search Key the process holds is recorded the same way, as a hash: clo mode live compares it with .env.
+  const second = start(s2, { env: envFor(s2, { OPENROUTER_API_KEY: undefined, CLO_SEARCH_KEY: 'FAKE-SEARCH-KEY-HELD' }) });
   await until(() => qq.identifies.length === 2, 'identify');
-  peek(s2, (store) => assert.equal(store.getControl('gateway_key'), 'none'));
+  peek(s2, (store) => {
+    assert.equal(store.getControl('gateway_key'), 'none');
+    assert.equal(store.getControl('search_key'), store.key('FAKE-SEARCH-KEY-HELD'));
+    assert.notEqual(store.getControl('search_key'), 'FAKE-SEARCH-KEY-HELD', 'never the value');
+  });
   second.ctl.abort();
   await ends(second.run, 'an aborted run');
 });

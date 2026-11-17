@@ -251,12 +251,16 @@ const liveReady = (cfg) => {
   return cfg;
 };
 
+// What gatherLiveFacts finds with search on and everything in order: the record, the lock, a Key of its own held by the
+// process, and that Key's daily limit equal to budget.searchKeyDailyLimitUsd (0.5) and above one hold.
+const searchFacts = () => ({ searchAckMatches: true, searchLocked: true, searchHoldMicros: 26000, searchKeyOk: true, searchProcessKeyMatches: true, searchKey: { limitMicros: 500000, limitReset: 'daily', usageDailyMicros: 0 } });
+
 test('live is refused while search is on, until the search rules are recorded', () => {
   assert.equal(SEARCH_RULES_RECORDED, false, 'this build has not recorded them');
   assert.deepEqual(livePreconditions(liveReady(ownCfg()), goodFacts()).failed, [], 'control: off, live passes');
   const on = liveReady(searchOn());
-  assert.deepEqual(livePreconditions(on, goodFacts()).failed, ['search_rules']);
-  assert.deepEqual(livePreconditions(on, goodFacts(), { searchRules: () => true }).failed, [], 'control: recorded, it passes');
+  assert.deepEqual(livePreconditions(on, { ...goodFacts(), ...searchFacts() }).failed, ['search_rules']);
+  assert.deepEqual(livePreconditions(on, { ...goodFacts(), ...searchFacts() }, { searchRules: () => true }).failed, [], 'control: recorded, it passes');
   // A hand edit while live counts it as a config problem too.
   assert.deepEqual(liveConfigProblems(liveReady(ownCfg())), []);
   assert.deepEqual(liveConfigProblems(on), ['search_rules']);
@@ -266,8 +270,31 @@ test('live: base_urls covers the search address', () => {
   const cfg = liveReady(searchOn());
   cfg.search = { baseUrl: 'http://127.0.0.1:9' };
   const rules = { searchRules: () => true };
-  assert.deepEqual(livePreconditions(cfg, goodFacts(), rules).failed, ['base_urls']);
-  assert.deepEqual(livePreconditions(cfg, { ...goodFacts(), env: { CLO_TEST_ROOT: dir } }, rules).failed, [], 'control: test mode');
+  assert.deepEqual(livePreconditions(cfg, { ...goodFacts(), ...searchFacts() }, rules).failed, ['base_urls']);
+  assert.deepEqual(livePreconditions(cfg, { ...goodFacts(), ...searchFacts(), env: { CLO_TEST_ROOT: dir } }, rules).failed, [], 'control: test mode');
+});
+
+test('live with search on: each search fact alone refuses with its own code; all of them pass (control)', () => {
+  const on = liveReady(searchOn());
+  const rules = { searchRules: () => true };
+  const facts = (over) => ({ ...goodFacts(), ...searchFacts(), ...over });
+  assert.deepEqual(livePreconditions(on, facts({}), rules).failed, [], 'control');
+  const cases = [
+    ['search_ack', { searchAckMatches: false }],
+    ['search_lock', { searchLocked: false }],
+    ['search_key', { searchKeyOk: false }],
+    ['search_process_key', { searchProcessKeyMatches: false }],
+    ['search_key_limit', { searchKey: null }],
+    ['search_key_limit', { searchKey: { limitMicros: 500000, limitReset: 'monthly', usageDailyMicros: 0 } }],
+    ['search_key_limit', { searchKey: { limitMicros: 400000, limitReset: 'daily', usageDailyMicros: 0 } }],
+    ['search_key_limit', { searchHoldMicros: 600000 }],
+    ['search_key_limit', { searchHoldMicros: null }],
+  ];
+  for (const [code, over] of cases) assert.deepEqual(livePreconditions(on, facts(over), rules).failed, [code], JSON.stringify(over));
+  // The same facts with search off are not looked at.
+  assert.deepEqual(livePreconditions(liveReady(ownCfg()), { ...goodFacts(), searchAckMatches: false, searchKey: null }).failed, []);
+  // On the OpenClaw runtime validation refuses search already; the live check says so too.
+  assert.deepEqual(livePreconditions({ ...on, runtime: 'openclaw' }, facts({}), rules).failed, ['search_runtime']);
 });
 
 // --- The env: the search Key reaches the bot alone, under its child name, and only with search on. ---

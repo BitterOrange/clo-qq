@@ -6,12 +6,12 @@ import { activeKindOf, ConfigError, livePreconditions, OPENROUTER_BASE_URL, prov
 import { checkSentinels, loadPolicy, sha256Hex } from '../clo-plugin/lib/core/contentPolicy.js';
 import { shanghaiDay } from '../clo-plugin/lib/core/ids.js';
 import { createLedger } from '../clo-plugin/lib/core/ledger.js';
-import { anthropicModelChecks, callWorstMicros, checkAnthropicModels, fetchCatalog, lockFromCatalog, lockFromPriceBook, lockSearchFromCatalog, resolveSelector, validateModels } from '../clo-plugin/lib/core/models.js';
+import { anthropicModelChecks, callWorstMicros, checkAnthropicModels, fetchCatalog, lockFromCatalog, lockFromPriceBook, lockSearchFromCatalog, resolveSelector, searchLockUsable, validateModels } from '../clo-plugin/lib/core/models.js';
 import { searchWorstMicros } from '../clo-plugin/lib/core/providers/cost.js';
-import { SEARCH_DEFAULTS, SEARCH_HOLD_INPUT_TOKENS, SEARCH_MODEL, SEARCH_OFF, SEARCH_PAUSE_KEY, searchDayCounter, searchOnInConfig } from '../clo-plugin/lib/core/providers/searchRegistry.js';
+import { SEARCH_CHILD_KEY, SEARCH_DEFAULTS, SEARCH_ENABLED_CONTROL, SEARCH_HOLD_INPUT_TOKENS, SEARCH_KEY_CONTROL, SEARCH_KEY_ENV, SEARCH_MODEL, SEARCH_OFF, SEARCH_PAUSE_KEY, SEARCH_PROVIDERS, SEARCH_RUNTIMES, searchDayCounter, searchOnInConfig, searchProviderOf, searchRulesRecorded } from '../clo-plugin/lib/core/providers/searchRegistry.js';
 import { ACTIVE_PROVIDER_CONTROL, hardCapAckProblems, hardCapAckRefusal, hardCapControlKey, KEY_ENV, liveStartCheck, providerRecord, providerRulesRecorded } from '../clo-plugin/lib/core/providers/registry.js';
 import { extractPolicySection, writeAtomic } from '../clo-plugin/lib/core/render.js';
-import { apply as applyRender, assertApplicable as checkApplicable, assertNoEnvProxy, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, readPriceBook, readSearchLock, renderAll, requiredHoldMicros, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock, writeSearchLock } from './common.mjs';
+import { apply as applyRender, assertApplicable as checkApplicable, assertNoEnvProxy, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, readPriceBook, readSearchLock, recordSearchChange, renderAll, requiredHoldMicros, runningSearchRecord, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock, writeSearchLock } from './common.mjs';
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, runDoctor } from './doctor.mjs';
 import { assertRuntimeSwitchAllowed, assertTestModeWired, inspectGateway, inspectStartLock, parseEnvFile, readPidRecord, recordRuntime, renamedEnvNames, renamedKeyHint, requireSecrets, RUNTIME_LABEL, startLockFile, startRuntime, stopGateway, withStartLock } from './lifecycle.mjs';
 import { collectStatus, formatStatus, RESIDUAL_EXIT, residualBehind } from './status.mjs';
@@ -25,7 +25,7 @@ const USAGE = `用法：clo <命令>
   resume [--group <群>|--all|--interject]
   status [--json] [--ack]            --ack 把当前告警标记为已读
   group list | add <群> --id <群ID> | remove <群>
-        set <群> [--interject on|off] [--name-mention on|off] [--display-names on|off] | notice-done <群>
+        set <群> [--interject on|off] [--name-mention on|off] [--display-names on|off] [--search on|off] | notice-done <群>
   owner add <群> --id <成员ID>
   targets arm --minutes <n> | list [--reveal] | clear
   budget show | accept-unsettled | clear-pause | clear-search-pause
@@ -35,7 +35,8 @@ const USAGE = `用法：clo <命令>
         [--confirm-price] [--qq-platform-notified]
   provider list | show | add anthropic
            use <接口> --confirm [--qq-platform-notified]   换模型接口，算一次模型变更
-  search lock [--confirm-price]       从模型目录锁定搜索模型的价格（只在 own 运行时用）
+  search show | lock [--confirm-price]   查看搜索状态；从模型目录锁定搜索模型的价格（只在 own 运行时用）
+         enable --confirm [--qq-platform-notified]   打开搜索，算一次模型变更 | disable   关掉搜索
   ack identity | q0 | d3 <决定> | terminal
       hard-cap <接口> --kind workspace_monthly --usd <金额> --prepaid-no-reload [--confirm]
   doctor [--config-only] [--json]
@@ -121,7 +122,13 @@ const LIVE_HINTS = {
   hard_cap: '这个接口读不到 Key 的花费和限额，要有你本人对硬上限的声明（clo ack hard-cap）：专用、非默认工作区的月度花费上限，加上关闭自动充值的预付费额度，金额至少够一次必答回复的预留，而且声明绑定的就是 .env 里现在这个 Key，也是运行中进程用的 Key。换过 Key 要先停进程，再重新声明',
   key_valid: '用这个 Key 读不到锁定的两个模型，或模型不支持这里要用的设置（D3 没有记录时不会去读）',
   provider_rules: '这个接口进入 live 的项目规则还没有记录：CLAUDE.md §8.2 和 DECISIONS.md 要先写进你同意的规则。在那之前只能 dry-run',
-  search_rules: '搜索打开时还不能 live：Sonar 的字段、价格和计费方式要等一次你同意金额的真实探测确认，规则写进 CLAUDE.md 和 DECISIONS.md 之后才放行。在那之前搜索只能在 dry-run 和离线测试里用；要 live，先关掉搜索（searchProvider 改回 none，再 clo apply）',
+  search_rules: '搜索打开时还不能 live：Sonar 的字段、价格和计费方式要等一次你同意金额的真实探测确认，规则写进 CLAUDE.md 和 DECISIONS.md 之后才放行。在那之前搜索只能在 dry-run 和离线测试里用；要 live，先 clo search disable',
+  search_runtime: '搜索只在 own 运行时可用（clo search disable，或把 runtime 改成 own）',
+  search_ack: 'config.json 的搜索记录和 clo.db 里 clo search enable 留下的记录对不上。搜索只能用 clo search enable 打开，不能手改',
+  search_lock: '搜索模型的价格没有锁定（clo search lock）',
+  search_key: '.env 里没有 CLO_SEARCH_API_KEY，或它和 CLO_CHAT_API_KEY、CLO_TEST_API_KEY 是同一个 Key。搜索要单独一个 Key，费用才能分开核算',
+  search_key_limit: '读不到搜索 Key 的信息，或它没有每日限额（limit_reset 必须是 daily），或限额和 config.json 的 budget.searchKeyDailyLimitUsd 不一样，或不够一次搜索的预留。这个限额是搜索唯一的硬上限（D3 没有记录、或搜索规则还没记录时不会去读）',
+  search_process_key: '运行中的可洛进程拿的不是 .env 里这个 CLO_SEARCH_API_KEY，或没有拿到搜索 Key。改过 .env 要先 clo stop 再 clo start',
   identity: '机器人身份没有确认（看 clo status，再 clo ack identity）',
   notice: '有群没有确认告知（clo group notice-done <群>）',
   q0: 'Q0 没有确认：你还没有确认看过自己的群能收到什么（clo ack q0）',
@@ -147,6 +154,7 @@ function liveHint(code, failed, hasKey, keyName = KEY_ENV.openrouter, facts = {}
   // The checker's problems are short codes it made itself, never provider text.
   if (code === 'key_valid' && facts.providerRulesRecorded === false) return '没有检查：这个接口进入 live 的项目规则还没有记录，记录之前不把 Key 发给接口';
   if (code === 'key_valid' && facts.keyProblems?.length) return `${LIVE_HINTS.key_valid}（${facts.keyProblems.join('、')}）`;
+  if (code === 'search_key_limit' && facts.searchKeyRead === 'skipped') return '没有检查：搜索进入 live 的项目规则还没有记录、D3 没有记录，或搜索 Key 本身不合格。这些解决之前不把搜索 Key 发给 OpenRouter';
   return LIVE_HINTS[code] ?? '';
 }
 
@@ -173,7 +181,32 @@ export function shownNotes(report) {
   return report.checks.filter((c) => !c.ok && SHOWN_WARNINGS.includes(c.id)).map((c) => `提醒：${c.detail}`);
 }
 
-export async function gatherLiveFacts(ctx, cfg, { rulesRecorded = providerRulesRecorded } = {}) {
+// Search's facts, while it is on. Its Key goes to OpenRouter's /key only once nothing else refuses search live: its
+// project rules recorded (searchRules), D3 recorded and the Key itself fit. Values are compared, never printed.
+async function gatherSearchFacts(ctx, cfg, store, facts, secrets, searchRules) {
+  const provider = searchProviderOf(cfg);
+  const lock = readSearchLock(ctx.paths);
+  const eff = readEffective(ctx);
+  facts.searchAckMatches = cfg.acks?.search?.provider === provider && store.getControl(SEARCH_ENABLED_CONTROL) === provider;
+  facts.searchLocked = searchLockUsable(lock, SEARCH_MODEL[provider]);
+  facts.searchHoldMicros = facts.searchLocked ? searchWorstMicros({ inputTokens: SEARCH_HOLD_INPUT_TOKENS, maxTokens: eff?.search?.maxTokens ?? SEARCH_DEFAULTS.maxTokens }, lock.price) : null;
+  const key = secrets[SEARCH_KEY_ENV] ?? null;
+  const others = [secrets[KEY_ENV.openrouter], secrets.CLO_TEST_API_KEY].filter(Boolean);
+  facts.searchKeyOk = Boolean(key) && !others.includes(key);
+  facts.searchProcessKeyMatches = Boolean(key) && store.getControl(SEARCH_KEY_CONTROL) === store.key(key);
+  facts.searchKey = null;
+  facts.searchKeyRead = 'skipped';
+  if (searchRules() !== true || !cfg.acks?.d3 || !facts.searchKeyOk) return;
+  const ledger = createLedger({ store, getEffective: () => eff, fetch: ctx.fetch, getKey: () => null, getSearchKey: () => key, log: ctx.log, now: ctx.now, runtime: 'own' });
+  try {
+    facts.searchKey = await ledger.readSearchKey();
+    facts.searchKeyRead = 'ok';
+  } catch {
+    facts.searchKeyRead = 'failed';
+  }
+}
+
+export async function gatherLiveFacts(ctx, cfg, { rulesRecorded = providerRulesRecorded, searchRules = searchRulesRecorded } = {}) {
   const facts = { now: ctx.now(), env: ctx.env };
   const provider = providerOfConfig(cfg);
   const kind = provider?.kind ?? null;
@@ -187,7 +220,7 @@ export async function gatherLiveFacts(ctx, cfg, { rulesRecorded = providerRulesR
   // ledger.holdMicros('reply_required') itself, on the effective file just rendered, so the runtime's own hold rule
   // applies. Without a price it is null, and 'models' or the ledger refuses anyway.
   facts.requiredHoldMicros = requiredHoldMicros(readEffective(ctx));
-  const secrets = parseEnvFile(ctx.paths.envFile);
+  const secrets = parseEnvFile(ctx.paths.envFile, [...new Set([...Object.values(KEY_ENV), SEARCH_KEY_ENV, 'CLO_TEST_API_KEY'])]);
   const envKey = kind ? (secrets[KEY_ENV[kind]] ?? null) : null;
   return withStoreAsync(ctx, async (store) => {
     const number = (k) => {
@@ -228,6 +261,7 @@ export async function gatherLiveFacts(ctx, cfg, { rulesRecorded = providerRulesR
       }
     }
     facts.paidPaused = store.getControl('paid_paused');
+    if (searchOnInConfig(cfg)) await gatherSearchFacts(ctx, cfg, store, facts, secrets, searchRules);
     return facts;
   });
 }
@@ -384,7 +418,7 @@ function cmdGroup(ctx, { positional, flags }) {
     const entries = Object.entries(qq.groups ?? {});
     if (entries.length === 0) ctx.out('没有群。空列表表示全部关闭。');
     for (const [id, g] of entries) {
-      ctx.out(`${g.label}\t${maskId(id)}\t插话 ${g.interject ? '开' : '关'}\t点名 ${g.nameMention ? '开' : '关'}\t显示名 ${g.displayNames === true ? '开' : '关'}\t已告知 ${g.noticeGiven ? '是' : '否'}\towner ${(qq.owner?.groupMember?.[id] ?? []).length}`);
+      ctx.out(`${g.label}\t${maskId(id)}\t插话 ${g.interject ? '开' : '关'}\t点名 ${g.nameMention ? '开' : '关'}\t显示名 ${g.displayNames === true ? '开' : '关'}\t搜索 ${g.search === true ? '开' : '关'}\t已告知 ${g.noticeGiven ? '是' : '否'}\towner ${(qq.owner?.groupMember?.[id] ?? []).length}`);
     }
     return 0;
   }
@@ -411,13 +445,24 @@ function cmdGroup(ctx, { positional, flags }) {
   }
   if (sub === 'set') {
     const { group } = groupByLabel(cfg, need(positional[1], '群的名称'));
-    if (flags['--interject'] === undefined && flags['--name-mention'] === undefined && flags['--display-names'] === undefined) throw new CliError('要指定 --interject、--name-mention 或 --display-names。');
+    if (flags['--interject'] === undefined && flags['--name-mention'] === undefined && flags['--display-names'] === undefined && flags['--search'] === undefined) throw new CliError('要指定 --interject、--name-mention、--display-names 或 --search。');
     if (flags['--interject'] !== undefined) group.interject = onOff(flags['--interject'], '--interject');
     if (flags['--name-mention'] !== undefined) group.nameMention = onOff(flags['--name-mention'], '--name-mention');
     if (flags['--display-names'] !== undefined) group.displayNames = onOff(flags['--display-names'], '--display-names');
+    // Decision D7: a group's search switch, on top of the global one. Turning it on sends this group's keywords to a new
+    // recipient, so the group's notice is cleared and has to be given again; that cannot happen while live.
+    let searchTurnedOn = false;
+    if (flags['--search'] !== undefined) {
+      const want = onOff(flags['--search'], '--search');
+      searchTurnedOn = want && group.search !== true;
+      if (searchTurnedOn && (cfg.mode === 'live' || readEffective(ctx)?.mode === 'live')) throw new CliError('live 下不能打开群的搜索：这个群的“已告知”会被清除，要重新告知。先 clo mode dry-run。');
+      group.search = want;
+      if (searchTurnedOn) group.noticeGiven = false;
+    }
     saveAndApply(ctx, cfg);
-    ctx.out(`群 ${group.label}：插话 ${group.interject ? '开' : '关'}，点名 ${group.nameMention ? '开' : '关'}，显示名 ${group.displayNames === true ? '开' : '关'}。`);
+    ctx.out(`群 ${group.label}：插话 ${group.interject ? '开' : '关'}，点名 ${group.nameMention ? '开' : '关'}，显示名 ${group.displayNames === true ? '开' : '关'}，搜索 ${group.search === true ? '开' : '关'}。`);
     if (flags['--display-names'] === 'on') ctx.out('这个开关属于决策点 D5（告知和同意）：群友的显示名会发给主模型。开启前请先告知这个群。');
+    if (searchTurnedOn) ctx.out(`已清除这个群的“已告知”：@ 和点名的消息会先发给判定模型决定要不要搜，检索词发给 ${SEARCH_RECIPIENTS['openrouter-sonar']}。请你本人按告知草稿重新告知这个群，再 clo group notice-done ${group.label}。${searchOnInConfig(cfg) ? '' : '搜索全局还关着，这个开关现在不起作用（clo search enable）。'}`);
     return 0;
   }
   if (sub === 'notice-done') {
@@ -785,10 +830,115 @@ async function lockSearch(ctx, cfg, flags) {
   return 0;
 }
 
+// Who receives the search queries: what the group notice has to name (decision D5: through OpenRouter, whatever the
+// chat provider is).
+const SEARCH_RECIPIENTS = { 'openrouter-sonar': 'OpenRouter 和 Perplexity' };
+
+function searchShow(ctx, cfg) {
+  const provider = searchProviderOf(cfg);
+  const on = searchOnInConfig(cfg);
+  const model = SEARCH_MODEL[on ? provider : 'openrouter-sonar'];
+  const recorded = runningSearchRecord(ctx);
+  ctx.out(`搜索：${on ? `开（${provider}，模型 ${model}）` : '关'}${recorded === provider ? '' : `。注意：这套安装记录的是 ${recorded}，和 config.json 不一致，apply 和 start 会拒绝`}`);
+  if (!SEARCH_RUNTIMES.includes(runtimeOf(cfg))) ctx.out('运行时：openclaw。这一版只有 own 运行时能搜索。');
+  const lock = readSearchLock(ctx.paths);
+  if (searchLockUsable(lock, model)) {
+    ctx.out(`价格：已锁定，输入 $${lock.price.inputPerM}/百万 token，输出 $${lock.price.outputPerM}/百万 token，每次另加 $${lock.price.requestUsd}。单次最坏预留 ${usd(searchWorstMicros({ inputTokens: SEARCH_HOLD_INPUT_TOKENS, maxTokens: cfg.search?.maxTokens ?? SEARCH_DEFAULTS.maxTokens }, lock.price))}。`);
+  } else {
+    ctx.out('价格：还没锁定（clo search lock）。没有锁定价格时不会搜索。');
+  }
+  const secrets = parseEnvFile(ctx.paths.envFile, [SEARCH_KEY_ENV, KEY_ENV.openrouter, 'CLO_TEST_API_KEY']);
+  const key = secrets[SEARCH_KEY_ENV];
+  const shared = Boolean(key) && [secrets[KEY_ENV.openrouter], secrets.CLO_TEST_API_KEY].includes(key);
+  ctx.out(`搜索 Key：.env 的 ${SEARCH_KEY_ENV}，${key ? (shared ? '已填，但和对话 Key 或探测 Key 是同一个，不能用' : '已填') : '未填'}。可洛进程里它叫 ${SEARCH_CHILD_KEY}，Gateway 拿不到。`);
+  const limit = cfg.budget?.searchKeyDailyLimitUsd;
+  ctx.out(`搜索 Key 日限额：${limit === undefined ? '还没写（budget.searchKeyDailyLimitUsd）。金额由你定：先在 OpenRouter 上给这个 Key 设每日限额，再把同一个数写进 config.json' : `$${limit}，要和 OpenRouter 上的一样。这是搜索唯一的硬上限`}。`);
+  ctx.out(`次数：每次回答最多 ${cfg.search?.perAnswer ?? SEARCH_DEFAULTS.perAnswer} 次，每天（上海日）最多 ${cfg.search?.perDay ?? SEARCH_DEFAULTS.perDay} 次。插话不搜索。`);
+  const groups = Object.values(cfg.qq?.groups ?? {});
+  if (groups.length) ctx.out(`各群开关：${groups.map((g) => `${g.label} ${g.search === true ? '开' : '关'}`).join('，')}${on ? '' : '（全局关着，都不起作用）'}`);
+  ctx.out(`检索词发给 ${SEARCH_RECIPIENTS['openrouter-sonar']}，对话接口是哪一种都一样。`);
+  if (!searchRulesRecorded()) ctx.out('搜索进入 live 的项目规则还没有记录（要等一次你同意金额的真实探测），搜索打开时 clo mode live 会拒绝。');
+  return 0;
+}
+
+// `clo search enable --confirm`: decision D7. A model change under protocol section 4.2 and a new recipient of text
+// (keywords go to OpenRouter and Perplexity), so it has what `clo provider use` has: dry-run, no process, the platform
+// attestation while QQ is enabled, and every group's notice and D3 cleared. The record in clo.db is what apply then
+// accepts, so a hand edit cannot do the same.
+function enableSearch(ctx, cfg, flags) {
+  const provider = 'openrouter-sonar';
+  const model = SEARCH_MODEL[provider];
+  if (searchOnInConfig(cfg) && runningSearchRecord(ctx) === searchProviderOf(cfg)) {
+    ctx.out(`搜索已经打开（${searchProviderOf(cfg)}）。`);
+    return 0;
+  }
+  if (!flags['--confirm']) {
+    throw new CliError(`打开搜索算一次模型变更：多了搜索模型 ${model}，检索词会发给 ${SEARCH_RECIPIENTS[provider]}。每个群的“已告知”和 D3 记录都会清除，要重新告知、重新记录后才能 live。确认后加 --confirm。`);
+  }
+  if (cfg.mode === 'live' || readEffective(ctx)?.mode === 'live') throw new CliError('live 下不能打开搜索。先 clo mode dry-run，再 clo stop。');
+  const proc = processState(ctx);
+  if (proc.running) throw new CliError(`${proc.why}。进程运行时不能打开搜索：搜索 Key 只在启动时交给进程。先 clo stop。`);
+  if (!SEARCH_RUNTIMES.includes(runtimeOf(cfg))) throw new CliError('搜索只在 own 运行时可用，OpenClaw 运行时这一版没有搜索。要用搜索，先把 runtime 改成 own。');
+  if (!searchLockUsable(readSearchLock(ctx.paths), model)) throw new CliError('搜索模型的价格还没锁定。先 clo search lock --confirm-price。');
+  if (cfg.budget?.searchKeyDailyLimitUsd === undefined) {
+    throw new CliError('config.json 还没写 budget.searchKeyDailyLimitUsd。金额由你定：先在 OpenRouter 上给搜索 Key 设每日限额（每天重置），再把同一个数写进 budget.searchKeyDailyLimitUsd。这个限额是搜索唯一的硬上限。');
+  }
+  const qqPlatformNotified = Boolean(flags['--qq-platform-notified']);
+  if (cfg.qq?.enabled && !qqPlatformNotified) {
+    throw new CliError('启用 QQ 时打开搜索算一次模型变更：先由你本人向平台报告模型信息的变更（QQ 协议 §4.2，多了搜索模型），再加 --qq-platform-notified。');
+  }
+  const next = structuredClone(cfg);
+  next.searchProvider = provider;
+  next.acks = { ...next.acks, search: { provider, at: new Date(ctx.now()).toISOString() }, d3: '' };
+  for (const g of Object.values(next.qq?.groups ?? {})) g.noticeGiven = false;
+  // Everything that could refuse comes before the store and the files change.
+  assertApplicable(ctx, next, { searchSwitch: true });
+  withStore(ctx, (store) => store.setControl(SEARCH_ENABLED_CONTROL, provider, 'cli'));
+  writeConfig(ctx, next);
+  printWarnings(ctx, next);
+  apply(ctx, next);
+  recordSearchChange(ctx, { state: 'on', model, qqPlatformNotified });
+  ctx.log('cli_search', { state: 'on' });
+  const on = Object.values(next.qq?.groups ?? {}).filter((g) => g.search === true).map((g) => g.label);
+  ctx.out(`已打开搜索（${provider}，模型 ${model}）。检索词发给 ${SEARCH_RECIPIENTS[provider]}。`);
+  ctx.out(on.length ? `打开了搜索开关的群：${on.join('、')}。` : '还没有群打开搜索开关：clo group set <群> --search on，先只开测试群。');
+  ctx.out('已清除每个群的“已告知”和 D3 记录：请你本人重新告知各群（告知草稿要写上搜索），再 clo group notice-done <群>，并重新 clo ack d3 <决定>。');
+  if (next.qq?.enabled) ctx.out('已记录：你确认向平台报告了这次模型变更（QQ 协议 §4.2）。');
+  if (!searchRulesRecorded()) ctx.out('搜索进入 live 的项目规则还没有记录，搜索打开时 clo mode live 会拒绝。现在只能在 dry-run 和离线测试里用。');
+  return 0;
+}
+
+// `clo search disable`: always allowed, in live too and beside a running process, since it only takes something away.
+// The running process stops searching at its next read of the effective file; the Key it holds stays unused.
+function disableSearch(ctx, cfg) {
+  const was = runningSearchRecord(ctx);
+  if (!searchOnInConfig(cfg) && was === SEARCH_OFF) {
+    ctx.out('搜索已经关着。');
+    return 0;
+  }
+  const next = structuredClone(cfg);
+  next.searchProvider = SEARCH_OFF;
+  if (next.acks) delete next.acks.search;
+  assertApplicable(ctx, next, { searchSwitch: true });
+  withStore(ctx, (store) => store.setControl(SEARCH_ENABLED_CONTROL, SEARCH_OFF, 'cli'));
+  writeConfig(ctx, next);
+  printWarnings(ctx, next);
+  apply(ctx, next);
+  recordSearchChange(ctx, { state: 'off', model: SEARCH_MODEL[SEARCH_PROVIDERS.includes(was) && was !== SEARCH_OFF ? was : 'openrouter-sonar'] });
+  ctx.log('cli_search', { state: 'off' });
+  ctx.out('已关掉搜索。运行中的进程下一条消息起不再搜索；各群的搜索开关保留，不起作用。');
+  ctx.out('报给平台的模型信息和群里的告知，按需要由你本人更新（少了搜索模型和一个接收方）。');
+  return 0;
+}
+
 async function cmdSearch(ctx, { positional, flags }) {
-  const sub = positional[0];
+  const sub = positional[0] ?? 'show';
   const cfg = readConfig(ctx);
   if (sub === 'lock') return lockSearch(ctx, cfg, flags);
+  assertValid(ctx, cfg);
+  if (sub === 'show') return searchShow(ctx, cfg);
+  if (sub === 'enable') return enableSearch(ctx, cfg, flags);
+  if (sub === 'disable') return disableSearch(ctx, cfg);
   throw new CliError(USAGE);
 }
 

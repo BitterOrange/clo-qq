@@ -590,7 +590,7 @@ The crisis list only ever adds one decision, within its caps, including past an 
 
 **Decision result handling (all forced locally, whatever the model says):**
 - Order in `routeDecision`: invalid, `crisis_route`, `crisis:true` with a cap slot, `skipClass`, `action`.
-- `parseAnswer` keeps the model's `action` and `skip_class` under `crisis:true`, because past the caps they decide. A non-`none` `skip_class` with `crisis:false` forces `action:'skip'`. `need_search` is ignored; it is always false in this build.
+- `parseAnswer` keeps the model's `action` and `skip_class` under `crisis:true`, because past the caps they decide. A non-`none` `skip_class` with `crisis:false` forces `action:'skip'`. `need_search` is ignored unless the decision was asked with the search schema (own runtime, search on in the group); that case is in `docs/search-contract.md` section 5.
 - A non-`none` `skip_class` bumps `skip_class:<localDay>` only on a real skip. A crisis reply on a flagged topic leaves no class count.
 - `ordinary`, `action:'reply'`, `skipClass:'none'`: continue as `interject`.
 - `ordinary` or `name`, `crisis:true`, cap slot taken: continue as `crisis`. Release any interject claim. Past the caps, crisis means nothing: the class and action decide.
@@ -777,7 +777,7 @@ Optional per-group `cooldownMinutes`, `perHour`, `perDay` override `interject`. 
 | `allowedDmUserIds` | `qq.allowedDmUserIds` | **Must be empty in this build** |
 | `allowedGroupIds` | `qq.allowedGroupIds` | Empty means closed. Each ID needs a `qq.groups` entry and the reverse. These are group IDs, never sender IDs. Any admitted-group member may chat |
 | `claudeModel`, `decisionModel` | same | §3.7 |
-| `searchProvider` | same | **Must be `none` in this build** |
+| `searchProvider` | same | `none`, the default and the only value the OpenClaw runtime accepts. `openrouter-sonar` on the own runtime, set only by `clo search enable` (`docs/search-contract.md`) |
 | budget, timeouts | `budget`, `timeouts` | Tier ordering §4.5. Timeouts positive |
 | Interjection rules | `interject`, `groups[id].interject`, `names` | Off per group by default |
 | Quiet hours | `quietHours` | Timezone `Asia/Shanghai` only |
@@ -1002,7 +1002,7 @@ Replacements for the weak tests:
 | Concurrent ordinary, atomic quota | `unit/quota-atomic` (two processes on real SQLite), `unit/window` | In scope |
 | Real @ during cooldown | `unit/gate-limits`, `e2e/qq-interject` | In scope |
 | Pause, no budget, owner impersonation | `unit/gate-limits`, `seam/failure-line`, `unit/gate-commands` | In scope |
-| Search success, timeout, no source | none | **Deferred (search)** |
+| Search success, timeout, no source | own runtime only: `e2e-own/search`, `unit/gate-search`, `unit/search-adapter`; the console in `unit/cli-search`, the probe in `unit/search-probe` | In scope on the own runtime, offline only (`docs/search-contract.md` section 10). The OpenClaw runtime has no search |
 | Injection for keys or cross-group history | `unit/prompt-injection-policy`, `unit/qq-policy-exit` (leak), `e2e/qq-identity` (cross-group) | In scope for group paths |
 | Restart, uncertain send | `e2e/qq-crash-matrix`, `unit/qq-send-results` | In scope |
 | DM memory vs group memory | none. Group context isolation is in `e2e/qq-identity`, `e2e/qq-context` | **Deferred (memory, DM)** |

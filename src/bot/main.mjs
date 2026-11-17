@@ -10,6 +10,7 @@ import {
   renewConsumerLease, runtimeOf, startControls, stopRun, STOP_REQUEST_KEY,
 } from '../clo-plugin/lib/channels/qq/startup.js';
 import { hardCapControlKey, LIVE_CODES, liveStartCheck } from '../clo-plugin/lib/core/providers/registry.js';
+import { SEARCH_CHILD_KEY, SEARCH_KEY_CONTROL } from '../clo-plugin/lib/core/providers/searchRegistry.js';
 import { keyOf, openBotServices } from './services.mjs';
 
 const USER_AGENT = `clo-qq/1 (Node/${process.versions.node})`;
@@ -154,6 +155,10 @@ async function runOnce({ env = process.env, signal = null, fetch = globalThis.fe
   const heldKey = services.provider ? keyOf(env, services.provider.kind) : null;
   try {
     beginRun({ store, getEffective, log, started, key: heldKey });
+    // The search Key this process holds, as a salted hash, or 'none': clo mode live compares it with .env. Here and not
+    // in beginRun, which the Gateway shares and which has no search.
+    const searchKey = env[SEARCH_CHILD_KEY];
+    store.setControl(SEARCH_KEY_CONTROL, typeof searchKey === 'string' && searchKey ? store.key(searchKey) : 'none', 'start');
     // The file this run was refused or accepted on, not a second read of it.
     const check = startCheck({ store, ledger, eff, provider: services.provider, key: heldKey });
     if (!check.ok) log('start_check', { code: check.code });

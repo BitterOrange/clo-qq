@@ -908,6 +908,8 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     applyLateUsage,
     spent,
     readKey: () => readKey(),
+    // The search Key's /key figures, for `clo mode live`. Throws when it cannot be read or has no usage_daily.
+    readSearchKey: () => readSearchKey(getEffective()),
     reconcile,
     pausePaid,
 

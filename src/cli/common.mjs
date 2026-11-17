@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { activeKindOf, buildEffective, ConfigError, createEffectiveReader, liveConfigProblems, loadBusinessConfig, lockFitProblems, providerOfConfig, providerOfEffective, resolvePaths, runtimeOf, validateBusinessConfig } from '../clo-plugin/lib/core/config.js';
 import { ACTIVE_PROVIDER_CONTROL, providerRecord } from '../clo-plugin/lib/core/providers/registry.js';
-import { SEARCH_LOCK_KEY, searchOnInConfig } from '../clo-plugin/lib/core/providers/searchRegistry.js';
+import { SEARCH_ENABLED_CONTROL, SEARCH_LOCK_KEY, SEARCH_OFF, searchOfEffective, searchOnInConfig, searchProviderOf } from '../clo-plugin/lib/core/providers/searchRegistry.js';
 import { createLedger } from '../clo-plugin/lib/core/ledger.js';
 import { createLog } from '../clo-plugin/lib/core/log.js';
 import { ensurePrivateDirs, tryNarrowMode } from '../clo-plugin/lib/core/private-fs.js';
@@ -135,6 +135,17 @@ export function writeSearchLock(ctx, lock) {
   writeAtomic(ctx.paths.versionsLock, `${JSON.stringify(file, null, 2)}\n`);
 }
 
+// Records `clo search enable` and `clo search disable` in the model-change history: turning search on adds a model and a
+// recipient (protocol section 4.2), so it is a model change; turning it off is recorded too, so the history says when
+// search was on. The chat locks are left as they are.
+export function recordSearchChange(ctx, { state, model, qqPlatformNotified = false }) {
+  const file = readVersionsLock(ctx.paths) ?? {};
+  const history = file.models?.changes ?? [];
+  history.push({ at: new Date(ctx.now()).toISOString(), kind: 'search', model, state, qqPlatformNotified });
+  file.models = { ...file.models, changes: history };
+  writeAtomic(ctx.paths.versionsLock, `${JSON.stringify(file, null, 2)}\n`);
+}
+
 // Records what `clo model` resolved. Other fields of the file stay as they are. An OpenRouter write leaves
 // models.locks and models.priceBooks alone; an Anthropic write touches only models.locks.anthropic and the history.
 export function writeModelsLock(ctx, lock, { qqPlatformNotified = false, changed = false, kind = 'openrouter' } = {}) {
@@ -258,14 +269,40 @@ function assertProviderUnchanged(ctx, cfg) {
   throw new CliError(`config.json 里在用的模型接口（${next}）不是现在运行的这个（${running}）。换接口只能用 clo provider use：它会要求 --qq-platform-notified（启用 QQ 时），并清除每个群的“已告知”和 D3 记录。先把 config.json 的 activeProvider 和 acks.provider 改回 ${name}（${kind}），再 clo provider use <名称> --confirm。`);
 }
 
+// The search provider the install runs with: the control `clo search enable` and `clo search disable` write; without
+// one, what the effective file names; without that file, off. Reading never creates clo.db.
+export function runningSearchRecord(ctx) {
+  if (existsSync(ctx.paths.db)) {
+    const recorded = withStore(ctx, (store) => store.getControl(SEARCH_ENABLED_CONTROL));
+    if (recorded !== null) return recorded;
+  }
+  return searchOfEffective(readEffective(ctx))?.provider ?? SEARCH_OFF;
+}
+
+// Decision D7: turning search on is a model change, so it goes through `clo search enable` alone, which asks for the
+// attestation and clears each group's noticeGiven and acks.d3. searchProvider and acks.search both sit in config.json,
+// so a hand edit of the two would otherwise pass validation. Turning it off goes through `clo search disable`, which
+// keeps the record right, so a later hand edit back on cannot pass as the state already recorded. searchSwitch is set
+// only by those two commands, before they record the new state.
+function assertSearchUnchanged(ctx, cfg) {
+  const next = searchProviderOf(cfg);
+  const running = runningSearchRecord(ctx);
+  if (next === running) return;
+  const turnOn = next !== SEARCH_OFF;
+  throw new CliError(turnOn
+    ? `config.json 打开了搜索（${next}），但这套安装没有用 clo search enable 打开过。打开搜索算一次模型变更，只能用 clo search enable --confirm：它会要求 --qq-platform-notified（启用 QQ 时），并清除每个群的“已告知”和 D3 记录。先把 config.json 的 searchProvider 改回 ${running}。`
+    : `config.json 关掉了搜索，但这套安装记录的是打开（${running}）。关搜索直接运行 clo search disable，它会同时更新记录。`);
+}
+
 // Everything that can refuse this config, with nothing written and the render as the result. A command runs it before
 // it writes config.json, so a refusal cannot leave a config that the running effective file does not match.
 // Only `clo mode live` may turn a dry-run install live. Hand-editing config.json cannot do it.
 // lock is a model lock a change is about to record, of kind lockKind; the active kind's lock is what the config runs
 // on. A lock passed for a kind that is not active must still match its own models, and the render uses the active one.
-export function assertApplicable(ctx, cfg, { allowLive = false, lock, lockKind = 'openrouter', providerSwitch = false } = {}) {
+export function assertApplicable(ctx, cfg, { allowLive = false, lock, lockKind = 'openrouter', providerSwitch = false, searchSwitch = false } = {}) {
   assertValid(ctx, cfg);
   if (!providerSwitch) assertProviderUnchanged(ctx, cfg);
+  if (!searchSwitch) assertSearchUnchanged(ctx, cfg);
   const kind = activeKindOf(cfg);
   if (lock !== undefined && lockKind !== kind && lock && !lockMatches(cfg, lock, lockKind)) {
     throw new CliError('config.json 里的模型与要锁定的模型不一致。');

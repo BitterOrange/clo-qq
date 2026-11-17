@@ -202,6 +202,17 @@ test('search: start gives the bot the search Key as CLO_SEARCH_KEY only while se
   const off = await startOnce(false);
   assert.equal(off.env.CLO_SEARCH_KEY, undefined, 'off: no search Key, though .env has one');
   assert.equal(off.env.OPENROUTER_API_KEY, FAKE_KEY, 'control: the chat Key passes');
+  // Search turned on by hand, with no record of `clo search enable`: start refuses before any process.
+  const hand = configOf(s.root);
+  hand.searchProvider = 'openrouter-sonar';
+  hand.acks = { ...hand.acks, search: { provider: 'openrouter-sonar', at: '2026-11-17T00:00:00.000Z' } };
+  hand.budget = { ...hand.budget, searchKeyDailyLimitUsd: 0.5 };
+  writeFileSync(cfgFile, JSON.stringify(hand, null, 2));
+  const refused = await s.run(['start']);
+  assert.notEqual(refused.code, 0);
+  assert.match(`${refused.out}${refused.err}`, /clo search enable/);
+  // What `clo search enable` records, then the same config starts.
+  withDb(s.root, (store) => store.setControl('search_enabled', 'openrouter-sonar', 'test'));
   const on = await startOnce(true);
   assert.equal(on.env.CLO_SEARCH_KEY, SEARCH_VALUE, 'on: from the temp .env, not the parent');
   assert.equal(on.env.OPENROUTER_API_KEY, FAKE_KEY);

@@ -29,6 +29,13 @@ export const SEARCH_BLOCK_FIELDS = Object.freeze([...SEARCH_BLOCK_LIMITS, 'baseU
 export const SEARCH_RULES_RECORDED = false;
 export const searchRulesRecorded = () => SEARCH_RULES_RECORDED === true;
 
+// clo.db controls. The first is written only by `clo search enable` and `clo search disable`: the search provider the
+// install runs with, so a hand edit of searchProvider (and acks.search with it) is refused by apply and start, the way
+// active_provider guards the chat provider. The second is the salted hash of the search Key the running bot holds, or
+// 'none', written at each start, so `clo mode live` can tell it is the Key in .env.
+export const SEARCH_ENABLED_CONTROL = 'search_enabled';
+export const SEARCH_KEY_CONTROL = 'search_key';
+
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 // config.json: the search provider it names. A missing field reads as off.

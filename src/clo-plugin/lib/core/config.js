@@ -664,6 +664,12 @@ export function liveConfigProblems(cfg) {
 //   key_valid: facts.keyValid is true (checkAnthropicModels passed for both locked ids);
 //   provider_rules: facts.providerRulesRecorded is true and the registry says the rules are recorded for the kind.
 // The provider comes from config.json itself, never from a fact. A config that names no usable one fails 'provider'.
+// With search on these are checked too, from facts gatherLiveFacts collects:
+//   search_runtime: the own runtime; search_ack: config.json's acks.search and the record `clo search enable` keeps in
+//   clo.db (facts.searchAckMatches); search_lock: the search model's price is locked (facts.searchLocked);
+//   search_key: the search Key is in .env and is neither the chat Key nor the probe Key (facts.searchKeyOk);
+//   search_key_limit: facts.searchKey, its /key read, has a daily limit equal to budget.searchKeyDailyLimitUsd and at
+//   least one search hold (facts.searchHoldMicros); search_process_key: the running process holds this Key.
 // rulesRecorded is the registry's, and only a test passes another. With search on, search_rules needs the search
 // registry's record (searchRules, which only a test replaces), so live is refused until the probe's rules have landed.
 export function livePreconditions(cfg, facts = {}, { rulesRecorded = providerRulesRecorded, searchRules = searchRulesRecorded } = {}) {
@@ -709,7 +715,21 @@ export function livePreconditions(cfg, facts = {}, { rulesRecorded = providerRul
   check('numbers', noLocalNumbers(cfg?.contentPolicy?.crisis?.localNumbers));
   check('doctor', facts.doctorOk === true);
   const entryUrls = isObj(cfg?.providers) ? Object.values(cfg.providers).map((e) => (isObj(e) ? e.baseUrl : undefined)) : [];
-  if (searchOnInConfig(cfg)) check('search_rules', searchRules() === true);
+  if (searchOnInConfig(cfg)) {
+    // Search (docs/search-contract.md section 8). The search Key's own daily limit is its only hard cap, so it has to be
+    // read, reset daily, the one config.json declares, and above one search hold.
+    const sk = facts.searchKey;
+    const skDaily = isObj(sk) && isNum(sk.limitMicros) && sk.limitReset === 'daily';
+    const searchHold = facts.searchHoldMicros;
+    check('search_runtime', SEARCH_RUNTIMES.includes(runtimeOf(cfg)));
+    check('search_ack', facts.searchAckMatches === true);
+    check('search_lock', facts.searchLocked === true);
+    check('search_key', facts.searchKeyOk === true);
+    check('search_key_limit', skDaily && isNum(budget?.searchKeyDailyLimitUsd) && usdToMicros(budget.searchKeyDailyLimitUsd) === sk.limitMicros
+      && isNum(searchHold) && sk.limitMicros >= searchHold);
+    check('search_process_key', facts.searchProcessKeyMatches === true);
+    check('search_rules', searchRules() === true);
+  }
   const urls = [qq.apiBaseUrl, qq.tokenBaseUrl, cfg?.openrouter?.baseUrl, cfg?.search?.baseUrl, ...entryUrls].filter((u) => u !== undefined && u !== '');
   check('base_urls', urls.length === 0 || testMode);
   check('no_paid_pause', !facts.paidPaused);
