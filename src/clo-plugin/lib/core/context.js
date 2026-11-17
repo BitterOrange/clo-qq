@@ -153,6 +153,13 @@ export function createContextBuffer({ maxItems, maxAgeMs, maxTokens }) {
       return g.items.filter((i) => !i.own && i.sender === sender && i.arrival < arrival).map((i) => i.eventKey);
     },
 
+    // The display names the group's lines carry now, for the search query check only. Never sent anywhere.
+    displayNames(groupKey) {
+      const g = groups.get(groupKey);
+      if (!g) return [];
+      return [...new Set(g.items.map((i) => i.displayName).filter((n) => typeof n === 'string' && n))];
+    },
+
     forgetNames(groupKey) {
       const g = groups.get(groupKey);
       if (g) for (const i of g.items) i.displayName = null;

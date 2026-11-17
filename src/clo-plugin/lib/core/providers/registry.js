@@ -157,3 +157,17 @@ export function providerOfEffective(eff) {
   if (!isObj(a) || !PROVIDER_KINDS.includes(a.kind) || !nonEmpty(a.name)) return null;
   return entry(a.name, a.kind, nonEmpty(a.baseUrl) ? a.baseUrl : DEFAULT_BASE[a.kind], false);
 }
+
+// ---- Turn system blocks (both adapters) ----
+
+// The search notes as a block of their own: no cache marker, so the cached system block before them is unchanged.
+export const noteBlocks = (note) => (typeof note === 'string' && note !== '' ? [{ type: 'text', text: note }] : []);
+
+// A turn's system blocks as the checks read them: one text block, or a cached block followed by one plain block (the
+// search notes), joined by a line break. '' for anything else, so a check that reads it fails closed.
+export function blocksText(content) {
+  if (!Array.isArray(content) || content.length < 1 || content.length > 2) return '';
+  if (!content.every((b) => b?.type === 'text' && typeof b.text === 'string')) return '';
+  if (content.length === 2 && (content[0].cache_control === undefined || content[1].cache_control !== undefined || content[1].text === '')) return '';
+  return content.map((b) => b.text).join('\n');
+}

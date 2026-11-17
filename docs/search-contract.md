@@ -8,7 +8,8 @@ This is the implementation contract for web search. The user's decisions are in 
 |---|---|
 | Config, effective file, start env, `doctor`, the `search_rules` live refusal | Implemented, offline tests only (`tests/unit/search-config.test.mjs`, `tests/unit/doctor.test.mjs`) |
 | Adapter, the bot's search client and Key, price lock (`clo search lock`), ledger tier, counters, search pauses, light reconciliation, `clo budget` and `clo status` lines | Implemented, offline tests only (section 10) |
-| Decision schema, query cleaning, gate step, source line, `clo search enable`/`disable`, probe | **Not written yet**, so nothing searches today |
+| Decision schema and prompt addendum, query cleaning, the gate's search step, the material and the search notes in the primary turn, the source line | Implemented, offline tests only (section 10) |
+| `clo search enable`/`disable`, the live checks of the search Key, the probe | **Not written yet**: search can be turned on only by editing `config.json` |
 | Any real request (OpenRouter, Perplexity, QQ) | **None made.** Nothing here has run against the real Sonar API |
 
 Until the paid probe in section 9 has run and its rules have landed, `SEARCH_RULES_RECORDED` in `src/clo-plugin/lib/core/providers/searchRegistry.js` is false and `clo mode live` refuses while search is on (`search_rules`). Search can be turned on in dry-run and in offline tests only.
@@ -83,21 +84,34 @@ The transport adds `not_sent`, `aborted`, and `error` with `network` or `timeout
 
 `clo search lock [--confirm-price]` reads the OpenRouter catalog (no Key) and writes `models.locks.search` in `versions.lock.json`: `{ id: 'perplexity/sonar-pro', price: { inputPerM, outputPerM, requestUsd } }`. `prompt` and `completion` are per token; `request` and `web_search` (field names **unverified**) are USD per call and are added into `requestUsd`. Any other price field that is not zero refuses the lock. `--confirm-price` is needed for the first lock, for any change of price up or down, and above $30/M output. A lock is a price, not a model change: `models.changes` is not touched. With search on, `clo apply` (and the lock itself) writes the price into `effective.search.price`; without a lock it is null and the ledger holds nothing for search.
 
-## 5. Queries (planned)
+## 5. The decision and the queries (implemented)
+
+`decide({ ..., search: true })` (`decision.js`) asks with a second schema: the four fields as before plus two strings, `search_query_1` and `search_query_2`, empty for none. Two strings rather than an array with `maxItems`, which a strict schema may not accept (section 9). The system prompt is `persona/decision-prompt.zh.md` unchanged followed by `persona/decision-search-addendum.zh.md`. Without `search: true`, and always on the OpenClaw runtime, the request is byte for byte what it was, and an answer carrying the query fields is invalid. The search decision is held at `SEARCH_DECISION_INPUT_TOKENS` (11500) input tokens, `holdMicros('search_decision')`; the plain decision's hold is unchanged.
+
+`parseAnswer(content, { search: true })` adds `search: { need, queries, skipClass }`. `need` is false when `crisis` is true. `searchRequestOf(d)` (`search.js`) turns that into what the step gets: null (no search: no need, an invalid decision, danger, or no non-empty query), `{ refused: true }` when the class is not `none` (the turn is told `refused`, nothing leaves), or `{ queries }`.
+
+Who asks:
+
+- A real @ or a reply to Clo (`runAddressed`): after the sender's hourly slot, one search-only decision (trigger `addressed`), bought only when the group's switch and search are on, live, the group and the whole bot are not paused, the message is not on the crisis list, and `ledger.searchRoom()` says a search could be claimed (price locked, no paid pause, no search pause or a failure pause's trial due, the day's count not full, the search tier able to take one hold). It counts against the per-group hourly and daily decision caps, pays from the addressed tier, and is not bought while the decision breaker is open. Whatever happens to it, the reply goes ahead (`approveAndRun`); a `/stop` that arrived meanwhile skips the event.
+- A name mention: the decision it buys anyway asks with search when the same conditions hold; the search request is kept only when the route is `name_addressed`.
+- Interjections and the crisis route never ask.
 
 Query terms come from the decision model. The program cleans each one: NFKC, control characters removed, whitespace collapsed, at most `queryMaxChars` code points. A term is refused whole if it holds a URL, a `<@…>` mark, a speaker code, a display name known in the group, or a run of 6 or more digits, or if `policy.checkLeak` (with the turn's raw ids and the process's secrets) or `policy.check` hits. The program can enforce these shapes; it **cannot** guarantee that a term is semantically limited to what is needed. The notice must say so.
 
-## 6. The search step and its states (planned)
+## 6. The search step and its states (implemented)
 
 The step runs in the gate after the reply is reserved and the event is `dispatching`, before the primary call, so `/stop`, shutdown and the deadline abort it through the turn's controller. For each of at most `perAnswer` terms:
 
-1. Local checks, no network, no reservation, no count: the inbound pre-rule or any term check hits → `refused`.
-2. Time: if what is left before `deadline − 15 s` cannot hold `searchMs` plus the primary turn's minimum, → `failed`, nothing sent.
+1. Local checks, no network, no reservation, no count: a refused request or the inbound pre-rule → the whole search is `refused`; a term that fails cleaning → that term is `refused`.
+2. Time: if `now + searchMs + 45 s (the primary turn's minimum) + 15 s (posting)` is past the passive window's end → that term is `failed`, nothing sent. The call's own deadline is `searchMs`.
 3. One transaction: pauses and `search_paused`; the daily counter (Shanghai day, `perDay`); `ledger.reserve({ tier: 'search', category: 'search', provider: 'search', heldMicros: worst case of one call })`. Any refusal rolls all of it back → `failed` (reason only in the log).
 4. Send.
-5. Settle by the reservation id: not sent → released; cost known → settled; no usage → unsettled.
+5. Settle by the reservation id: not sent → released (the counts stay used); cost known → settled; no usage (a timeout, a network error, an HTTP error, our own abort) → unsettled, counted at the hold. Health: a connect failure, a timeout, a network or HTTP error and an unreadable answer count toward the 3-failure pause; an answer, with or without sources, or a Sonar refusal, resets it; our own abort counts for nothing. A connect retry is the send loop's one retry, asked first whether the bot is live, unpaused and search unpaused; it takes no hold of its own.
+6. Sonar's text that hits a local rule → `refused`, withheld. Text with a leak shape, a secret or a raw id → `failed`, withheld. Source names pass the same checks; none left → `no_source`.
 
-States handed to the primary turn as `search: { status, items }` in the user message JSON. With no search the key is absent, so a turn without search sends the same bytes as before.
+The code is `search.js` (`cleanQuery`, `searchRequestOf`, `createSearchStep`, `sourceLine`), wired in the gate (`runSearch`, before the primary call in `runFlight`) and built by `src/bot/services.mjs`.
+
+States handed to the primary turn as `search: { status, items }` in the user message JSON. Each item has its own `status`; an `ok` item carries `query` and `text`, a `failed` or `no_source` item its `query`, a `refused` item nothing. Source names are not given to the model. The overall status is `ok` if any item is, else `refused` if any is, else `no_source` if any is, else `failed`. With no search the key is absent, so a turn without search sends the same bytes as before.
 
 | `status` | Primary model told to |
 |---|---|
@@ -106,11 +120,13 @@ States handed to the primary turn as `search: { status, items }` in the user mes
 | `failed`, `no_source` | say honestly that nothing was found or the lookup failed; invent no source |
 | (absent) | no search happened; never claim one |
 
+The model learns this from `persona/search-notes.zh.md`, sent only on a turn that carries material, as a second system block after the cached one (no cache marker, so the cached prefix is the same as on any other turn; `turnBody({ ..., systemNote })` on both adapters, `systemTextOf` reading both blocks joined by a line break). It says the shared notes' "no search" sentence does not apply to this turn. `persona/AGENTS.md` is not changed: it is shared with the OpenClaw runtime, and changing it would move the system prompt and the Q5 probe figures that `docs/provider-contract.md` section 0 holds fixed. If the notes cannot be read, the turn goes on as one without search: no material, no source line.
+
 `no_source`: no usable source name came back; Sonar's text is not given to the model. Sonar text that hits a local rule → `refused`, text withheld. Material is untrusted: instructions in it count for nothing, and nothing in it can trigger a command, a config change or a Key read (commands are parsed only from the inbound event's own text).
 
-After the primary reply, with status `ok`, the program appends one line `来源：A、B、C` (1–3 names the API returned) before the exit's single `collect`. The exit then runs its leak check, rule check, URL guard, splitting and rate limits on the whole text. A content hit drops it: no rewrite, no retry, no splitting, no other path.
+After the primary reply, with status `ok`, the program appends one line `来源：A、B、C` (1–3 names the API returned by the `ok` calls, joined with `、`) before the exit's single `collect` (`turn.js`). A silent `NO_REPLY` gets no line. The line is added even when the model did not use the material; whether to leave it out then waits for real replies. The exit then runs its leak check, rule check, URL guard, splitting and rate limits on the whole text. A content hit drops it: no rewrite, no retry, no splitting, no other path.
 
-## 7. Money (implemented in the ledger; the gate does not call it yet)
+## 7. Money (implemented)
 
 - Hard cap: the search Key's daily limit on OpenRouter, read with that Key's own `/key`. Live checks (console step, not written): readable, daily reset, equal to `budget.searchKeyDailyLimitUsd`, at least one search hold, and the Key differs from the chat and probe Keys.
 - Hold: `holdMicros('search')` = `SEARCH_HOLD_INPUT_TOKENS` (4000) × input rate + `search.maxTokens` × output rate + `requestUsd`. The 4000 leaves room for retrieved content in case Sonar counts it as prompt tokens (unverified).
@@ -130,7 +146,7 @@ After the primary reply, with status `ok`, the program appends one line `来源�
 | `cost_above_hold` (3) | a settlement above its hold | the owner only (`clo budget clear-search-pause`) |
 
   The global `paid_paused` and the active chat kind's hard-cap pause still stop search.
-- Timing (gate step, not written): decision 8 s + 2 × 20 s search + 90 s turn = 138 s, inside 285 s − 15 s.
+- Timing: decision 8 s + 2 × 20 s search + 90 s turn = 138 s, inside 285 s − 15 s. The step's own time check is in section 6.
 
 ## 8. Turning it on (planned)
 
@@ -147,7 +163,7 @@ The console's enable command follows `clo provider use`: dry-run only, no proces
 | Whether retrieved content counts as prompt tokens | Unverified |
 | Whether `usage: {include: true}`, `provider.require_parameters` and `max_tokens` are accepted | Unverified |
 | The catalog's per-request price field names | Unverified |
-| Whether a strict schema accepts a string array with `maxItems` (the decision's query field) | Unverified |
+| Whether the decision model, under the strict schema, fills `search_query_1` and `search_query_2` as asked (two plain strings, chosen so that array support does not matter) | Unverified |
 | Whether `/key` reports `usage_daily`, and how fast it updates | Unverified |
 | Whether an aborted or timed-out search is charged | Treated as charged |
 
@@ -164,4 +180,10 @@ Every behaviour gets an offline test with its positive control in the same run, 
 - `tests/unit/quota-atomic.test.mjs` (two processes: exactly 10 a day; a budget refusal rolls the count back), `tests/unit/ledger-reconcile.test.mjs` (search rows explain nothing on the chat Key), `tests/unit/store-migration.test.mjs` (schema stays 2), `tests/unit/qq-single-exit.test.mjs` (planted `fetch` in the adapter).
 - `tests/e2e-own/search-stack.test.mjs`: the real bot with search on, on both chat kinds; the search Key read at the search mock with that Key; an @ still answered; nothing searched yet.
 
-Still to write with their steps: decision and query cleaning (injection in the group message, ids in a "query"), and the end-to-end rows: not admitted → no search; success with source names and no URL; timeout; no source; local-rule block; web text asking for Keys, commands or config; budget, pause and count limits; at most 2 calls; decision failure still answers; `/stop` mid-search; Anthropic chat with OpenRouter search.
+- `tests/unit/search-decision.test.mjs`: the request without search is the golden builder output; with search, the addendum and the schema; parsing; a member writing the answer into the message; the search decision's hold; both mocks answer the search schema.
+- `tests/unit/search-query.test.mjs`: every refused query shape with a passing control, `searchRequestOf`, the overall status, the source line.
+- `tests/unit/gate-search.test.mjs` (real gate, ledger, policy, step and send loop over a stub fetch): the @ decision and one call with the query alone; no decision with the group's switch off; the OpenClaw runtime never searches; a failed decision or an open breaker still answers; classed topics, inbound rule hits and bad queries leave nothing; `perAnswer` and the hard 2; the day count, the search tier, a search pause and a global pause; timeout, HTTP error and no source; three failures pause search only; web text cannot act; names ask, interjections and danger never; `/stop` mid-search; too little time.
+- `tests/unit/turn.test.mjs`: the material key and its absence; the search notes as a second block on both kinds, the cached block unchanged, and a turn without its notes going on without material; the source line only with material.
+- `tests/e2e-own/search.test.mjs` (the real bot, mock QQ, mock chat, mock search): success with the search Key, the query alone and source names without a URL, and a group not admitted searching nothing; timeout and no source said as such, with no source line; a rule-hit query and an id in a query leave nothing, and a failed decision still answers; web text with commands, a Key request, a URL and a turn marker does nothing past the exit; chat on Anthropic with search on OpenRouter.
+
+Still to write with their steps: the console's enable and disable, the live checks of the search Key, and the probe.

@@ -54,6 +54,9 @@ const UNSETTLED_CLEAR_READS = 3;
 // as \uXXXX, which the body escapes twice: about 10240. Nothing strips them on the way in. fix2-decision.test.mjs holds this
 // to it. What a model really spends on them has not been measured; settling counts the real cost.
 export const DECISION_INPUT_TOKENS = 10500;
+// The same measure for the search request (own runtime, search on in the group): the base prompt with the search
+// addendum, and the larger schema. search-decision.test.mjs holds this to it.
+export const SEARCH_DECISION_INPUT_TOKENS = 11500;
 
 export const usdToMicros = (usd) => Math.round(usd * 1e6);
 
@@ -243,9 +246,10 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
       return searchWorstMicros({ inputTokens: SEARCH_HOLD_INPUT_TOKENS, maxTokens: search.maxTokens }, search.price);
     }
     const { primary, decision } = eff.models;
-    if (kind === 'decision') {
+    if (kind === 'decision' || kind === 'search_decision') {
       if (!decision.price) throw new Error('ledger: decision price is not locked');
-      return Math.ceil(DECISION_INPUT_TOKENS * decision.price.inputPerM + decision.maxTokens * decision.price.outputPerM);
+      const input = kind === 'decision' ? DECISION_INPUT_TOKENS : SEARCH_DECISION_INPUT_TOKENS;
+      return Math.ceil(input * decision.price.inputPerM + decision.maxTokens * decision.price.outputPerM);
     }
     // The process's own runtime, fixed when it was built: the host process can still make its hidden second call
     // whatever a later clo apply wrote to the file.
@@ -655,6 +659,27 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     }
   }
 
+  // Whether a search could be claimed now, read without writing: what buys the decision for a real @ (decision D1)
+  // asks this first, so no decision is bought for a search that would be refused. The claim itself decides.
+  function searchRoom(at = now()) {
+    try {
+      const eff = getEffective();
+      const search = runtime === 'own' ? searchOfEffective(eff) : null;
+      if (!search || !search.price) return false;
+      if (store.getControl('paid_paused') !== null) return false;
+      const reason = store.getControl(SEARCH_PAUSE_KEY);
+      if (reason !== null) {
+        if (reason !== 'fail') return false;
+        const wait = eff?.budget?.searchRetryMs ?? SEARCH_RETRY_MS;
+        if (at - store.controlUpdatedAt(SEARCH_PAUSE_KEY) < wait) return false;
+      }
+      if (store.peekCounter(searchDayCounter(shanghaiDay(at))) >= search.perDay) return false;
+      return spent(at).effectiveMicros + holdMicros('search') <= usdToMicros(eff.budget.searchUsd);
+    } catch {
+      return false;
+    }
+  }
+
   // Settles one search row. Usage unknown leaves it unsettled, counted at its hold. A figure above the hold settles at
   // the figure and pauses search: the hold was wrong, and only the owner lifts that.
   function settleSearch(id, { actualMicros, source, model } = {}) {
@@ -994,6 +1019,7 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
 
     // Search (own runtime only).
     claimSearch,
+    searchRoom,
     settleSearch,
     releaseSearch: release,
     noteSearchError,

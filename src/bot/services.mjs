@@ -15,6 +15,7 @@ import { SEARCH_CHILD_KEY, searchOfEffective } from '../clo-plugin/lib/core/prov
 import {
   CHILD_KEY, hardCapControlKey, hardCapPauseKey, LIVE_CODES, liveStartCheck, providerOfEffective, providerRulesRecorded,
 } from '../clo-plugin/lib/core/providers/registry.js';
+import { createSearchStep } from '../clo-plugin/lib/core/search.js';
 import { openStore } from '../clo-plugin/lib/core/store.js';
 import { createTurnRunner } from '../clo-plugin/lib/core/turn.js';
 
@@ -205,6 +206,12 @@ export function openBotServices(effectivePath, { env = process.env, fetch = glob
       adapter: createSearchAdapter({ resultMaxChars: searchOfEffective(eff)?.resultMaxChars }), fetch, getKey: getSearchKey, getBaseUrl: getSearchBaseUrl, log, now,
     });
     const client = makeClient({ adapter, fetch, getKey, getBaseUrl, log, now });
+    // The gate's search step. A connect retry asks what a turn's retry asks, and that search is not paused.
+    const searchStep = createSearchStep({
+      client: searchClient, ledger, policy, getEffective, log, now,
+      secrets: () => liveSecrets(env),
+      beforeRetry: (groupKey) => retryAllowed({ getEffective, store }, { groupKey }) && ledger.searchPaused() === null,
+    });
     const decide = createDecider({ fetch, client, getKey, getEffective, log, now });
     // Read at each turn, so the bytes the runner checks are the bytes on disk now. Missing reads as null.
     const readSystemPrompt = () => {
@@ -218,7 +225,7 @@ export function openBotServices(effectivePath, { env = process.env, fetch = glob
     };
     let closed = false;
     return {
-      effectivePath, store, ledger, policy, getEffective, decide, log, runGen, client, getKey, readSystemPrompt, provider, searchClient, getSearchKey,
+      effectivePath, store, ledger, policy, getEffective, decide, log, runGen, client, getKey, readSystemPrompt, provider, searchClient, getSearchKey, searchStep,
       secrets: () => liveSecrets(env),
       /** The dispatchTurn the gate calls. getExit returns the exit once the connection has made it. */
       createDispatch(getExit) {

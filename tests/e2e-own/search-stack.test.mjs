@@ -1,9 +1,9 @@
-// The own runtime with search turned on, on both chat kinds (search step 2 and 3: harness, Key and ledger; the gate's
-// search step is not written yet). The real bot process, mock QQ, the mock chat provider and, on anthropic, a mock
+// The own runtime with search turned on, on both chat kinds: harness, Key and ledger. The gate's search step has its own
+// end-to-end file (search.test.mjs); here the decision says no search. The real bot process, mock QQ, the mock chat provider and, on anthropic, a mock
 // OpenRouter of its own for search (decision D5), behind a net guard that lets the bot reach those mocks only.
 // What it shows: the effective file with search on is one the bot runs on; the bot holds the search Key under its child
-// name only; the ledger reads the search Key, with that Key, at the search mock; an @ is still answered; and nothing
-// is searched yet.
+// name only; the ledger reads the search Key, with that Key, at the search mock; an @ is still answered; and a decision
+// that says no search searches nothing.
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { fullAt, nextId } from '../fixtures/qq-events.mjs';
@@ -52,7 +52,8 @@ for (const provider of ['openrouter', 'anthropic']) {
     assert.equal(row.state, 'completed');
     await s.waitPosts(1);
     assert.equal(s.agentRequests().length, 1, 'control: the @ reached the chat model');
-    assert.equal(s.search.searchRequests().length, 0, 'nothing searches before the gate step exists');
+    assert.equal(s.decisionRequests().length, 1, 'the @ bought its search-only decision');
+    assert.equal(s.search.searchRequests().length, 0, 'the default decision says no search, so nothing is searched');
     assert.equal(s.control('search_paused'), null, 'a clean search Key read pauses nothing');
     assert.equal(s.control('paid_paused'), null);
     assert.equal(s.alerts().some((a) => a.kind === 'search_key_limit_mismatch'), false);

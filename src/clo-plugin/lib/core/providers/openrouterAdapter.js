@@ -1,7 +1,7 @@
 // OpenRouter's chat completions, as an adapter for modelChat.js: the request bodies, byte for byte as before the
 // provider layer, and the classification of every response shape. Pure: no fetch, no cost, no pause. Provider text
 // never leaves: only status, error type, provider name, provider code and limit source come out as diagnostics.
-import { MODEL_ID_RULES } from './registry.js';
+import { blocksText, MODEL_ID_RULES, noteBlocks } from './registry.js';
 
 const MAX_STRING = 128;
 
@@ -95,8 +95,10 @@ export const openrouterAdapter = Object.freeze({
   // The Key goes in a header only.
   request: (key, baseUrl) => ({ url: `${baseUrl}/chat/completions`, headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' } }),
 
-  // The main turn, keys in this order: the goldens pin the bytes.
-  turnBody: ({ model, effort, maxTokens, system, user }) => ({
+  // The main turn, keys in this order: the goldens pin the bytes. systemNote: the search notes of a turn that carries
+  // search material (own runtime), as a second system block after the cache breakpoint, so the cached prefix stays the
+  // same. Without it the body is what it always was.
+  turnBody: ({ model, effort, maxTokens, system, user, systemNote }) => ({
     model,
     stream: false,
     reasoning: { effort },
@@ -105,7 +107,7 @@ export const openrouterAdapter = Object.freeze({
     usage: { include: true },
     messages: [
       // One cache breakpoint, at the end of the stable system block, with the default five-minute lifetime.
-      { role: 'system', content: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }] },
+      { role: 'system', content: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }, ...noteBlocks(systemNote)] },
       { role: 'user', content: user },
     ],
   }),
@@ -125,14 +127,13 @@ export const openrouterAdapter = Object.freeze({
     ],
   }),
 
-  // The system string as sent: the one text block of a turn, or the plain string of a decision. '' for anything else,
-  // so a check that reads it fails closed.
+  // The system string as sent: the one text block of a turn (with a turn's search notes after it, joined by a line
+  // break), or the plain string of a decision. '' for anything else, so a check that reads it fails closed.
   systemTextOf(body) {
     const m = messagesOf(body)[0];
     if (m?.role !== 'system') return '';
     if (typeof m.content === 'string') return m.content;
-    if (Array.isArray(m.content) && m.content.length === 1 && m.content[0]?.type === 'text' && typeof m.content[0].text === 'string') return m.content[0].text;
-    return '';
+    return blocksText(m.content);
   },
   userTextOf(body) {
     const m = messagesOf(body)[1];

@@ -25,7 +25,30 @@ export const THINKING_MARKER = 'THINKINGLEAKMARKER';
 
 export const isDecisionRequest = (rec) => Boolean(rec.body?.output_config?.format);
 
-export const decisionText = ({ action = 'skip', skipClass = 'none', crisis = false } = {}) => JSON.stringify({ action, skip_class: skipClass, crisis, need_search: false });
+// needSearch and queries: an answer to the search schema (the own runtime with search on). Without them, the answer
+// the plain schema takes; a request that asked with the search schema gets the two query fields as empty strings.
+export const decisionText = ({ action = 'skip', skipClass = 'none', crisis = false, needSearch, queries } = {}) => {
+  const answer = { action, skip_class: skipClass, crisis, need_search: needSearch === true };
+  if (needSearch !== undefined || queries !== undefined) {
+    answer.search_query_1 = queries?.[0] ?? '';
+    answer.search_query_2 = queries?.[1] ?? '';
+  }
+  return JSON.stringify(answer);
+};
+
+// A scripted decision written for the plain schema, made to fit a request that asked with the search schema: the two
+// query fields are added, empty. Text that is not such a JSON object is left as it is.
+export function fitSearchSchema(text, schema) {
+  if (typeof text !== 'string' || !schema?.properties?.search_query_1) return text;
+  let v;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  if (v === null || typeof v !== 'object' || Array.isArray(v) || 'search_query_1' in v) return text;
+  return JSON.stringify({ ...v, search_query_1: '', search_query_2: '' });
+}
 
 // usage.inference_geo and usage.speed are UNVERIFIED field names (the contract's section 14). The adapter reads them
 // and cost.js flags and pauses when they are absent, so the default answer carries the standard values.
@@ -214,7 +237,8 @@ export async function startMockAnthropic() {
         return send(res, refused.status, refused.body);
       }
       const decision = isDecisionRequest(rec);
-      const step = (await (decision ? decide : script)(rec, requests.length)) ?? {};
+      let step = (await (decision ? decide : script)(rec, requests.length)) ?? {};
+      if (decision && typeof step.text === 'string') step = { ...step, text: fitSearchSchema(step.text, body?.output_config?.format?.schema) };
       if (step.delayMs) await new Promise((r) => setTimeout(r, step.delayMs));
       rec.answeredAt = Date.now();
       const named = ERROR_STEP_NAMES.find((k) => step[k]);

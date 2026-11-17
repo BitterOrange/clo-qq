@@ -189,7 +189,7 @@ async function runOnce({ env = process.env, signal = null, fetch = globalThis.fe
 
   let exitRef = null;
   const dispatchTurn = services.createDispatch(() => exitRef);
-  const gate = createGate({ store, ledger, policy, getEffective, decide, dispatchTurn, log, runtime: 'own' });
+  const gate = createGate({ store, ledger, policy, getEffective, decide, dispatchTurn, log, runtime: 'own', search: services.searchStep ?? null });
   const controls = startControls({ store, ledger, getEffective, log, onBeat: () => leaseCheck(true) });
 
   const onSignal = () => stopOn('signal');

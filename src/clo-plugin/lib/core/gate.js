@@ -9,7 +9,9 @@ import { crashpoint, hourBucket, isQuietHours, shanghaiDay } from './ids.js';
 import { refShape } from './log.js';
 import { settleMicros } from './providers/cost.js';
 import { HARD_CAP_PAUSE, PRICE_ALERT, PRICE_PAUSE, providerOfEffective } from './providers/registry.js';
+import { groupSearchOn } from './providers/searchRegistry.js';
 import { CRISIS_ELIGIBLE, evaluateOrdinary, extractUrls, pickRepresentative, selectNameRecords } from './rules.js';
+import { searchRequestOf } from './search.js';
 import { createGroupQueues } from './window.js';
 
 // Costs come from the host's figure. Tokens at the locked price are the fallback. Zero is never free. The one
@@ -130,8 +132,11 @@ function decisionCap(trigger, cap) {
 const hourExpiry = (at) => (hourBucket(at) + 2) * HOUR;
 const dayExpiry = (at) => at + 2 * 24 * HOUR;
 
-export function createGate({ store, ledger, policy, getEffective, decide, dispatchTurn, log = () => {}, now = Date.now, timers = {}, runtime = 'openclaw' }) {
+// search: the own runtime's search step (search.js createSearchStep). The OpenClaw runtime has no search in this build:
+// a step given to it is ignored, its decisions never ask about search, and need_search means nothing there.
+export function createGate({ store, ledger, policy, getEffective, decide, dispatchTurn, log = () => {}, now = Date.now, timers = {}, runtime = 'openclaw', search = null }) {
   if (runtime !== 'openclaw' && runtime !== 'own') throw new TypeError('createGate: runtime must be openclaw or own');
+  const searchStep = runtime === 'own' && search && typeof search.run === 'function' ? search : null;
   const setTimer = timers.setTimer ?? setTimeout;
   const clearTimer = timers.clearTimer ?? clearTimeout;
   let exit = null;
@@ -489,6 +494,8 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     // aborts nothing for a person in danger: their reply goes out as it would once delivery had begun.
     const stopAborts = () => flight.aborted && !(flight.replyBeforeStop && inDanger(rec, turn.cls));
     try {
+      // Own runtime, a search asked for: before the primary call, under the turn's own signal.
+      if (flight.own && rec.search && turn.cls !== 'command') await runSearch(rec, turn, flight);
       exit.beginTurn(turn);
       try {
         // The host path calls straight through, at the same moment it always has.
@@ -528,6 +535,37 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     } else if (inDanger(rec, turn.cls) && !flight.droppedOnStop && await noteDangerLost(rec, turn, reason, stopAborts())) {
       rec.spoke = true;
     }
+  }
+
+  // The search step (docs/search-contract.md section 6). The event is dispatching and the flight is registered, so a
+  // /stop, a shutdown or the turn's deadline aborts it through the flight's signal. Both switches are read again here:
+  // a search turned off while this waited does not run. Whatever happens, the turn goes on, with or without material.
+  async function runSearch(rec, turn, flight) {
+    const request = rec.search;
+    rec.search = null;
+    if (!searchStep) return;
+    const eff = getEffective();
+    if (!eff || eff.mode !== 'live' || !groupSearchOn(eff, turn.groupId)) return;
+    const { evt } = rec;
+    let out = null;
+    try {
+      out = await searchStep.run({
+        eventKey: rec.eventKey,
+        groupKey: rec.groupKey,
+        request,
+        prerule: rec.prerule === true,
+        rawIds: [evt.conversationId, evt.senderId, evt.messageId, eff.qq?.appId].filter(Boolean),
+        displayNames: [...(context?.displayNames(rec.groupKey) ?? []), rec.displayName].filter(Boolean),
+        signal: flight.controller.signal,
+        deadlineAt: turn.deadlineAt,
+      });
+    } catch {
+      log('search_error', { eventKey: rec.eventKey });
+      out = { status: 'failed', items: [{ status: 'failed' }], sources: [] };
+    }
+    if (!out) return;
+    turn.search = { status: out.status, items: out.items };
+    turn.searchSources = out.sources;
   }
 
   // Own runtime only; the host has its own watchdog and ignores the signal. Here the gate's deadline aborts the run, and
@@ -777,8 +815,73 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       if (stoppedByOwner(rec)) return end(rec, 'queued', 'skipped', 'owner_stop');
       const eff = getEffective();
       if (eff && !takeSenderSlot(rec, eff)) return isCrisis(rec) ? judgeOverRate(rec) : end(rec, 'queued', 'skipped', 'sender_rate');
+      if (eff && wantsSearchDecision(rec, eff)) return searchThenRun(rec, eff);
       return approveAndRun(rec, rec.cls, 'queued');
     });
+  }
+
+  // ---- search (own runtime only) ----
+
+  // Whether a decision may ask about search for this message: the own runtime with its step, search on in this group,
+  // live, and a search that could be claimed now. Not for a person in danger: their answer is not held up for it.
+  function searchable(rec, eff) {
+    if (!searchStep || !eff || eff.mode !== 'live' || !groupSearchOn(eff, rec.evt.conversationId)) return false;
+    if (isCrisis(rec) || !rec.evt.hasUserText) return false;
+    return ledger.searchRoom?.() === true;
+  }
+
+  // A real @ or a reply to her buys one decision that only asks whether to search (decision D1). Not while the group
+  // is paused, where the reply would be refused anyway.
+  function wantsSearchDecision(rec, eff) {
+    const p = store.pauseState(rec.groupKey);
+    if (p.global || p.group || p.terminal) return false;
+    return searchable(rec, eff);
+  }
+
+  // Claim, caps and hold commit together, as for any decision. It counts against the decision caps, pays from the
+  // addressed tier, and a decision breaker that is open means no search, never no answer.
+  function claimSearchDecision(rec, eff) {
+    let heldMicros;
+    try {
+      heldMicros = ledger.holdMicros('search_decision');
+    } catch {
+      return { ok: false, reason: 'budget' };
+    }
+    const at = now();
+    const hour = hourBucket(at);
+    const day = shanghaiDay(at);
+    const { limits } = eff;
+    return attempt(store, () => {
+      if (!ledger.admitDecision()) throw new Refused('decision_paused');
+      if (!store.bumpCounter(`dec_group:${rec.groupKey}:${hour}`, hourExpiry(at), limits.decisionsPerGroupPerHour).ok) throw new Refused('decision_cap');
+      if (!store.bumpCounter(`dec_day:${day}`, dayExpiry(at), limits.decisionsPerDay).ok) throw new Refused('decision_cap');
+      const r = ledger.reserve({ tier: 'addressed', category: 'decision', heldMicros, eventKey: rec.eventKey, model: eff.models.decision.id });
+      if (!r.ok) throw new Refused(pausedRefusal(r.reason) ? 'paid_paused' : 'budget');
+      if (!store.transition(rec.eventKey, 'queued', 'deciding')) throw new Refused('gone');
+      return { holdId: r.id };
+    });
+  }
+
+  // The decision never decides whether to answer: any failure means no search, and the reply goes ahead.
+  async function searchThenRun(rec, eff) {
+    const claim = claimSearchDecision(rec, eff);
+    if (!claim.ok) {
+      if (claim.reason === 'gone') return undefined;
+      log('search_decision', { eventKey: rec.eventKey, groupKey: rec.groupKey, reason: claim.reason });
+      return approveAndRun(rec, rec.cls, 'queued');
+    }
+    crashpoint('deciding');
+    const d = await askDecision(rec, 'addressed', eff, { search: true });
+    settleDecision(claim.value.holdId, d);
+    noteDecisionHealth(d);
+    rec.search = searchRequestOf(d);
+    log('search_decision', { eventKey: rec.eventKey, groupKey: rec.groupKey, reason: d.invalid ?? null, state: rec.search ? (rec.search.refused ? 'refused' : 'search') : 'none' });
+    // A /stop that came while the decision ran.
+    if (stoppedByOwner(rec)) {
+      rec.search = null;
+      return end(rec, 'deciding', 'skipped', 'owner_stop');
+    }
+    return approveAndRun(rec, rec.cls, 'deciding');
   }
 
   // Danger past the hourly count buys one decision on the crisis route, and is answered only if the model agrees.
@@ -898,12 +1001,12 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     }
   }
 
-  async function askDecision(rec, trigger, eff) {
+  async function askDecision(rec, trigger, eff, { search: withSearch = false } = {}) {
     const at = now();
     const lines = context.lines(rec.groupKey, rec.eventKey, eff.retention.decisionLines, eff.retention.decisionLineChars, at);
     const current = { sender: context.pseudonym(rec.groupKey, rec.senderKey), text: shapeCurrentText(eff, rec.evt.text, crisisSpan(rec)) };
     try {
-      return await decide({ trigger, lines, current, signal: abort.signal });
+      return await decide({ trigger, lines, current, signal: abort.signal, ...(withSearch ? { search: true } : {}) });
     } catch {
       return { action: 'skip', skipClass: 'none', crisis: false, invalid: 'http', paid: true, actualMicros: null, model: null, httpStatus: null, limitSource: null };
     }
@@ -926,7 +1029,9 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     rec.claimId = claim.value.claimId;
     crashpoint('deciding');
 
-    const d = await askDecision(rec, trigger, eff);
+    // A name in a group with search on asks about search in the decision it buys anyway. Interjections never search.
+    const withSearch = trigger === 'name' && searchable(rec, eff);
+    const d = await askDecision(rec, trigger, eff, { search: withSearch });
     settleDecision(claim.value.holdId, d);
     noteDecisionHealth(d);
     rec.modelCrisis = d.crisis === true;
@@ -964,6 +1069,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
       if (d.crisis === true) alertMissed(rec, 'sender_rate');
       return undefined;
     }
+    rec.search = withSearch && route.next === 'name_addressed' ? searchRequestOf(d) : null;
     return approveAndRun(rec, route.next, 'deciding');
   }
 
@@ -1232,7 +1338,7 @@ export function createGate({ store, ledger, policy, getEffective, decide, dispat
     crashpoint('after_claim');
     store.setControl('last_event_at', receivedAt, 'gate');
     arrivals += 1;
-    const rec = { evt, eventKey, groupKey, senderKey: store.key(evt.senderId), receivedAt, arrival: arrivals, cls: null, prerule: false, claimId: null, displayName: null, spoke: false, contentDropped: false, modelCrisis: false, heldBack: [] };
+    const rec = { evt, eventKey, groupKey, senderKey: store.key(evt.senderId), receivedAt, arrival: arrivals, cls: null, prerule: false, claimId: null, displayName: null, spoke: false, contentDropped: false, modelCrisis: false, heldBack: [], search: null };
 
     await guarded(rec, async () => {
       ensureRuntime(eff);

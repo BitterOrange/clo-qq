@@ -3,7 +3,7 @@
 // tools, tool_choice or sampling parameters. Provider text never leaves: error messages, request ids, stop details,
 // thinking text and tool bodies stay here; only short scalars come out. docs/provider-contract.md section 3.2.
 // Facts marked unverified there are assumptions until the paid probe has seen the real API.
-import { ANTHROPIC_EFFORTS, ANTHROPIC_VERSION, MODEL_ID_RULES } from './registry.js';
+import { ANTHROPIC_EFFORTS, ANTHROPIC_VERSION, blocksText, MODEL_ID_RULES, noteBlocks } from './registry.js';
 
 const MAX_STRING = 128;
 // The decision call runs with thinking off, which Haiku 5.5 accepts at effort high or below; low keeps it short.
@@ -125,13 +125,14 @@ export const anthropicAdapter = Object.freeze({
 
   // The main turn. Opus 5.5 thinking is adaptive and cannot be turned off, so there is no thinking key and effort is
   // the control. One cache breakpoint, at the end of the system block, with the default five-minute lifetime.
-  turnBody({ model, effort, maxTokens, system, user }) {
+  // systemNote: a turn's search notes, as a second block after the cache breakpoint (see the OpenRouter adapter).
+  turnBody({ model, effort, maxTokens, system, user, systemNote }) {
     checkCommon({ model, maxTokens, system, user });
     if (!ANTHROPIC_EFFORTS.primary.includes(effort)) throw new TypeError('anthropic: primary effort');
     return {
       model,
       max_tokens: maxTokens,
-      system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+      system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }, ...noteBlocks(systemNote)],
       messages: [{ role: 'user', content: user }],
       output_config: { effort },
     };
@@ -158,8 +159,7 @@ export const anthropicAdapter = Object.freeze({
   systemTextOf(body) {
     const s = body?.system;
     if (typeof s === 'string') return s;
-    if (Array.isArray(s) && s.length === 1 && s[0]?.type === 'text' && typeof s[0].text === 'string') return s[0].text;
-    return '';
+    return blocksText(s);
   },
   userTextOf(body) {
     const m = Array.isArray(body?.messages) ? body.messages[0] : undefined;
