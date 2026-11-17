@@ -332,6 +332,25 @@
 | 故意没做的 | Q0、Q5 探测脚本的 shell 版本；这个容器里没有运行的 npm 安装脚本怎么处理；SIGTERM 停止；`doctor` 在启动失败时打印的“退出码 timeout”；`CMDLINE_HINT` 的措辞（Linux 上“用更高权限启动”不一定是原因）；Linux 上的内存和时长；任何真实 QQ、OpenRouter、Anthropic 调用 | 这些要么改了会动 Windows 的输出，要么属于 Linux 部署，等用户决定做 Linux 时再做 |
 | Linux 上的几处提示措辞 | 没有 `config.json` 时说 `cp -n config.example.json config.json`；own 运行时 `mode live` 的 `gateway_key`、`reconciled` 说“可洛进程”；群没有 owner 的提醒改成中文，带下一步的 `clo owner add <名> --id <成员ID>`。README 写项目路径最好不超过约 60 字节、只用 ASCII | 都是开发时选的说法。约 60 字节的界限来自走查时看到的约 62 字节，没有在真实部署上量过 |
 
+## CI（2026-11-17，用户要求；做法是开发时定的，用户还没有确认）
+
+用户要求加 CI/CD 的测试。可洛跑在用户自己的机器上，没有部署目标，所以这里只有 CI：每次推送和每个 PR 给出一个测试结论，不部署、不发布、不上传运行产物。下面的做法都是开发时定的，用户不同意就改。写好时还没有在 GitHub 上真的跑过一次，Windows 那几个任务很可能先失败。
+
+| 项目 | 现在的做法 | 说明 |
+|---|---|---|
+| 文件 | `.github/workflows/tests.yml`，测试由 `tests/run-files.mjs` 一个文件一个文件地跑 | 运行器用私有 Node 运行，每个文件单独一个 `node --test --test-concurrency=1`，默认每个文件最多 15 分钟（`tests/e2e` 和 Windows 上给 30 分钟），最后列出每个文件的结果，有一个不通过就以非 0 退出。没有选中任何文件也算失败 |
+| 触发 | 推送到 `master` 和当前工作分支 `claude/elegant-ptolemy-hofhze`、任何 PR、手动触发。不用 `pull_request_target` | 仓库按公开处理，来自分叉的 PR 拿不到写权限和密钥。工作分支开着 PR 时每次推送会整套跑两遍（推送一遍、PR 一遍），换工作分支时要改这一行 |
+| 权限和密钥 | 整个工作流只有 `contents: read`。不用任何仓库密钥，不设带 Key 的环境变量。`actions/checkout` 不保留凭据 | 运行器给每个测试文件的环境按白名单构造（PATH、HOME、临时目录、语言，Windows 上另加系统变量），不复制外层 shell 的环境 |
+| 联网 | 只有安装步骤联网：从 nodejs.org 下载私有 Node（按 `versions.lock.json` 核对校验值），从 npm 仓库按锁文件 `npm ci`。测试本身只连回环地址 | 和本机用 `setup.sh --runtime`、`setup.ps1 -Runtime` 完全一样，单元测试和 e2e-own 也要 `.runtime/pkg`（acorn、OpenClaw 的 dist），所以都装 `--runtime` |
+| 先 own | 按用户 2026-11-17 的决定，own 运行时是主任务：Linux 上 `tests/unit`、`tests/seam`、`tests/e2e-own` 分 2 片（默认 mock OpenRouter），另把 `tests/e2e-own` 用 `CLO_TEST_PROVIDER=anthropic` 再跑一遍，一个任务。OpenClaw 运行时的 `tests/e2e` 是单独的任务，分 4 片 | 各任务同时开始，不互相等待，openclaw 失败不挡 own 的结论。分片按排好序的文件列表轮流分，没有按时长平衡 |
+| 要 root 的那个文件 | `tests/e2e/qq-first-run.test.mjs` 在 openclaw 第 1 片的最后一步用 `sudo env -i` 以 root 跑，环境只有 PATH、HOME、语言。同一片里别的文件失败时它照样跑，安装失败或取消时不跑 | GitHub 的 Ubuntu 机器以普通用户 `runner` 运行，可以免密码 sudo。这个文件要读每个进程的 `fd` 目录，普通用户读不了别人的进程。其他文件都以普通用户跑，所以“root 下做不到让写文件失败”的那个测试在 CI 上会真的跑。`sudo` 只写在工作流里，项目脚本里仍然禁用 |
+| Windows | `windows-latest` 上用 pwsh 运行 `setup.ps1 -Runtime`，own（单元、接缝、e2e-own）和 openclaw（e2e）各分 3 片，每片最多 150 分钟。先打印 git 的换行设置，供看失败原因。checkout 沿用机器的 `core.autocrlf`，和用户自己在 Windows 上克隆一样；带哈希的文件由 `.gitattributes`（`CLAUDE.md` 的 `-text`，`persona/`、`policy/` 各自的 `eol=lf`）保持 LF | 不设 `continue-on-error`，失败就显示失败。用 pwsh 是因为 `setup.ps1` 用了 `ConvertFrom-Json -AsHashtable`，Windows PowerShell 5.1 没有；README 里用户自己运行时用的是哪一个没有核对。Windows 上的 Anthropic 一遍没有加 |
+| 第三方 Action | 只用 `actions/checkout`，固定到 v7.0.1 的完整提交 `3d3c42e5aac5ba805825da76410c181273ba90b1` | 不用 `setup-node`，Node 由项目自己的安装脚本按锁定版本和校验值装 |
+| 缓存 | 不用 | 私有 Node 和 npm 包每次重新下载并核对，避免被别的分支或 PR 写进去的缓存影响结论。代价是每个任务多几分钟 |
+| 时限和并发 | Linux 每片 45（own）、75（openclaw）分钟；同一个分支或 PR 有新的推送时，取消还在跑的那一次 | 2026-11-17 在开发用的容器里（4 核，root）用 `tests/run-files.mjs` 串行跑过一次：单元和接缝 90 个文件约 3.5 分钟，e2e-own 29 个文件约 12 分钟（`CLO_TEST_PROVIDER=anthropic` 再跑一遍也约 12 分钟），e2e 除 `qq-first-run` 外 28 个文件约 48 分钟，全部通过；`qq-first-run` 用 `env -i` 只给 PATH、HOME、语言，约 20 秒通过。GitHub 机器上没有量过 |
+
+**CI 通过只说明离线测试通过**（mock QQ、mock 模型），不是真实 QQ 验收，也不代表 Linux 部署已经支持。
+
 ## 待定（决策点 D）
 
 | 编号 | 问题 | 依据 |

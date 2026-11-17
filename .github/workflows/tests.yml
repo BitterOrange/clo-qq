@@ -1,0 +1,104 @@
+# Offline tests on every push to master or to the working branch, on every pull request and by hand. Nothing is
+# deployed, released or published: the bot runs on the owner's own machine, so the only output is the verdict. No
+# secret is used: the tests run on mock QQ and mock models, and tests/run-files.mjs gives each test file an environment
+# built from an allowlist. Setup reaches nodejs.org (the private Node, checked against versions.lock.json) and the npm
+# registry (npm ci from the lockfiles); the tests themselves refuse any connection that is not loopback.
+# The own runtime comes first (the owner's decision, 2026-11-17): its job is the primary verdict. The OpenClaw
+# runtime and Windows run as separate jobs. Green here is offline only; it is not real QQ acceptance.
+name: tests
+
+on:
+  push:
+    branches: [master, claude/elegant-ptolemy-hofhze]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  own-linux:
+    name: own runtime, Linux (${{ matrix.provider }} ${{ matrix.shard }}/${{ matrix.of }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # unit, seam and e2e-own on the default mock (OpenRouter), in two shards (about 9 minutes each here).
+          - { provider: openrouter, shard: 1, of: 2, paths: tests/e2e-own tests/seam tests/unit }
+          - { provider: openrouter, shard: 2, of: 2, paths: tests/e2e-own tests/seam tests/unit }
+          # e2e-own again with CLO_TEST_PROVIDER=anthropic: the provider-aware files switch to mock Anthropic.
+          - { provider: anthropic, shard: 1, of: 1, paths: tests/e2e-own }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the private Node and the locked packages
+        run: bash scripts/setup.sh --runtime
+      - name: Run the test files one at a time
+        run: .runtime/node/bin/node tests/run-files.mjs --provider ${{ matrix.provider }} --shard ${{ matrix.shard }}/${{ matrix.of }} ${{ matrix.paths }}
+
+  openclaw-linux:
+    name: OpenClaw runtime e2e, Linux (${{ matrix.shard }}/4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the private Node and the locked packages
+        id: setup
+        run: bash scripts/setup.sh --runtime
+      # The slowest e2e files took about 10 minutes each on a 4-core container, so these get 30 minutes per file.
+      - name: Run the test files one at a time
+        run: .runtime/node/bin/node tests/run-files.mjs --timeout 1800 --shard ${{ matrix.shard }}/4 --exclude tests/e2e/qq-first-run.test.mjs tests/e2e
+      # qq-first-run reads every process's open files to confirm that only the recorded Gateway listens. Another
+      # user's processes are unreadable to the runner account, so this one file runs as root, with an environment
+      # that holds only PATH, HOME and the locale. It runs last, so nothing root-owned is left for a later step. It
+      # still runs when another file in this shard failed, but not after a failed install or a cancelled run.
+      - name: Run qq-first-run as root
+        if: ${{ !cancelled() && matrix.shard == 1 && steps.setup.outcome == 'success' }}
+        run: sudo env -i PATH=/usr/bin:/bin HOME=/root LANG=C.UTF-8 "$GITHUB_WORKSPACE/.runtime/node/bin/node" tests/run-files.mjs --timeout 1800 --out "$RUNNER_TEMP/root-results" tests/e2e/qq-first-run.test.mjs
+
+  windows:
+    name: Windows (${{ matrix.suite }} ${{ matrix.shard }}/3)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suite: own, shard: 1, paths: tests/e2e-own tests/seam tests/unit }
+          - { suite: own, shard: 2, paths: tests/e2e-own tests/seam tests/unit }
+          - { suite: own, shard: 3, paths: tests/e2e-own tests/seam tests/unit }
+          - { suite: openclaw, shard: 1, paths: tests/e2e }
+          - { suite: openclaw, shard: 2, paths: tests/e2e }
+          - { suite: openclaw, shard: 3, paths: tests/e2e }
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Hashed files must keep their bytes: CLAUDE.md is -text, persona/ and policy/ have their own .gitattributes with
+      # eol=lf. The checkout keeps the image's core.autocrlf, as a user's own Windows clone would. This step only shows
+      # how git checked the files out, for reading a failure.
+      - name: Show line-ending settings
+        run: |
+          git config --show-origin --get-all core.autocrlf
+          git ls-files --eol CLAUDE.md persona scripts/setup.sh
+      - name: Install the private Node and the locked packages
+        run: ./scripts/setup.ps1 -Runtime
+      - name: Run the test files one at a time
+        # Windows has never been timed under this runner; 30 minutes per file, as for the e2e shards on Linux.
+        run: .\.runtime\node\node.exe tests/run-files.mjs --timeout 1800 --shard ${{ matrix.shard }}/3 ${{ matrix.paths }}
