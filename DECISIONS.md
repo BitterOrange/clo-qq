@@ -336,7 +336,7 @@
 
 用户同意搜索规划里的全部推荐答案（“按推荐”），并决定先只做 own 运行时。表里的 D0 到 D7 是这次搜索规划里的编号，和下面“待定（决策点 D）”、`CLAUDE.md` 里的 D2、D3、D5 不是一回事。用户原话里的“D5 走甲”按规划的推荐（仍搜）记。
 
-现状（2026-11-17）：只写进了配置、生成的运行配置、启动时的环境和 `doctor`（见下一节），离线测试通过。搜索请求、账本、判定、gate、来源行、控制台命令都还没有写；任何真实请求都没有发过。搜索打开时 `clo mode live` 一律拒绝（`search_rules`），直到第 4 项的真实探测做完、规则写进来。
+现状（2026-11-17）：写进了配置、生成的运行配置、启动时的环境、`doctor`，Sonar 的请求和响应读法（适配器）、可洛进程里的搜索客户端、搜索模型的价格锁定（`clo search lock`）、账本里的搜索层级、次数、搜索自己的暂停和对搜索 Key 的轻对账（见下一节），离线测试通过。判定、gate 里的搜索步骤、来源行、打开搜索的控制台命令都还没有写，所以现在一次搜索都不会发生；任何真实请求都没有发过。搜索打开时 `clo mode live` 一律拒绝（`search_rules`），直到真实探测做完、规则写进来。
 
 | 项目 | 决定 |
 |---|---|
@@ -365,6 +365,19 @@
 | 和对话 Key 相同 | live 下搜索打开时，`clo start` 和 `doctor` 发现搜索 Key 和 `CLO_CHAT_API_KEY` 是同一个就拒绝，不打印值 | 和探测 Key 的比较放在以后的 `clo mode live` 检查里，`clo start` 不读探测 Key |
 | live 的拦截 | 新增 `search_rules`：搜索打开时 `clo mode live` 拒绝，live 下手改打开搜索时 `clo apply` 也拒绝。常量 `SEARCH_RULES_RECORDED` 现在是 false，真实探测确认 Sonar 的字段和价格、规则写进来之后才改 | 照 `provider_rules` 的写法 |
 | `doctor` | openclaw 运行时保留 `search_off`，提示搜索只在 own 运行时。own 运行时换成 `search_config`：可洛进程的环境里有搜索 Key 的名字，当且仅当搜索打开，并且 `effective.json` 和 `config.json` 一致 | |
+| 搜索请求的内容 | 只有模型、`stream:false`、`max_tokens`、`usage:{include:true}`、一段固定的系统指令和一条搜索词。没有历史、发言人代号、群和成员编号、`user` 字段和归属请求头 | 字段名没有用真实请求核实 |
+| 来源从哪里读 | 三种写法都读：`choices[0].message.annotations[]` 里的 `url_citation`、顶层的 `search_results`、顶层的 `citations`。有可用标题用标题（去控制字符、带网址或括号的不要，最多 30 字），没有就用网址主机名的主要部分（比如 `reuters`，不带点，所以不会被当成网址）。重复的只留一个，最多 5 个。网址本身不出适配器 | 哪一种是真的没有核实。一个可用来源都没有时，适配器把这次结果标成 `no_source`，Sonar 的文字不交出去 |
+| 搜索模型的价格 | `clo search lock` 从 OpenRouter 模型目录读 `perplexity/sonar-pro` 的价格（不带 Key），写进 `versions.lock.json` 的 `models.locks.search`。`prompt`、`completion` 按每百万 token 换算，`request` 和 `web_search` 当作每次调用的固定费用加在一起。目录里还有别的不为零的价格字段，就拒绝锁定。第一次锁定、价格有任何变化（涨或降）、输出价超过每百万 $30，都要 `--confirm-price`。锁价不算模型变更，不记进 `models.changes`；打开搜索时才算 | 按次收费的字段名没有核实。没有锁价时运行配置里的搜索价格是 null，账本不给搜索预留，所以不会搜索 |
+| 一次搜索的预留 | 按 4000 个输入 token、`maxTokens` 个输出 token 和每次的固定费用算最坏数。用 mock 价格（输入 $3、输出 $15 每百万，每次 $0.005）是 $0.026 | 4000 是给检索内容留的余量：Sonar 算不算进输入 token 不知道。结算超过预留就只停搜索（`cost_above_hold`），由 owner 解除 |
+| 结算的算法 | 有上报的费用就按上报的（这是搜索 Key 实际被扣的）；没有就按 token 乘锁定价再加每次的固定费用；都没有就记未结算，按预留额计 | 上报的费用含不含按次费用没有核实 |
+| 搜索行 | 层级 `search`，类别 `search`，`provider` 列写 `search`。所以对话 Key 的对账既不拿它解释读数，也不会把它结清或按 0 结清。只在 own 运行时、搜索打开、没有搜索暂停、当天总花费加上这次预留不超过 `searchUsd` 时才能预留。全局付费暂停和当前对话接口的硬上限暂停也挡住搜索 | 搜索没有对话就没有用处，所以对话停了搜索也停 |
+| 次数怎么数 | 每次回答的次数和每天的次数（上海日）都是计数器，和预留在同一个事务里：任何一项被拒，整个回滚，计数不变 | 两个进程同时抢也只成 10 次（`tests/unit/quota-atomic.test.mjs`） |
+| 搜索自己的暂停 | 控制项 `search_paused`，只停搜索，不碰付费暂停。连续 3 次失败停（`fail`），10 分钟后放一次试探，成功就解除，owner 也可以解除；402 或 OpenRouter 的限额来源停（`key_limit`），读到搜索 Key 还有余额才解除；读不到搜索 Key（启动时一次，之后连续两次）停（`key_read_failed`），读到就解除；对账差额连续两次超过阈值停（`residual`），读到对得上就解除；结算超过预留停（`cost_above_hold`），只有 owner 能解除。等级高的不会被低的覆盖 | owner 用 `clo budget clear-search-pause` 解除，只能解除 `cost_above_hold` 和 `fail` |
+| 轻对账 | live 下可洛进程启动后的第一次心跳、之后有新的搜索行或结算、有没结清的搜索行、有读 Key 才能解除的暂停时、或者每 10 分钟，用搜索 Key 读 `搜索地址/key`。拿 `usage_daily` 和本机当天（UTC 日）搜索行的合计比（结清的按实际，释放的按 0，其余按预留额）。阈值和对话那边一样：$0.25 和读数的 15% 取大的。读数里没有 `usage_daily` 算读取失败。Key 的限额和 `budget.searchKeyDailyLimitUsd` 不一样、或不是按日重置，告警一次。不写 `key_snapshots`，不把差额记成行 | 依赖 `usage_daily`，没有核实这个字段存在、多久更新 |
+| 到期的未结算搜索行 | 未结算超过 15 分钟（`budget.unsettledClearMs`）就按预留额结清，来源记 `search_hold`。之后没有别的未结算行时，崩溃或缺用量造成的付费暂停照常解除 | 对话接口是 Anthropic 时也一样 |
+| 可洛进程里的搜索 Key | 只有运行配置里搜索打开时才用；和对话 Key（OpenRouter 或 Anthropic）相同就不用。出口把它当作密钥，含它的文字不发 | 和 `clo start` 的检查重复，防的是不经 `clo start` 启动的情况 |
+| 运行中的规则检查 | 可洛进程发搜索请求前不再检查 `SEARCH_RULES_RECORDED`，只靠 `clo mode live` 和 `clo apply` 拒绝 | 运行时也拦的话，离线的端到端测试没法在 live 下测搜索。手改运行配置成 live 绕过控制台的情况，对话那边的 Anthropic 有运行时检查，搜索这里没有 |
+| 状态显示 | `clo status` 和 `clo budget show` 在搜索打开、或有搜索暂停、或当天有搜索花费时多一行：当天次数、花费、`searchUsd`、搜索暂停、配置的搜索 Key 日限额 | |
 
 ## 待定（决策点 D）
 

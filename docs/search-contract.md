@@ -7,7 +7,8 @@ This is the implementation contract for web search. The user's decisions are in 
 | Part | State |
 |---|---|
 | Config, effective file, start env, `doctor`, the `search_rules` live refusal | Implemented, offline tests only (`tests/unit/search-config.test.mjs`, `tests/unit/doctor.test.mjs`) |
-| Adapter, price lock, ledger tier and counters, decision schema, gate step, source line, console commands, probe | **Not written yet** |
+| Adapter, the bot's search client and Key, price lock (`clo search lock`), ledger tier, counters, search pauses, light reconciliation, `clo budget` and `clo status` lines | Implemented, offline tests only (section 10) |
+| Decision schema, query cleaning, gate step, source line, `clo search enable`/`disable`, probe | **Not written yet**, so nothing searches today |
 | Any real request (OpenRouter, Perplexity, QQ) | **None made.** Nothing here has run against the real Sonar API |
 
 Until the paid probe in section 9 has run and its rules have landed, `SEARCH_RULES_RECORDED` in `src/clo-plugin/lib/core/providers/searchRegistry.js` is false and `clo mode live` refuses while search is on (`search_rules`). Search can be turned on in dry-run and in offline tests only.
@@ -52,9 +53,11 @@ qq.groups[id].search   // true or false for every group
 - In live with search on, `requireSecrets` (start and `doctor`) needs the Key and refuses it when it equals `CLO_CHAT_API_KEY`, without printing either value. The comparison with `CLO_TEST_API_KEY` belongs to the live checks of the console step, since `clo start` does not read the probe Key.
 - `doctor` on the own runtime: `search_config` passes when the bot's env holds `CLO_SEARCH_KEY` exactly when search is on, and `effective.json` agrees with `config.json`.
 
-## 4. The adapter (planned)
+## 4. The adapter and the client (implemented)
 
-`providers/searchAdapter.js` implements what `modelChat.js` needs (`request`, `classify`, `parseError`, `requestedModel`, `retryEvent`). Pure; it never calls `fetch` itself, so the static list of files that may call `fetch` stays as it is.
+`providers/searchAdapter.js` implements what `modelChat.js` needs (`request`, `classify`, `parseError`, `requestedModel`, `retryEvent`), plus `searchBody`. Pure; it never calls `fetch` itself, so the static list of files that may call `fetch` stays as it is (a planted `fetch` in it is flagged: `tests/fixtures/single-exit-offenders/fetch-in-search-adapter.js`). `createSearchAdapter({ resultMaxChars })` fixes the text cut; the bot builds its adapter once, when the services open.
+
+The bot (`src/bot/services.mjs`) builds a second client on the same send loop: Key `searchKeyOf(env, getEffective)`, which is `CLO_SEARCH_KEY` only while the effective file has search on and only when it is not the chat Key (OpenRouter or Anthropic); base `searchBaseOf(getEffective)`, the search block's own `baseUrl`, whatever the chat provider is. The search Key is in `liveSecrets`, so the exit refuses text that holds it.
 
 Request body (field names **unverified**):
 
@@ -63,7 +66,22 @@ Request body (field names **unverified**):
   messages: [ { role: 'system', content: <fixed instruction> }, { role: 'user', content: <one query> } ] }
 ```
 
-No history, no speaker codes, no group or member ids, no `user` field, no attribution headers. The classified result carries only: the text cut to `resultMaxChars`, up to 5 sources as `{ name }`, usage, and the HTTP status. Provider error text never leaves the adapter. URLs never leave the adapter: they are not stored in `clo.db`, not logged, and not added to the turn's inbound URL list, so a URL the model copies is replaced by the exit's URL guard.
+No history, no speaker codes, no group or member ids, no `user` field, no attribution headers. The classified result carries only: the text cut to `resultMaxChars`, up to 5 sources as `{ name }`, usage, and the HTTP status (`message` is always null). Provider error text never leaves the adapter. URLs never leave the adapter: they are not stored in `clo.db`, not logged, and not added to the turn's inbound URL list, so a URL the model copies is replaced by the exit's URL guard.
+
+Sources are read from all three shapes (`choices[0].message.annotations[].url_citation`, top-level `search_results`, top-level `citations`), in that order. A name is the title when it is usable (NFKC, control and format characters out, no URL by the exit's own matcher, no `<>[]{}`, at most 30 code points), else the main label of the URL's host (`news.bbc.co.uk` gives `bbc`; never a dot, an IP, punycode or a scheme other than http/https). Each name once, at most 5.
+
+| `kind` | `reason` | Meaning |
+|---|---|---|
+| `ok` | null | text and 1 to 5 sources |
+| `no_source` | `no_source` | a handled, billed answer with no usable source name; its text is withheld here |
+| `error` | `bad_body`, `no_choice`, `tool_calls`, `finish_error`, `finish_reason`, `model_mismatch`, `empty`, `http`, `provider_error` | no text, no sources |
+| `refusal` | `refusal`, `content_filter`, `moderation` (a 403 with no limit source) | no text, no sources |
+
+The transport adds `not_sent`, `aborted`, and `error` with `network` or `timeout`, with no text and no sources.
+
+### The price lock
+
+`clo search lock [--confirm-price]` reads the OpenRouter catalog (no Key) and writes `models.locks.search` in `versions.lock.json`: `{ id: 'perplexity/sonar-pro', price: { inputPerM, outputPerM, requestUsd } }`. `prompt` and `completion` are per token; `request` and `web_search` (field names **unverified**) are USD per call and are added into `requestUsd`. Any other price field that is not zero refuses the lock. `--confirm-price` is needed for the first lock, for any change of price up or down, and above $30/M output. A lock is a price, not a model change: `models.changes` is not touched. With search on, `clo apply` (and the lock itself) writes the price into `effective.search.price`; without a lock it is null and the ledger holds nothing for search.
 
 ## 5. Queries (planned)
 
@@ -92,14 +110,27 @@ States handed to the primary turn as `search: { status, items }` in the user mes
 
 After the primary reply, with status `ok`, the program appends one line `来源：A、B、C` (1–3 names the API returned) before the exit's single `collect`. The exit then runs its leak check, rule check, URL guard, splitting and rate limits on the whole text. A content hit drops it: no rewrite, no retry, no splitting, no other path.
 
-## 7. Money (planned)
+## 7. Money (implemented in the ledger; the gate does not call it yet)
 
-- Hard cap: the search Key's daily limit on OpenRouter, read with that Key's own `/key`. Live checks (console step): readable, daily reset, equal to `budget.searchKeyDailyLimitUsd`, at least one search hold, and the Key differs from the chat and probe Keys.
-- Local: tier `search` (`effective + hold ≤ searchUsd`), the daily count, the per-answer count. Rows are `tier='search'`, `category='search'`, `provider='search'`, so they never explain the chat Key's reading.
-- Reconciliation (decision D3, light): each heartbeat compares the search Key's `usage_daily` (**field unverified**) with the UTC day's search rows; a gap above the threshold twice in a row pauses search only (`search_paused=residual`). No `clo.db` migration; schema stays at version 2.
-- Unsettled search rows settle at their reserved amount when they expire (over-count, never under-count), so they do not hold the chat side's `usage_missing` pause open.
-- Pauses stop search, never chat: 3 failures or timeouts in a row → `search_paused=fail` with a probe after 10 minutes; 402 or the Key limit → `search_paused=key_limit`; actual cost above the hold → `search_paused=cost_above_hold`, owner clears. The global `paid_paused` still stops everything.
-- Timing: decision 8 s + 2 × 20 s search + 90 s turn = 138 s, inside 285 s − 15 s.
+- Hard cap: the search Key's daily limit on OpenRouter, read with that Key's own `/key`. Live checks (console step, not written): readable, daily reset, equal to `budget.searchKeyDailyLimitUsd`, at least one search hold, and the Key differs from the chat and probe Keys.
+- Hold: `holdMicros('search')` = `SEARCH_HOLD_INPUT_TOKENS` (4000) × input rate + `search.maxTokens` × output rate + `requestUsd`. The 4000 leaves room for retrieved content in case Sonar counts it as prompt tokens (unverified).
+- Claim: `ledger.claimSearch({ eventKey })` commits, in one transaction, the per-answer count (`search_event:<event>`, `perAnswer`), the day's count (`search_day:<Shanghai day>`, `perDay`) and the hold; any refusal rolls all of it back. Reasons: `search_off`, `price`, `paid_paused`, `hard_cap_unverified`, `search_paused`, `answer_cap`, `day_cap`, `total`.
+- Local tier: `search` (`effective + hold ≤ searchUsd`), own runtime and search on only. Rows are `tier='search'`, `category='search'`, `provider='search'`, so they never explain the chat Key's reading and the chat Key's reads never settle them.
+- Settlement (`ledger.settleSearch`, figures from `cost.js` `searchMicros`): the reported cost; without one, tokens at the lock plus `requestUsd`; without either, unsettled at the hold. A figure above the hold settles at the figure and pauses search (`cost_above_hold`).
+- Reconciliation (decision D3, light): `searchTick` reads the search Key at the search base at the first live tick, after any new search row or settlement, while a search row is open or a read-lifted pause stands, and every 10 minutes. It compares `usage_daily` (**field unverified**; missing counts as a failed read) with the UTC day's search rows (settled at their figure, released at 0, others at their hold). A gap above max($0.25, 15% of the figure) twice in a row pauses search (`residual`). A limit unlike `budget.searchKeyDailyLimitUsd`, or a reset that is not daily, alerts once. Nothing is written to `key_snapshots` and nothing is attributed. No `clo.db` migration; schema stays at version 2.
+- Unsettled search rows settle at their hold after `unsettledClearMs` (15 minutes), source `search_hold` (over-count, never under-count); then a settlement pause with nothing left unsettled lifts as on any settlement. The same on either chat provider.
+- Pauses (`search_paused`) stop search, never chat. A lower rank never replaces a higher one.
+
+| Reason | Set by | Lifted by |
+|---|---|---|
+| `fail` (rank 1) | 3 failures in a row (`noteSearchError`) | a success after the one trial per 10 minutes, or the owner |
+| `key_read_failed` (1) | the search Key unread at the first read, or twice in a row | a clean read |
+| `key_limit` (2) | a 402, or a 402/403 with an OpenRouter limit source; a read with no room left | a read with room |
+| `residual` (2) | the gap above, twice in a row | a clean read |
+| `cost_above_hold` (3) | a settlement above its hold | the owner only (`clo budget clear-search-pause`) |
+
+  The global `paid_paused` and the active chat kind's hard-cap pause still stop search.
+- Timing (gate step, not written): decision 8 s + 2 × 20 s search + 90 s turn = 138 s, inside 285 s − 15 s.
 
 ## 8. Turning it on (planned)
 
@@ -124,4 +155,13 @@ The search Key's daily limit and the probe's cap are not decided. Results go to 
 
 ## 10. Tests (CLAUDE.md section 10)
 
-Every behaviour gets an offline test with its positive control in the same run, against mocks only. Written so far: `tests/unit/search-config.test.mjs` (config, effective, live refusal, env, secrets) and the search cases in `tests/unit/doctor.test.mjs`. Still to write with their steps: adapter (success, no source, non-JSON, 4xx, 5xx, refusal, model mismatch), ledger and counters (tier stop order, 11th call refused, rollback), decision and query cleaning (injection in the group message, ids in a "query"), and the end-to-end rows: not admitted → no search; success with source names and no URL; timeout; no source; local-rule block; web text asking for Keys, commands or config; budget, pause and count limits; at most 2 calls; decision failure still answers; `/stop` mid-search; Anthropic chat with OpenRouter search.
+Every behaviour gets an offline test with its positive control in the same run, against mocks only. Written so far:
+
+- `tests/unit/search-config.test.mjs` (config, effective, the price in it, live refusal, env, secrets) and the search cases in `tests/unit/doctor.test.mjs`.
+- `tests/unit/search-adapter.test.mjs`: body, success in each citation shape, source names, no source, the text cut, every failure shape, HTTP errors without provider text, the send loop, the bot's search Key and base, the mock.
+- `tests/unit/provider-cost.test.mjs` (search figures), `tests/unit/cli-search.test.mjs` (`clo search lock`, budget and status lines, `clear-search-pause`).
+- `tests/unit/ledger-search.test.mjs`: hold, claim, both caps, rollback, tier stop order, search off, settlement, failure and limit pauses, the trial, ranks, expiry at the hold, the search Key read, the light reconciliation, the tick, Anthropic chat.
+- `tests/unit/quota-atomic.test.mjs` (two processes: exactly 10 a day; a budget refusal rolls the count back), `tests/unit/ledger-reconcile.test.mjs` (search rows explain nothing on the chat Key), `tests/unit/store-migration.test.mjs` (schema stays 2), `tests/unit/qq-single-exit.test.mjs` (planted `fetch` in the adapter).
+- `tests/e2e-own/search-stack.test.mjs`: the real bot with search on, on both chat kinds; the search Key read at the search mock with that Key; an @ still answered; nothing searched yet.
+
+Still to write with their steps: decision and query cleaning (injection in the group message, ids in a "query"), and the end-to-end rows: not admitted → no search; success with source names and no URL; timeout; no source; local-rule block; web text asking for Keys, commands or config; budget, pause and count limits; at most 2 calls; decision failure still answers; `/stop` mid-search; Anthropic chat with OpenRouter search.

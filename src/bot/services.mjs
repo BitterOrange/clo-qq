@@ -10,6 +10,8 @@ import { createLedger } from '../clo-plugin/lib/core/ledger.js';
 import { createLog } from '../clo-plugin/lib/core/log.js';
 import { adapterFor } from '../clo-plugin/lib/core/providers/index.js';
 import { createChatClient } from '../clo-plugin/lib/core/providers/modelChat.js';
+import { createSearchAdapter } from '../clo-plugin/lib/core/providers/searchAdapter.js';
+import { SEARCH_CHILD_KEY, searchOfEffective } from '../clo-plugin/lib/core/providers/searchRegistry.js';
 import {
   CHILD_KEY, hardCapControlKey, hardCapPauseKey, LIVE_CODES, liveStartCheck, providerOfEffective, providerRulesRecorded,
 } from '../clo-plugin/lib/core/providers/registry.js';
@@ -21,9 +23,38 @@ import { createTurnRunner } from '../clo-plugin/lib/core/turn.js';
 // run does not have.
 export const keyOf = (env, kind = 'openrouter') => (typeof kind === 'string' && Object.hasOwn(CHILD_KEY, kind) ? env[CHILD_KEY[kind]] || null : null);
 
-/** Every secret this process holds. The exit refuses text that contains one. */
+/** Every secret this process holds. The exit refuses text that contains one. The search Key too, when it was given. */
 export function liveSecrets(env) {
-  return [env.CLO_QQ_APP_SECRET, env.OPENROUTER_API_KEY, env.CLO_PROVIDER_API_KEY].filter(Boolean);
+  return [env.CLO_QQ_APP_SECRET, env.OPENROUTER_API_KEY, env.CLO_PROVIDER_API_KEY, env[SEARCH_CHILD_KEY]].filter(Boolean);
+}
+
+/**
+ * The search Key, only while the effective file has search on (own runtime, a known provider) and only when it is not
+ * the chat Key: a search spend on the chat Key would read as the chat Key's unexplained residual. clo start refuses
+ * the same Key already; this holds for a process started any other way. Null otherwise.
+ */
+export function searchKeyOf(env, getEffective) {
+  const key = env[SEARCH_CHILD_KEY];
+  if (typeof key !== 'string' || key === '') return null;
+  if (key === env.OPENROUTER_API_KEY || key === env.CLO_PROVIDER_API_KEY) return null;
+  try {
+    return searchOfEffective(getEffective()) ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Where a search request may go: the search block's own base, whatever the chat provider is (decision D5: with an
+ * Anthropic chat provider, search still goes through OpenRouter on its own Key). Null with search off.
+ */
+export function searchBaseOf(getEffective) {
+  try {
+    const base = searchOfEffective(getEffective())?.baseUrl;
+    return typeof base === 'string' && base !== '' ? base : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -164,8 +195,15 @@ export function openBotServices(effectivePath, { env = process.env, fetch = glob
   const adapter = adapterFor(kind ?? 'openrouter');
   const makeClient = factories.createChatClient ?? createChatClient;
   const makeRunner = factories.createTurnRunner ?? createTurnRunner;
+  // Search has a client of its own, on the same send loop, with its own Key and base. Its adapter's text cut is fixed
+  // when the services open, as the provider is.
+  const getSearchKey = () => searchKeyOf(env, getEffective);
+  const getSearchBaseUrl = () => searchBaseOf(getEffective);
   try {
-    ledger = createLedger({ store, getEffective, fetch, getKey, log, now, runtime: 'own' });
+    ledger = createLedger({ store, getEffective, fetch, getKey, getSearchKey, log, now, runtime: 'own' });
+    const searchClient = makeClient({
+      adapter: createSearchAdapter({ resultMaxChars: searchOfEffective(eff)?.resultMaxChars }), fetch, getKey: getSearchKey, getBaseUrl: getSearchBaseUrl, log, now,
+    });
     const client = makeClient({ adapter, fetch, getKey, getBaseUrl, log, now });
     const decide = createDecider({ fetch, client, getKey, getEffective, log, now });
     // Read at each turn, so the bytes the runner checks are the bytes on disk now. Missing reads as null.
@@ -180,7 +218,7 @@ export function openBotServices(effectivePath, { env = process.env, fetch = glob
     };
     let closed = false;
     return {
-      effectivePath, store, ledger, policy, getEffective, decide, log, runGen, client, getKey, readSystemPrompt, provider,
+      effectivePath, store, ledger, policy, getEffective, decide, log, runGen, client, getKey, readSystemPrompt, provider, searchClient, getSearchKey,
       secrets: () => liveSecrets(env),
       /** The dispatchTurn the gate calls. getExit returns the exit once the connection has made it. */
       createDispatch(getExit) {

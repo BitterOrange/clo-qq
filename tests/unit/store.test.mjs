@@ -239,13 +239,14 @@ test('alerts: six an hour per kind, the rest are counted, detail is whitelisted'
 
 test('pauseState reads every switch', () => {
   const { store } = fresh();
-  assert.deepEqual(store.pauseState('G1'), { global: false, group: false, interject: false, paid: null, terminal: null });
+  assert.deepEqual(store.pauseState('G1'), { global: false, group: false, interject: false, paid: null, terminal: null, search: null });
   store.setControl('global_paused', '1', 'cli');
   store.setControl('group_paused:G1', '1', 'cli');
   store.setControl('interject_paused', '1', 'gate');
   store.setControl('paid_paused', 'crash_unsettled', 'recovery');
   store.setControl('terminal_close', '4914', 'connection');
-  assert.deepEqual(store.pauseState('G1'), { global: true, group: true, interject: true, paid: 'crash_unsettled', terminal: '4914' });
+  store.setControl('search_paused', 'fail', 'ledger');
+  assert.deepEqual(store.pauseState('G1'), { global: true, group: true, interject: true, paid: 'crash_unsettled', terminal: '4914', search: 'fail' });
   assert.equal(store.pauseState('G2').group, false);
   store.delControl('group_paused:G1');
   assert.equal(store.pauseState('G1').group, false);

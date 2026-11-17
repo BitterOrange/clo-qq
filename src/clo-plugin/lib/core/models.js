@@ -370,3 +370,67 @@ async function readModel({ fetch, baseUrl, key, id, signal }) {
   if (body.id !== id) return { problem: 'model_mismatch' };
   return { body };
 }
+
+// ---- Search (the own runtime only; docs/search-contract.md) ----
+// The search model's price comes from the OpenRouter catalog, like the chat models'. The catalog's field names for
+// a per-call fee are unverified: 'request' and 'web_search' are read, both USD per call, and added together. Any other
+// price field that is not zero refuses the lock, so a fee this code does not know can never be priced at 0.
+
+export const SEARCH_PRICE_FIELDS = Object.freeze(['prompt', 'completion', 'request', 'web_search']);
+const SEARCH_PRICE_KEYS = ['inputPerM', 'outputPerM', 'requestUsd'];
+
+function perCall(value, what, id) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`model ${id}: bad ${what} price`);
+  return n;
+}
+
+// { inputPerM, outputPerM, requestUsd } for one catalog row, or a thrown Error naming what is wrong.
+export function searchPriceFor(id, catalog) {
+  const row = rowOf(id, catalog);
+  if (!row) throw new Error(`model ${id} is not in the catalog`);
+  const p = row.pricing;
+  if (!isObj(p) || p.prompt === undefined || p.completion === undefined) throw new Error(`model ${id}: price missing`);
+  for (const [k, v] of Object.entries(p)) {
+    if (SEARCH_PRICE_FIELDS.includes(k)) continue;
+    const n = typeof v === 'number' || typeof v === 'string' ? Number(v) : NaN;
+    if (!(Number.isFinite(n) && n === 0)) throw new Error(`model ${id}: unknown price field ${k}`);
+  }
+  return {
+    inputPerM: perMillion(p.prompt, 'input', id),
+    outputPerM: perMillion(p.completion, 'output', id),
+    requestUsd: Number((perCall(p.request ?? 0, 'request', id) + perCall(p.web_search ?? 0, 'web search', id)).toFixed(9)),
+  };
+}
+
+// The search lock for model: { ok, errors, lock: { id, price } }. Nothing is written here. --confirm-price is needed
+// on the first lock, for a different model, for any change of price and above the output ceiling: nothing but the
+// light reconciliation checks a search price, so a fall needs a look as much as a rise.
+export function lockSearchFromCatalog(model, catalog, { previous = null, confirmPrice = false, maxOutputPerM = DEFAULT_MAX_OUTPUT_PER_M } = {}) {
+  const errors = [];
+  const err = (path, message) => { errors.push({ path, message }); };
+  if (typeof model !== 'string' || !model) return { ok: false, errors: [{ path: 'search', message: 'no search model' }], lock: null };
+  let price = null;
+  try {
+    price = searchPriceFor(model, catalog);
+  } catch (e) {
+    err('search', e.message);
+  }
+  if (price) {
+    if (price.inputPerM <= 0 || price.outputPerM <= 0) err('search', 'a token price of 0 cannot be locked');
+    if (price.outputPerM > maxOutputPerM && !confirmPrice) err('search', `output price is above $${maxOutputPerM}/M; pass --confirm-price`);
+    if (!confirmPrice) {
+      if (!previous || previous.id !== model) err('price', 'a first lock or a different model needs --confirm-price');
+      else if (SEARCH_PRICE_KEYS.some((k) => previous.price?.[k] !== price[k])) err('price', 'the catalog price differs from the locked one; pass --confirm-price');
+    }
+  }
+  return errors.length ? { ok: false, errors, lock: null } : { ok: true, errors, lock: { id: model, price } };
+}
+
+// Whether a lock record is a usable search lock for model.
+export function searchLockUsable(lock, model) {
+  const p = lock?.price;
+  const pos = (v) => typeof v === 'number' && Number.isFinite(v) && v > 0;
+  return isObj(lock) && lock.id === model && isObj(p) && pos(p.inputPerM) && pos(p.outputPerM)
+    && typeof p.requestUsd === 'number' && Number.isFinite(p.requestUsd) && p.requestUsd >= 0;
+}

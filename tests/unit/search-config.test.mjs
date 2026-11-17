@@ -165,6 +165,7 @@ test('effective: on, the block has the one model, the defaults, the Key limit an
   assert.deepEqual(e.search, {
     provider: 'openrouter-sonar', model: SEARCH_MODEL['openrouter-sonar'], baseUrl: OPENROUTER_BASE_URL,
     perAnswer: 2, perDay: 10, maxTokens: SEARCH_DEFAULTS.maxTokens, resultMaxChars: SEARCH_DEFAULTS.resultMaxChars, queryMaxChars: 80, searchMs: SEARCH_DEFAULTS.searchMs,
+    price: null,
   });
   assert.equal(e.search.model, 'perplexity/sonar-pro');
   assert.equal(e.budget.searchKeyDailyLimitUsd, 0.5);
@@ -189,6 +190,24 @@ test('effective: on, the block has the one model, the defaults, the Key limit an
   assert.equal(buildEffective(viaOr, { paths, env: { CLO_TEST_ROOT: dir }, now: () => 0 }).search.baseUrl, 'http://127.0.0.1:8');
 });
 
+test('effective: the search price comes from a lock of the search model only, and only while search is on', () => {
+  const LOCK = { id: 'perplexity/sonar-pro', price: { inputPerM: 3, outputPerM: 15, requestUsd: 0.005 } };
+  const locked = buildEffective(searchOn(), { paths, env: {}, now: () => 0, searchLock: LOCK });
+  assert.deepEqual(locked.search.price, LOCK.price, 'control: a lock of the search model is the price');
+  assert.notEqual(locked.search.price, LOCK.price, 'a copy, not the lock object');
+  for (const bad of [
+    { ...LOCK, id: 'perplexity/sonar' },
+    { ...LOCK, price: { ...LOCK.price, inputPerM: 0 } },
+    { ...LOCK, price: { ...LOCK.price, requestUsd: -1 } },
+    { ...LOCK, price: { inputPerM: 3, outputPerM: 15 } },
+    null,
+  ]) {
+    assert.equal(buildEffective(searchOn(), { paths, env: {}, now: () => 0, searchLock: bad }).search.price, null, JSON.stringify(bad));
+  }
+  const off = buildEffective(ownCfg(), { paths, env: {}, now: () => 0, searchLock: LOCK });
+  assert.equal('search' in off, false, 'off: no block, lock or not');
+});
+
 test('the effective reader refuses a search block it does not know, or one on the OpenClaw runtime', () => {
   const sub = join(dir, 'eff');
   mkdirSync(sub, { recursive: true });
@@ -211,6 +230,12 @@ test('the effective reader refuses a search block it does not know, or one on th
   assert.equal(read(), null, 'search on the OpenClaw runtime');
   write({ ...good, search: 'on' });
   assert.equal(read(), null, 'not an object');
+  write({ ...good, search: { ...good.search, price: { inputPerM: 3, outputPerM: 15, requestUsd: 0.005 } } });
+  assert.deepEqual(read()?.search?.price, { inputPerM: 3, outputPerM: 15, requestUsd: 0.005 }, 'control: a locked price reads');
+  write({ ...good, search: { ...good.search, price: { inputPerM: 3, outputPerM: 15 } } });
+  assert.equal(read(), null, 'a price without its per-call fee');
+  write({ ...good, search: { ...good.search, price: { inputPerM: 0, outputPerM: 15, requestUsd: 0 } } });
+  assert.equal(read(), null, 'a free token price');
   const { search, ...off } = good;
   assert.ok(search);
   write(off);

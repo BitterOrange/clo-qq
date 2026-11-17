@@ -9,6 +9,17 @@ function sseChunk(res, id, model, delta, finishReason = null) {
 }
 
 export const isDecisionRequest = (rec) => rec.body?.stream === false && Boolean(rec.body?.response_format);
+// The search model (docs/search-contract.md). Its requests are told apart by the model alone.
+export const SEARCH_MODEL_ID = 'perplexity/sonar-pro';
+export const isSearchRequest = (rec) => rec.body?.model === SEARCH_MODEL_ID;
+
+// A Sonar-shaped answer. The citation fields are unverified (contract section 9), so a step can put sources in any of
+// the three shapes: searchResults ([{title, url}]), citations ([url]) and annotations ([{title, url}] as url_citation).
+// The default has one titled source. Mock data only: not what the real API returns.
+export const DEFAULT_SEARCH_STEP = Object.freeze({
+  text: 'mock 检索结果：示例事实。',
+  searchResults: [{ title: 'Mock News', url: 'https://news.example.com/a' }],
+});
 
 export const decisionText = ({ action = 'skip', skipClass = 'none', crisis = false } = {}) => JSON.stringify({ action, skip_class: skipClass, crisis, need_search: false });
 
@@ -23,6 +34,17 @@ const OPUS_ROW = (id, name) => ({
   supported_parameters: ['tools', 'tool_choice', 'reasoning', 'include_reasoning', 'max_tokens'],
   reasoning: { mandatory: true, supported_efforts: ['max', 'xhigh', 'high', 'medium', 'low'], default_effort: 'high' },
 });
+// A search row in the catalog's shape. Its prices are mock figures, not Sonar's: the field names for a per-call fee
+// ('request', 'web_search') are what the lock reads, and are unverified.
+export const sonarRow = (pricing = {}) => ({
+  id: SEARCH_MODEL_ID,
+  name: 'mock sonar',
+  created: 80,
+  pricing: { prompt: '0.000003', completion: '0.000015', request: '0.005', ...pricing },
+  context_length: 127000,
+  top_provider: { max_completion_tokens: 8000 },
+  supported_parameters: ['max_tokens'],
+});
 // The opus-latest selector checks the top concrete row against the alias row, so a catalog without it cannot lock.
 export const defaultCatalog = () => [
   OPUS_ROW('anthropic/claude-opus-5.5', 'mock opus'),
@@ -35,9 +57,14 @@ export async function startMockOpenRouter() {
   const other = [];
   let script = () => ({ text: '好的。' });
   let decide = () => ({ text: decisionText() });
+  let searchStep = () => ({ ...DEFAULT_SEARCH_STEP });
   let counter = 0;
   let keyBody = { ...DEFAULT_KEY };
   let keyStatus = 200;
+  // Per-Key /key answers, by the bearer Key: the search Key and the chat Key read their own figures.
+  const keyBodies = new Map();
+  const keyStatuses = new Map();
+  const keyReads = [];
   let catalog = defaultCatalog();
 
   const server = createServer((req, res) => {
@@ -50,8 +77,12 @@ export async function startMockOpenRouter() {
         if (req.url.endsWith('/models')) {
           res.end(JSON.stringify({ data: catalog }));
         } else if (req.url.endsWith('/key')) {
-          res.statusCode = keyStatus;
-          res.end(JSON.stringify(keyStatus === 200 ? { data: keyBody } : { error: { message: 'mock: key read refused' } }));
+          const bearer = String(req.headers.authorization ?? '').replace(/^Bearer /, '');
+          keyReads.push({ key: bearer, at: Date.now() });
+          const status = keyStatuses.get(bearer) ?? keyStatus;
+          const data = keyBodies.get(bearer) ?? keyBody;
+          res.statusCode = status;
+          res.end(JSON.stringify(status === 200 ? { data } : { error: { message: 'mock: key read refused' } }));
         } else {
           res.statusCode = 404;
           res.end(JSON.stringify({ error: { message: 'mock: no such route' } }));
@@ -62,6 +93,10 @@ export async function startMockOpenRouter() {
       try { body = JSON.parse(raw); } catch { /* recorded as null */ }
       const rec = { url: req.url, headers: { ...req.headers }, body, at: Date.now() };
       requests.push(rec);
+      if (isSearchRequest(rec)) {
+        await answerSearch(rec, res);
+        return;
+      }
       const decision = isDecisionRequest(rec);
       const step = (await (decision ? decide : script)(rec, requests.length)) ?? {};
       if (step.delayMs) await new Promise((r) => setTimeout(r, step.delayMs));
@@ -111,6 +146,39 @@ export async function startMockOpenRouter() {
       res.end();
     });
   });
+  async function answerSearch(rec, res) {
+    const step = (await searchStep(rec, requests.filter(isSearchRequest).length)) ?? {};
+    if (step.delayMs) await new Promise((r) => setTimeout(r, step.delayMs));
+    rec.answeredAt = Date.now();
+    res.setHeader('Content-Type', 'application/json');
+    if (step.error) {
+      res.statusCode = step.error.status ?? 500;
+      res.end(JSON.stringify(step.error.body ?? { error: { message: 'mock: scripted search error' } }));
+      return;
+    }
+    if (step.raw !== undefined) {
+      res.end(typeof step.raw === 'string' ? step.raw : JSON.stringify(step.raw));
+      return;
+    }
+    const id = `gen-mock-${++counter}`;
+    const usage = step.usage === null ? undefined : { prompt_tokens: 20, completion_tokens: 40, total_tokens: 60, cost: 0.0056, ...(step.usage ?? {}) };
+    const message = {
+      role: 'assistant',
+      content: step.text ?? null,
+      ...(step.refusal ? { refusal: step.refusal } : {}),
+      ...(step.annotations ? { annotations: step.annotations.map((a) => ({ type: 'url_citation', url_citation: { title: a.title, url: a.url } })) } : {}),
+    };
+    res.end(JSON.stringify({
+      id,
+      object: 'chat.completion',
+      model: step.model ?? rec.body?.model,
+      choices: [{ index: 0, finish_reason: step.finishReason ?? 'stop', message }],
+      ...(step.citations ? { citations: step.citations } : {}),
+      ...(step.searchResults ? { search_results: step.searchResults } : {}),
+      ...(usage ? { usage } : {}),
+    }));
+  }
+
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   return {
     base: `http://127.0.0.1:${server.address().port}/api/v1`,
@@ -123,11 +191,27 @@ export async function startMockOpenRouter() {
     setScript(fn) { script = fn; },
     /** Same step shape, for decision requests only. */
     setDecision(fn) { decide = fn; },
-    setKey(obj) { keyBody = { ...DEFAULT_KEY, ...obj }; },
-    setKeyStatus(status) { keyStatus = status; },
+    /**
+     * `fn(record, nthSearchRequest)` for search requests (body.model is the search model). A step may carry `text`,
+     * `searchResults`, `citations`, `annotations`, `usage` (merged, or null for none), `model`, `finishReason`,
+     * `refusal`, `delayMs`, `error: { status, body }`, or `raw` (sent as the body as is).
+     */
+    setSearch(fn) { searchStep = fn; },
+    /** With a Key: that Key's /key answer only. Without: the answer for every Key that has none of its own. */
+    setKey(obj, key) {
+      if (key === undefined) keyBody = { ...DEFAULT_KEY, ...obj };
+      else keyBodies.set(key, { ...DEFAULT_KEY, ...obj });
+    },
+    setKeyStatus(status, key) {
+      if (key === undefined) keyStatus = status;
+      else keyStatuses.set(key, status);
+    },
+    /** Every /key read, as { key, at }. */
+    keyReads: () => [...keyReads],
     setCatalog(list) { catalog = list; },
-    agentRequests: () => requests.filter((r) => !isDecisionRequest(r)),
+    agentRequests: () => requests.filter((r) => !isDecisionRequest(r) && !isSearchRequest(r)),
     decisionRequests: () => requests.filter(isDecisionRequest),
+    searchRequests: () => requests.filter(isSearchRequest),
     async stop() {
       server.closeAllConnections();
       await new Promise((r) => server.close(r));

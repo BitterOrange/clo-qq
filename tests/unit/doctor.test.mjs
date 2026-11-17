@@ -451,8 +451,15 @@ test('own: search_config agrees with config.json on and off, and the bot env hol
   assert.equal(applied.code, 0, applied.err);
   const on = doctor(root, {}, env);
   assert.deepEqual(on.failed, [], formatDoctor(on));
-  assert.equal(on.checks.find((c) => c.id === 'search_config').detail, '搜索打开（openrouter-sonar）');
+  assert.equal(on.checks.find((c) => c.id === 'search_config').detail, '搜索打开（openrouter-sonar），价格还没锁定，不会搜索（clo search lock）');
   assert.ok(on.checks.find((c) => c.id === 'bot_env').ok, 'the search Key is not a model Key, so bot_env still sees exactly one');
+  // With the search price locked (what `clo search lock` writes) and applied, the note goes.
+  const lockPath = join(root, 'versions.lock.json');
+  const lockFile = JSON.parse(readFileSync(lockPath, 'utf8'));
+  lockFile.models = { ...lockFile.models, locks: { ...lockFile.models?.locks, search: { id: 'perplexity/sonar-pro', price: { inputPerM: 3, outputPerM: 15, requestUsd: 0.005 } } } };
+  writeFileSync(lockPath, `${JSON.stringify(lockFile, null, 2)}\n`);
+  assert.equal((await clo(root, ['apply'], { env })).code, 0);
+  assert.equal(doctor(root, {}, env).checks.find((c) => c.id === 'search_config').detail, '搜索打开（openrouter-sonar）');
 
   // Turned off by hand and applied: off again, nothing left over.
   editConfig(root, (c) => ({ ...c, searchProvider: 'none' }));

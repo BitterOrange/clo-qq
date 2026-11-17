@@ -305,8 +305,11 @@ export function runDoctor(ctx, { level = FULL_LEVEL, run = spawnSync, packageRoo
       const has = Object.hasOwn(child, SEARCH_CHILD_KEY);
       if (on && !has) return `搜索打开了，可洛进程的环境里却没有 ${SEARCH_CHILD_KEY} 这个名字，搜索 Key 传不过去`;
       if (!on && has) return `搜索没有打开，可洛进程的环境里却有 ${SEARCH_CHILD_KEY}`;
-      if ((searchOfEffective(readJson(paths.effectiveJson)) !== null) !== on) return 'effective.json 的搜索设置与 config.json 不一致，运行 clo apply';
-      return { ok: true, detail: on ? `搜索打开（${searchProviderOf(cfg)}）` : '搜索关闭' };
+      const search = searchOfEffective(readJson(paths.effectiveJson));
+      if ((search !== null) !== on) return 'effective.json 的搜索设置与 config.json 不一致，运行 clo apply';
+      // Not a failure: with no locked price the ledger holds nothing for search, so nothing is searched.
+      const unpriced = on && !search.price ? '，价格还没锁定，不会搜索（clo search lock）' : '';
+      return { ok: true, detail: on ? `搜索打开（${searchProviderOf(cfg)}）${unpriced}` : '搜索关闭' };
     });
   }
   if (host) {

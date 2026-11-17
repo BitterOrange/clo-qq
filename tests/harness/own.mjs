@@ -20,7 +20,7 @@ import { ownArgs, ownEnv } from '../../src/cli/lifecycle.mjs';
 import { endSpawnedChild } from '../../src/cli/platform.mjs';
 import { cleanChildEnv } from './clean-env.mjs';
 import { IS_WINDOWS, linuxProcessList, linuxSockets } from './platform.mjs';
-import { FAKE_ANTHROPIC_KEY } from './fake-keys.mjs';
+import { FAKE_ANTHROPIC_KEY, FAKE_SEARCH_KEY } from './fake-keys.mjs';
 import {
   allocPort, APP_ID, cleanupTmp, deepMerge, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, makeTmp, NODE, OWNER, pidAlive,
   readJsonl, ROOT, TERMINAL, until,
@@ -32,7 +32,7 @@ export {
   allocPort, APP_ID, assertEveryPostLegal, BOT_MEMBER, cleanupTmp, DECISION_ID, deepMerge, FAKE_MODEL_KEY, FAKE_QQ_SECRET, GROUP_A, GROUP_B,
   MEMBER, MEMBER2, OWNER, pidAlive, PRIMARY_ID, readJsonl, ROOT, sleep, TERMINAL, until,
 } from './gateway.mjs';
-export { FAKE_ANTHROPIC_KEY } from './fake-keys.mjs';
+export { FAKE_ANTHROPIC_KEY, FAKE_SEARCH_KEY } from './fake-keys.mjs';
 export { keySent, view } from './model-view.mjs';
 
 // The provider this run names (CLO_TEST_PROVIDER, default openrouter), and the ids its mock lock carries. It applies
@@ -66,6 +66,11 @@ const MODEL_LOCKS = {
     },
   },
 };
+
+// The search lock a search stack runs on (models.locks.search). Mock figures, the same as the mock catalog's sonarRow.
+export const SEARCH_LOCK = Object.freeze({ id: 'perplexity/sonar-pro', price: Object.freeze({ inputPerM: 3, outputPerM: 15, requestUsd: 0.005 }) });
+// The search Key's daily limit a search stack's config names. An example for the mocks, not a recommended amount.
+const SEARCH_KEY_DAILY_LIMIT_USD = 0.5;
 
 // Decision D2's pair, as `clo ack hard-cap` records it.
 export const D2_ACK = Object.freeze({ kind: 'workspace_monthly', usd: 20, prepaidNoReload: true, at: '2000-01-01T00:00:00.000Z' });
@@ -178,15 +183,18 @@ export function processTree(pid) {
 // The environment clo start builds for the own runtime, from the same builder. Only the temp folders stay in the
 // test root, as in the Gateway harness. Built from an allowlist, so nothing from the shell that runs the tests leaks in.
 // On anthropic both model Keys are in the secrets, as both would be in .env: ownEnv must hand the bot only the active one.
-export function e2eOwnEnv(tmp, paths, extra = {}, kind = 'openrouter') {
+// search: the stack has search on, so the search Key is in the secrets and ownEnv passes it, as clo start would.
+export function e2eOwnEnv(tmp, paths, extra = {}, kind = 'openrouter', { search = false } = {}) {
   const parent = { CLO_TEST_ROOT: tmp, CLO_NET_GUARD_LOG: join(tmp, 'net-guard.jsonl') };
   for (const k of ['SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR', 'ComSpec', 'COMSPEC', 'PATHEXT', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'OS']) {
     if (process.env[k]) parent[k] = process.env[k];
   }
   const secrets = { CLO_QQ_APP_ID: APP_ID, CLO_QQ_APP_SECRET: FAKE_QQ_SECRET, CLO_CHAT_API_KEY: FAKE_MODEL_KEY };
   if (kind === 'anthropic') secrets[KEY_ENV.anthropic] = FAKE_ANTHROPIC_KEY;
+  if (search) secrets.CLO_SEARCH_API_KEY = FAKE_SEARCH_KEY;
+  const opts = search ? { secrets, kind, search: true } : kind === 'openrouter' ? { secrets } : { secrets, kind };
   return {
-    ...(kind === 'openrouter' ? ownEnv(paths, parent, { secrets }) : ownEnv(paths, parent, { secrets, kind })),
+    ...ownEnv(paths, parent, opts),
     APPDATA: join(tmp, 'appdata', 'Roaming'),
     LOCALAPPDATA: join(tmp, 'appdata', 'Local'),
     TEMP: join(tmp, 'temp'),
@@ -250,7 +258,18 @@ function anthropicProviders(cfg, model, ack) {
   if (ack) cfg.acks.hardCap = { anthropic: { ...ack } };
 }
 
-function businessConfig({ qq, model, port, groups, mode, over, kind, hardCapAck }) {
+// Search on, as `clo search enable` would leave config.json (the console step is not written yet): the provider, its
+// ack, the search Key's daily limit and the base of the mock that answers search. Each group's own switch is on unless
+// the group says search: false.
+function searchConfig(cfg, searchMock, groups) {
+  cfg.searchProvider = 'openrouter-sonar';
+  cfg.acks.search = { provider: 'openrouter-sonar', at: D2_ACK.at };
+  cfg.budget.searchKeyDailyLimitUsd = SEARCH_KEY_DAILY_LIMIT_USD;
+  cfg.search = { ...cfg.search, baseUrl: searchMock.base };
+  for (const [id, g] of Object.entries(groups)) cfg.qq.groups[id].search = g.search ?? true;
+}
+
+function businessConfig({ qq, model, port, groups, mode, over, kind, hardCapAck, searchMock }) {
   const cfg = JSON.parse(readFileSync(join(ROOT, 'config.example.json'), 'utf8'));
   cfg.runtime = 'own';
   cfg.mode = mode;
@@ -271,6 +290,7 @@ function businessConfig({ qq, model, port, groups, mode, over, kind, hardCapAck 
     for (const k of ['cooldownMinutes', 'perHour', 'perDay', 'displayNames']) if (g[k] !== undefined) cfg.qq.groups[id][k] = g[k];
     cfg.qq.owner.groupMember[id] = g.owners ?? [OWNER];
   }
+  if (searchMock) searchConfig(cfg, searchMock, groups);
   return deepMerge(cfg, over);
 }
 
@@ -286,25 +306,39 @@ const portOf = (base) => Number(new URL(base).port);
  *   hardCapAck: the ack written to config.json (default D2_ACK; null for none);
  *   hardCapKey: the Key the attestation is bound to (default the Key the bot gets; null for no binding);
  *   liftStartPause: see liftProviderRulesPause below (default true).
+ * search: true turns search on (own runtime only; docs/search-contract.md). On OpenRouter the one mock answers chat,
+ * decisions and search; on anthropic a second mock OpenRouter answers search, as decision D5 has it, and is
+ * stack.search. Either way stack.search is the mock that answers search, and the bot holds the search Key.
  */
 export async function startOwnStack({
   label, groups = { [GROUP_A]: {} }, mode = 'live', config = {}, effective = {}, script, decision, env = {}, ready = true, start = true, waitReady = true, editPrompt, entry,
-  provider, hardCapAck = D2_ACK, hardCapKey = FAKE_ANTHROPIC_KEY, liftStartPause = true,
+  provider, hardCapAck = D2_ACK, hardCapKey = FAKE_ANTHROPIC_KEY, liftStartPause = true, search = false,
 } = {}) {
   const kind = stackKind(provider);
   const tmp = makeTmp(`own-${label}`);
   const { startMockQq } = await import('./mock-qq.mjs');
   const qq = await startMockQq({ ready });
   const model = await startMockModel(kind);
+  let searchMock = null;
+  if (search) {
+    if (kind === 'openrouter') searchMock = model;
+    else {
+      const { startMockOpenRouter } = await import('./mock-openrouter.mjs');
+      searchMock = await startMockOpenRouter();
+    }
+  }
+  const stopSearchMock = async () => {
+    if (searchMock && searchMock !== model) await searchMock.stop();
+  };
   if (script) model.setScript(script);
   if (decision) model.setDecision(decision);
   const port = await allocPort();
 
   const paths = resolvePaths({ CLO_TEST_ROOT: tmp });
   for (const d of [paths.cloDir, paths.logsDir, paths.gatewayCwd, join(paths.runtime, 'pids')]) mkdirSync(d, { recursive: true });
-  const cfg = businessConfig({ qq, model, port, groups, mode, over: config, kind, hardCapAck });
+  const cfg = businessConfig({ qq, model, port, groups, mode, over: config, kind, hardCapAck, searchMock });
   writeFileSync(paths.configJson, `${JSON.stringify(cfg, null, 2)}\n`);
-  const built = buildEffective(cfg, { paths, modelsLock: MODEL_LOCKS[kind], env: { CLO_TEST_ROOT: tmp } });
+  const built = buildEffective(cfg, { paths, modelsLock: MODEL_LOCKS[kind], searchLock: search ? SEARCH_LOCK : null, env: { CLO_TEST_ROOT: tmp } });
   const eff = deepMerge(deepMerge(built, E2E_RELAXED), effective);
   const writeEffective = (next) => writeAtomic(paths.effectiveJson, JSON.stringify(next, null, 2));
   writeEffective(eff);
@@ -328,8 +362,8 @@ export async function startOwnStack({
     }
   }
 
-  const guardFile = writeAllowlistGuard(join(tmp, 'own-net-guard.mjs'), [portOf(qq.base), portOf(model.base)]);
-  const environment = e2eOwnEnv(tmp, paths, env, kind);
+  const guardFile = writeAllowlistGuard(join(tmp, 'own-net-guard.mjs'), [portOf(qq.base), portOf(model.base), ...(searchMock ? [portOf(searchMock.base)] : [])]);
+  const environment = e2eOwnEnv(tmp, paths, env, kind, { search: Boolean(search) });
   const args = e2eOwnArgs(tmp, guardFile, { entry });
   let bot = null;
   let generations = 0;
@@ -409,6 +443,8 @@ export async function startOwnStack({
     qq,
     model,
     kind,
+    /** The mock that answers search (the model mock on OpenRouter, a mock OpenRouter of its own on anthropic), or null. */
+    search: searchMock,
     /** The model ids this stack's lock carries. */
     ids: MODEL_IDS[kind],
     /** The provider-neutral view of a recorded model request (tests/harness/model-view.mjs). */
@@ -533,6 +569,7 @@ export async function startOwnStack({
       } finally {
         await qq.stop();
         await model.stop();
+        await stopSearchMock();
       }
       const alive = [...pids].filter(pidAlive);
       if (alive.length) throw new Error(`bot process still alive after stop: ${alive.join(',')}`);
@@ -544,6 +581,7 @@ export async function startOwnStack({
     await launch().catch(async (err) => {
       await qq.stop();
       await model.stop();
+      await stopSearchMock();
       throw err;
     });
   }

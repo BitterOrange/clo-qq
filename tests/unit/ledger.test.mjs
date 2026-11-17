@@ -150,7 +150,7 @@ test('spent reports tiers for the Shanghai day and rolls over at its midnight', 
   reserve(ledger, 'interject', 0.1);
   reserve(ledger, 'named', 0.2);
   reserve(ledger, 'addressed', 0.3);
-  assert.deepEqual(ledger.spent().byTier, { interject: 100000, named: 200000, addressed: 300000 });
+  assert.deepEqual(ledger.spent().byTier, { interject: 100000, named: 200000, addressed: 300000, search: 0 });
   clock.t = Date.UTC(2026, 10, 3, 15, 59, 59);
   assert.equal(ledger.spent().localMicros, 600000, 'still 23:59 in Shanghai');
   clock.t = Date.UTC(2026, 10, 3, 16, 0, 0);

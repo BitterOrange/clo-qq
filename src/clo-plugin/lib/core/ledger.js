@@ -7,6 +7,11 @@ import {
   PROVIDER_KINDS, hardCapControlKey, hardCapPauseKey, providerOfEffective,
 } from './providers/registry.js';
 import { pauseRank } from './store.js';
+import { searchWorstMicros } from './providers/cost.js';
+import {
+  SEARCH_HOLD_INPUT_TOKENS, SEARCH_OWNER_CLEARS, SEARCH_PAUSE_KEY, SEARCH_PAUSE_REASONS, SEARCH_ROW_PROVIDER, SEARCH_TIER,
+  searchDayCounter, searchEventCounter, searchOfEffective, searchPauseRank,
+} from './providers/searchRegistry.js';
 
 const KEY_TIMEOUT_MS = 8000;
 const TICK_MS = 60000;
@@ -52,6 +57,23 @@ export const DECISION_INPUT_TOKENS = 10500;
 
 export const usdToMicros = (usd) => Math.round(usd * 1e6);
 
+// Search (docs/search-contract.md section 7). The search Key's daily limit is search's only hard cap; these are local.
+const SEARCH_STREAK_KEY = 'search_fail_streak';
+const SEARCH_RETRY_MS = 10 * 60000;
+const SEARCH_RESIDUAL_COUNT = 'search_residual_over';
+const SEARCH_KEY_LIMIT_SEEN = 'search_key_limit_seen';
+const SEARCH_LIFTED_BY_READ = new Set(['key_limit', 'residual', 'key_read_failed']);
+// What a search row settles at when no figure came for it: its hold, never less (decision D3).
+const SEARCH_HOLD_SOURCE = 'search_hold';
+const searchDayExpiry = (at) => shanghaiDayStart(at) + 2 * DAY_MS;
+
+class SearchRefused extends Error {
+  constructor(reason) {
+    super(reason);
+    this.reason = reason;
+  }
+}
+
 // One primary call at its worst. The own runtime marks the system block for caching, and which part of the input that
 // is goes unmeasured here, so all of it is priced at the dearer of the input and cache-write rates. It makes no hidden
 // second call, so a required turn holds one call. With the host a required turn holds two: it calls again on NO_REPLY.
@@ -74,7 +96,9 @@ function microsOf(v) {
 // can be named. Its caps decide whether the Key can be read at all: an Anthropic Key is never sent to OpenRouter's /key.
 // Each call resolves the provider once, from the very eff it uses, so one call never mixes two reads of the file. On the
 // own runtime an unreadable file names no provider: the implicit OpenRouter entry would read and pause on the wrong Key.
-export function createLedger({ store, getEffective, fetch = globalThis.fetch, getKey, log = () => {}, now = Date.now, setTimer = setInterval, clearTimer = clearInterval, runtime = 'openclaw', getProvider = (eff) => (eff == null && runtime === 'own' ? null : providerOfEffective(eff)) }) {
+// getSearchKey: the search Key, on the own runtime with search on only. It is never the chat Key, and it is read only
+// against the search block's own base.
+export function createLedger({ store, getEffective, fetch = globalThis.fetch, getKey, getSearchKey = () => null, log = () => {}, now = Date.now, setTimer = setInterval, clearTimer = clearInterval, runtime = 'openclaw', getProvider = (eff) => (eff == null && runtime === 'own' ? null : providerOfEffective(eff)) }) {
   if (runtime !== 'openclaw' && runtime !== 'own') throw new TypeError('createLedger: runtime must be openclaw or own');
   const { q } = store;
   const provider = (eff) => {
@@ -91,6 +115,9 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
   // The rows the OpenRouter Key figure can speak for.
   const OPENROUTER_ROWS = "(provider IS NULL OR provider='openrouter')";
   let keyFailures = 0;
+  let searchKeyFailures = 0;
+  let searchStarted = false;
+  let lastSearchReadAt = 0;
   let timer = null;
   let liveStarted = false;
   let lastReadAt = 0;
@@ -120,7 +147,7 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
       effectiveMicros: Math.max(local, provider),
       localMicros: local,
       providerMicros: provider,
-      byTier: { interject: tiers.interject, named: tiers.named, addressed: tiers.addressed },
+      byTier: { interject: tiers.interject, named: tiers.named, addressed: tiers.addressed, search: tiers.search ?? 0 },
       unsettled: unsettled.n,
       unsettledMicros: unsettled.m,
     };
@@ -159,8 +186,17 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     });
   }
 
-  function reserve({ tier, category, heldMicros, eventKey = null, model = null }) {
+  // provider: only 'search', and only with the search tier, which always takes it. Every other row carries the kind
+  // spending now. A search row needs search on, no search pause, and the whole day's spend within searchUsd.
+  function reserve(args) {
+    return reserveRow(args, { searchAdmitted: false });
+  }
+
+  // searchAdmitted: the caller has already let this search row past the search pause (claimSearch, in its transaction).
+  function reserveRow({ tier, category, heldMicros, eventKey = null, model = null, provider: providerOverride }, { searchAdmitted }) {
     if (!Number.isInteger(heldMicros) || heldMicros <= 0) throw new TypeError('ledger.reserve: heldMicros must be a positive integer');
+    if (providerOverride !== undefined && providerOverride !== SEARCH_ROW_PROVIDER) throw new TypeError('ledger.reserve: provider can only be search');
+    if (providerOverride === SEARCH_ROW_PROVIDER && tier !== SEARCH_TIER) throw new TypeError('ledger.reserve: the search provider goes with the search tier');
     return store.tx(() => {
       const eff = getEffective();
       if (!eff) return { ok: false, reason: 'total' };
@@ -180,13 +216,19 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
         if (after > usdToMicros(b.namedUsd)) return { ok: false, reason: 'total' };
       } else if (tier === 'addressed') {
         if (after > usdToMicros(b.addressedUsd)) return { ok: false, reason: 'total' };
+      } else if (tier === SEARCH_TIER) {
+        // Search is never on under the OpenClaw runtime, whatever the file says.
+        if (runtime !== 'own' || !searchOfEffective(eff)) return { ok: false, reason: 'search_off' };
+        if (!searchAdmitted && store.getControl(SEARCH_PAUSE_KEY) !== null) return { ok: false, reason: 'search_paused' };
+        if (after > usdToMicros(b.searchUsd)) return { ok: false, reason: 'total' };
       } else {
         return { ok: false, reason: 'tier' };
       }
       const id = randomUUID();
+      const column = tier === SEARCH_TIER ? SEARCH_ROW_PROVIDER : providerColumn(p);
       q(`INSERT INTO reservations(id, local_day, utc_day, tier, category, held_micros, status, event_key, model, run_gen, created_at, provider)
          VALUES (?, ?, ?, ?, ?, ?, 'held', ?, ?, ?, ?, ?)`)
-        .run(id, shanghaiDay(at), utcDay(at), tier, category, heldMicros, eventKey, model, store.runGen, at, providerColumn(p));
+        .run(id, shanghaiDay(at), utcDay(at), tier, category, heldMicros, eventKey, model, store.runGen, at, column);
       return { ok: true, id };
     });
   }
@@ -194,6 +236,12 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
   function holdMicros(kind) {
     const eff = getEffective();
     if (!eff) throw new Error('ledger: no effective config');
+    // One search call at its worst: held prompt, the output cap and the per-call fee (docs/search-contract.md 7).
+    if (kind === 'search') {
+      const search = searchOfEffective(eff);
+      if (!search) throw new Error('ledger: search is off');
+      return searchWorstMicros({ inputTokens: SEARCH_HOLD_INPUT_TOKENS, maxTokens: search.maxTokens }, search.price);
+    }
     const { primary, decision } = eff.models;
     if (kind === 'decision') {
       if (!decision.price) throw new Error('ledger: decision price is not locked');
@@ -542,12 +590,262 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
     return out;
   }
 
+  // ---- Search ----
+
+  // A lower rank never replaces a higher one; an equal rank replaces. Search only: paid_paused is not touched.
+  function pauseSearch(reason, by = 'ledger') {
+    if (!SEARCH_PAUSE_REASONS.includes(reason)) throw new TypeError('ledger.pauseSearch: unknown reason');
+    return store.tx(() => {
+      const old = store.getControl(SEARCH_PAUSE_KEY);
+      if (old !== null && searchPauseRank(old) > searchPauseRank(reason)) return false;
+      if (old === reason) return false;
+      store.setControl(SEARCH_PAUSE_KEY, reason, String(by).slice(0, 32));
+      store.addAlert('search_paused', { reason });
+      log('search_paused', { reason });
+      return true;
+    });
+  }
+
+  function liftSearch(reason) {
+    store.delControl(SEARCH_PAUSE_KEY);
+    log('search_resumed', { reason });
+  }
+
+  // Inside a claim's transaction, so a claim refused later gives the trial back. After a failure pause, one trial per
+  // wait; it restarts the timer, so a crash during it still waits. No other search pause admits anything.
+  function admitSearch() {
+    const reason = store.getControl(SEARCH_PAUSE_KEY);
+    if (reason === null) return true;
+    if (reason !== 'fail') return false;
+    const wait = getEffective()?.budget?.searchRetryMs ?? SEARCH_RETRY_MS;
+    if (now() - store.controlUpdatedAt(SEARCH_PAUSE_KEY) < wait) return false;
+    store.setControl(SEARCH_PAUSE_KEY, 'fail', 'ledger');
+    return true;
+  }
+
+  // One search call: the per-answer count, the day's count and the hold commit together, or none of them do.
+  // -> { ok: true, id, heldMicros } | { ok: false, reason } with reason one of search_off, search_paused, paid_paused,
+  //    hard_cap_paused, price, answer_cap, day_cap, total, provider.
+  function claimSearch({ eventKey, model = null } = {}) {
+    if (typeof eventKey !== 'string' || !eventKey) throw new TypeError('ledger.claimSearch: eventKey');
+    const eff = getEffective();
+    const search = runtime === 'own' ? searchOfEffective(eff) : null;
+    if (!search) return { ok: false, reason: 'search_off' };
+    let heldMicros;
+    try {
+      heldMicros = holdMicros('search');
+    } catch {
+      return { ok: false, reason: 'price' };
+    }
+    const at = now();
+    try {
+      return store.tx(() => {
+        if (store.getControl('paid_paused') !== null) throw new SearchRefused('paid_paused');
+        if (!admitSearch()) throw new SearchRefused('search_paused');
+        if (!store.bumpCounter(searchEventCounter(eventKey), at + DAY_MS, search.perAnswer).ok) throw new SearchRefused('answer_cap');
+        if (!store.bumpCounter(searchDayCounter(shanghaiDay(at)), searchDayExpiry(at), search.perDay).ok) throw new SearchRefused('day_cap');
+        // admitSearch has decided about the search pause, a failure pause's trial included.
+        const r = reserveRow({ tier: SEARCH_TIER, category: 'search', heldMicros, eventKey, model: model ?? search.model, provider: SEARCH_ROW_PROVIDER }, { searchAdmitted: true });
+        if (!r.ok) throw new SearchRefused(r.reason);
+        return { ok: true, id: r.id, heldMicros };
+      });
+    } catch (err) {
+      if (err instanceof SearchRefused) return { ok: false, reason: err.reason };
+      throw err;
+    }
+  }
+
+  // Settles one search row. Usage unknown leaves it unsettled, counted at its hold. A figure above the hold settles at
+  // the figure and pauses search: the hold was wrong, and only the owner lifts that.
+  function settleSearch(id, { actualMicros, source, model } = {}) {
+    const row = q("SELECT held_micros AS held, provider FROM reservations WHERE id=? AND status IN ('held','unsettled')").get(id);
+    if (!row || row.provider !== SEARCH_ROW_PROVIDER) return { status: 'unchanged' };
+    const out = settle(id, { actualMicros, source, model });
+    if (out.status === 'settled' && actualMicros > row.held) {
+      store.addAlert('search_cost_above_hold', { actualMicros, heldMicros: row.held });
+      pauseSearch('cost_above_hold');
+    }
+    return out;
+  }
+
+  // Search failures stop search only: chat goes on. A 402, or one of OpenRouter's limit sources, is the search Key's
+  // limit or the account's credits: search pauses until a read of its Key shows room.
+  function noteSearchError({ httpStatus = null, limitSource = null } = {}) {
+    if (httpStatus === 402 || (httpStatus === 403 && LIMIT_SOURCES.has(limitSource))) {
+      pauseSearch('key_limit');
+      return;
+    }
+    store.tx(() => {
+      const { value } = store.bumpCounter(SEARCH_STREAK_KEY, now() + STREAK_TTL_MS);
+      if (store.getControl(SEARCH_PAUSE_KEY) === 'fail') {
+        // A failed trial: the wait starts again.
+        store.setControl(SEARCH_PAUSE_KEY, 'fail', 'ledger');
+      } else if (value >= streakLimit()) {
+        pauseSearch('fail');
+      }
+    });
+  }
+
+  function noteSearchOk() {
+    store.tx(() => {
+      q('DELETE FROM counters WHERE key=?').run(SEARCH_STREAK_KEY);
+      if (store.getControl(SEARCH_PAUSE_KEY) === 'fail') liftSearch('fail');
+    });
+  }
+
+  // The owner says the cause is dealt with: cost_above_hold (after a look at the price lock) and fail only. The others
+  // end with a read of the search Key.
+  function clearSearchPause(by = 'cli') {
+    return store.tx(() => {
+      const reason = store.getControl(SEARCH_PAUSE_KEY);
+      if (!SEARCH_OWNER_CLEARS.includes(reason)) return { cleared: false, reason };
+      liftSearch(reason);
+      q('DELETE FROM counters WHERE key=?').run(SEARCH_STREAK_KEY);
+      log('search_pause_cleared', { reason, by: String(by).slice(0, 32) });
+      return { cleared: true, reason };
+    });
+  }
+
+  // Unsettled search rows that no figure has settled after the wait settle at their hold (decision D3): the light
+  // reconciliation never attributes the search Key's figure to rows, so waiting longer cannot settle them. Over-counts,
+  // never under-counts. Then a settlement pause with nothing left unsettled lifts as it would on any settlement.
+  function settleExpiredSearch(at = now()) {
+    const delay = getEffective()?.budget?.unsettledClearMs ?? UNSETTLED_CLEAR_MS;
+    return store.tx(() => {
+      const n = Number(q(`UPDATE reservations SET status='settled', actual_micros=held_micros, source=?, settled_at=?
+                          WHERE status='unsettled' AND provider=? AND created_at<=?`).run(SEARCH_HOLD_SOURCE, at, SEARCH_ROW_PROVIDER, at - delay).changes);
+      if (n > 0) {
+        log('settle_search_hold', { count: n });
+        resumeIfSettled();
+      }
+      return n;
+    });
+  }
+
+  async function readSearchKey(eff) {
+    const search = searchOfEffective(eff);
+    if (runtime !== 'own' || !search) throw new Error('search key read unsupported');
+    const key = getSearchKey();
+    if (!key) throw new Error('search key read failed: no key');
+    const res = await fetch(`${search.baseUrl}/key`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${key}` },
+      redirect: 'error',
+      signal: AbortSignal.timeout(KEY_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`search key read failed: HTTP ${res.status}`);
+    const data = (await res.json())?.data;
+    const usageDailyMicros = microsOf(data?.usage_daily);
+    // The light reconciliation stands on this figure. Without it nothing can be compared, which is a failed read.
+    if (usageDailyMicros === null) throw new Error('search key read failed: no daily usage figure');
+    return {
+      limitMicros: microsOf(data.limit),
+      remainingMicros: microsOf(data.limit_remaining),
+      limitReset: data.limit_reset ?? null,
+      usageDailyMicros,
+    };
+  }
+
+  // What the local search rows of a UTC day come to: settled at their figure, released at 0, the rest at their hold.
+  function searchLocalUtc(day) {
+    return q(`SELECT COALESCE(SUM(CASE status WHEN 'settled' THEN actual_micros WHEN 'released' THEN 0 ELSE held_micros END), 0) AS m
+              FROM reservations WHERE utc_day=? AND provider=?`).get(day, SEARCH_ROW_PROVIDER).m;
+  }
+
+  // Says so once per difference: the search Key's limit should be budget.searchKeyDailyLimitUsd, reset daily.
+  function noteSearchKeyLimit(k, eff) {
+    const configured = eff.budget?.searchKeyDailyLimitUsd;
+    const wanted = configured === null || configured === undefined ? null : usdToMicros(configured);
+    const reason = wanted === null ? null : k.limitMicros !== wanted ? 'amount' : k.limitReset !== 'daily' ? 'reset' : null;
+    if (reason === null) {
+      store.delControl(SEARCH_KEY_LIMIT_SEEN);
+      return;
+    }
+    const seen = `${reason}:${wanted}:${k.limitMicros}`;
+    if (store.getControl(SEARCH_KEY_LIMIT_SEEN) === seen) return;
+    store.setControl(SEARCH_KEY_LIMIT_SEEN, seen, 'ledger');
+    store.addAlert('search_key_limit_mismatch', { reason, actualMicros: k.limitMicros });
+    log('search_key_limit_mismatch', { reason });
+  }
+
+  // The light reconciliation (decision D3): the search Key's figure for the UTC day against what the local search rows
+  // of that day come to. Nothing is attributed and nothing is written to key_snapshots. A gap above the threshold twice
+  // in a row pauses search; a Key with no room left pauses search; a clean read lifts what a read can lift.
+  async function reconcileSearch(at = now(), { atStart = false } = {}) {
+    const startEff = getEffective();
+    if (runtime !== 'own' || !searchOfEffective(startEff) || !getSearchKey()) return { ok: false, unsupported: true };
+    const readStartedAt = now();
+    let k;
+    try {
+      k = await readSearchKey(startEff);
+    } catch {
+      searchKeyFailures += 1;
+      log('search_key_read_failed', { count: searchKeyFailures });
+      if (atStart || searchKeyFailures >= 2) pauseSearch('key_read_failed');
+      return { ok: false, gapMicros: null, paused: store.getControl(SEARCH_PAUSE_KEY) };
+    }
+    searchKeyFailures = 0;
+    lastSearchReadAt = at;
+    const eff = getEffective();
+    if (!searchOfEffective(eff)) return { ok: false, gapMicros: null, paused: store.getControl(SEARCH_PAUSE_KEY) };
+    return store.tx(() => {
+      noteSearchKeyLimit(k, eff);
+      const local = searchLocalUtc(utcDay(at));
+      const gapMicros = k.usageDailyMicros - local;
+      const threshold = Math.max(usdToMicros(eff.budget.residualMinUsd), Math.ceil(eff.budget.residualPct * k.usageDailyMicros));
+      const over = gapMicros > threshold;
+      const overCount = over ? Number(store.getControl(SEARCH_RESIDUAL_COUNT) ?? 0) + 1 : 0;
+      store.setControl(SEARCH_RESIDUAL_COUNT, overCount, 'ledger');
+      if (overCount >= 2) pauseSearch('residual');
+      const exhausted = k.remainingMicros !== null && k.remainingMicros <= 0;
+      if (exhausted) pauseSearch('key_limit');
+      const reason = store.getControl(SEARCH_PAUSE_KEY);
+      const pausedDuringRead = store.controlUpdatedAt(SEARCH_PAUSE_KEY) > readStartedAt;
+      if (SEARCH_LIFTED_BY_READ.has(reason) && !over && !exhausted && !pausedDuringRead) liftSearch(reason);
+      return { ok: true, gapMicros, localMicros: local, providerMicros: k.usageDailyMicros, paused: store.getControl(SEARCH_PAUSE_KEY) };
+    });
+  }
+
+  // Each tick: expired search rows settle at their hold, then the search Key is read at the first live tick, after any
+  // search row since the last read, and every ten minutes. Off, or with no search Key, nothing is read.
+  async function searchTick() {
+    const at = now();
+    settleExpiredSearch(at);
+    const eff = getEffective();
+    if (!eff || eff.mode !== 'live' || runtime !== 'own' || !searchOfEffective(eff) || !getSearchKey()) return;
+    if (!searchStarted) {
+      searchStarted = true;
+      await reconcileSearch(at, { atStart: true });
+      return;
+    }
+    const fresh = q('SELECT COUNT(*) AS n FROM reservations WHERE provider=? AND (created_at>=? OR settled_at>=?)').get(SEARCH_ROW_PROVIDER, lastSearchReadAt, lastSearchReadAt).n;
+    const due = at - lastSearchReadAt >= CONNECTED_READ_MS;
+    const open = q("SELECT COUNT(*) AS n FROM reservations WHERE provider=? AND status IN ('held','unsettled')").get(SEARCH_ROW_PROVIDER).n;
+    if (fresh > 0 || due || open > 0 || SEARCH_LIFTED_BY_READ.has(store.getControl(SEARCH_PAUSE_KEY))) await reconcileSearch(at);
+  }
+
+  // What status shows for search: the pause, today's count and spend, and the limits it runs under.
+  function searchSnapshot(at = now()) {
+    const eff = getEffective();
+    const search = searchOfEffective(eff);
+    return {
+      on: runtime === 'own' ? search !== null : false,
+      paused: store.getControl(SEARCH_PAUSE_KEY),
+      countToday: store.peekCounter(searchDayCounter(shanghaiDay(at))),
+      perDay: search?.perDay ?? null,
+      spentMicros: store.spendByTier(shanghaiDay(at)).search ?? 0,
+      searchUsd: eff?.budget?.searchUsd ?? null,
+      keyDailyLimitUsd: eff?.budget?.searchKeyDailyLimitUsd ?? null,
+      priceLocked: Boolean(search?.price),
+    };
+  }
+
   function checkKind(kind) {
     if (!PROVIDER_KINDS.includes(kind)) throw new TypeError('ledger: unknown provider kind');
   }
 
   function runTick() {
-    tick().catch(() => log('reconcile_error', {}));
+    tick().catch(() => log('reconcile_error', {})).then(() => searchTick()).catch(() => log('search_reconcile_error', {}));
   }
 
   // The Key is shared, so a limit error from either path stops all paid work. A bare 402 still means no money.
@@ -693,6 +991,20 @@ export function createLedger({ store, getEffective, fetch = globalThis.fetch, ge
 
     rebaseKey,
     resetForProviderSwitch,
+
+    // Search (own runtime only).
+    claimSearch,
+    settleSearch,
+    releaseSearch: release,
+    noteSearchError,
+    noteSearchOk,
+    pauseSearch,
+    searchPaused: () => store.getControl(SEARCH_PAUSE_KEY),
+    clearSearchPause,
+    settleExpiredSearch,
+    reconcileSearch,
+    searchTick,
+    searchSnapshot,
 
     // The hard-cap pause (contract 8.1). Not a paid_paused reason: it lives in a control per kind, so it never
     // replaces a lower pause, lifting it never clears one, and it binds only while its kind spends.

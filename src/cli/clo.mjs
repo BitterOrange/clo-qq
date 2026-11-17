@@ -4,11 +4,14 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { activeKindOf, ConfigError, livePreconditions, OPENROUTER_BASE_URL, providerOfConfig, runtimeOf } from '../clo-plugin/lib/core/config.js';
 import { checkSentinels, loadPolicy, sha256Hex } from '../clo-plugin/lib/core/contentPolicy.js';
+import { shanghaiDay } from '../clo-plugin/lib/core/ids.js';
 import { createLedger } from '../clo-plugin/lib/core/ledger.js';
-import { anthropicModelChecks, callWorstMicros, checkAnthropicModels, fetchCatalog, lockFromCatalog, lockFromPriceBook, resolveSelector, validateModels } from '../clo-plugin/lib/core/models.js';
+import { anthropicModelChecks, callWorstMicros, checkAnthropicModels, fetchCatalog, lockFromCatalog, lockFromPriceBook, lockSearchFromCatalog, resolveSelector, validateModels } from '../clo-plugin/lib/core/models.js';
+import { searchWorstMicros } from '../clo-plugin/lib/core/providers/cost.js';
+import { SEARCH_DEFAULTS, SEARCH_HOLD_INPUT_TOKENS, SEARCH_MODEL, SEARCH_OFF, SEARCH_PAUSE_KEY, searchDayCounter, searchOnInConfig } from '../clo-plugin/lib/core/providers/searchRegistry.js';
 import { ACTIVE_PROVIDER_CONTROL, hardCapAckProblems, hardCapAckRefusal, hardCapControlKey, KEY_ENV, liveStartCheck, providerRecord, providerRulesRecorded } from '../clo-plugin/lib/core/providers/registry.js';
 import { extractPolicySection, writeAtomic } from '../clo-plugin/lib/core/render.js';
-import { apply as applyRender, assertApplicable as checkApplicable, assertNoEnvProxy, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, readPriceBook, renderAll, requiredHoldMicros, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock } from './common.mjs';
+import { apply as applyRender, assertApplicable as checkApplicable, assertNoEnvProxy, assertValid, CliError, forceEffectiveDryRun, groupByLabel, lockMatches, makeContext, maskId, readConfig, readEffective, readModelsLock, readPriceBook, readSearchLock, renderAll, requiredHoldMicros, usableLock, usd, withStore, withStoreAsync, writeConfig, writeModelsLock, writeSearchLock } from './common.mjs';
 import { CONFIG_LEVEL, formatDoctor, FULL_LEVEL, runDoctor } from './doctor.mjs';
 import { assertRuntimeSwitchAllowed, assertTestModeWired, inspectGateway, inspectStartLock, parseEnvFile, readPidRecord, recordRuntime, renamedEnvNames, renamedKeyHint, requireSecrets, RUNTIME_LABEL, startLockFile, startRuntime, stopGateway, withStartLock } from './lifecycle.mjs';
 import { collectStatus, formatStatus, RESIDUAL_EXIT, residualBehind } from './status.mjs';
@@ -25,13 +28,14 @@ const USAGE = `用法：clo <命令>
         set <群> [--interject on|off] [--name-mention on|off] [--display-names on|off] | notice-done <群>
   owner add <群> --id <成员ID>
   targets arm --minutes <n> | list [--reveal] | clear
-  budget show | accept-unsettled | clear-pause
+  budget show | accept-unsettled | clear-pause | clear-search-pause
   policy test <文件> | rule disable <规则ID> --reason <原因> | hash
   model show | set-primary <id> | set-decision <id> | refresh | check
         lock --provider <接口>               按价格表锁定这个接口的模型价格
         [--confirm-price] [--qq-platform-notified]
   provider list | show | add anthropic
            use <接口> --confirm [--qq-platform-notified]   换模型接口，算一次模型变更
+  search lock [--confirm-price]       从模型目录锁定搜索模型的价格（只在 own 运行时用）
   ack identity | q0 | d3 <决定> | terminal
       hard-cap <接口> --kind workspace_monthly --usd <金额> --prepaid-no-reload [--confirm]
   doctor [--config-only] [--json]
@@ -505,6 +509,29 @@ function cmdBudget(ctx, { positional }) {
       }
       const note = hardCapNote(snap);
       if (note) ctx.out(note);
+      // Search: while it is on, and while anything of it is left. Its only hard cap is the search Key's daily limit.
+      const sr = effective?.search ?? null;
+      const searchPaused = store.getControl(SEARCH_PAUSE_KEY);
+      const searchSpent = s.byTier.search ?? 0;
+      if (sr || searchPaused !== null || searchSpent > 0) {
+        const count = store.peekCounter(searchDayCounter(shanghaiDay(ctx.now())));
+        ctx.out(`搜索：今日 ${count}${sr ? `/${sr.perDay}` : ''} 次，花费 ${usd(searchSpent)}${b ? ` / 全部到 $${b.searchUsd} 停` : ''}。搜索暂停：${searchPaused ?? '否'}`);
+        if (sr) ctx.out(`配置写的搜索 Key 日限额：$${b?.searchKeyDailyLimitUsd}。这是搜索唯一的硬上限，由 OpenRouter 执行；本地只按 UTC 日粗略对照这个 Key 的当日用量，不逐笔对账。`);
+      }
+      return 0;
+    }
+    if (sub === 'clear-search-pause') {
+      const { cleared, reason } = ledger.clearSearchPause('cli');
+      if (reason === null) {
+        ctx.out('现在没有搜索暂停。');
+        return 0;
+      }
+      if (!cleared) {
+        ctx.out(`搜索暂停 ${reason} 由读取搜索 Key 解除（读到有余额、读数和本地记录对得上），这个命令不动它。`);
+        return 1;
+      }
+      const why = reason === 'cost_above_hold' ? '先核对搜索模型的锁定价格（clo search lock），预留比实际少的话还会再暂停。' : '下一次搜索失败会重新计数。';
+      ctx.out(`已解除搜索暂停 ${reason}。${why}`);
       return 0;
     }
     if (sub === 'accept-unsettled') {
@@ -731,6 +758,38 @@ function lockFromBook(ctx, cfg, flags) {
   if (changed && active && cfg.qq?.enabled) ctx.out('已记录：你确认向平台报告了这次模型变更（QQ 协议 §4.2）。');
   if (!active) ctx.out(`这个接口现在没在用。切换用 clo provider use ${name} --confirm，那也算一次模型变更。`);
   return 0;
+}
+
+// --- search ---
+
+// `clo search lock [--confirm-price]`: the search model's price from the OpenRouter catalog, a read with no Key, into
+// models.locks.search. A price, not a model change: turning search on is the model change. While search is on the
+// effective file is rendered again, so the running process's holds use the new price at its next read.
+async function lockSearch(ctx, cfg, flags) {
+  const provider = cfg.searchProvider && cfg.searchProvider !== SEARCH_OFF ? cfg.searchProvider : 'openrouter-sonar';
+  const model = SEARCH_MODEL[provider];
+  const catalog = await loadCatalog(ctx, cfg);
+  const previous = readSearchLock(ctx.paths);
+  const confirmPrice = Boolean(flags['--confirm-price']);
+  const r = lockSearchFromCatalog(model, catalog, { previous, confirmPrice, maxOutputPerM: cfg.budget?.maxOutputUsdPerMtok ?? undefined });
+  if (!r.ok) throw new CliError(`锁定没有通过：\n${r.errors.map((e) => `  ${e.path}: ${e.message}`).join('\n')}`);
+  const { lock } = r;
+  const on = searchOnInConfig(cfg);
+  if (on) assertApplicable(ctx, cfg);
+  writeSearchLock(ctx, lock);
+  if (on) apply(ctx, cfg);
+  ctx.log('cli_search_lock', { model: lock.id });
+  ctx.out(`已锁定搜索模型 ${lock.id}：输入 $${lock.price.inputPerM}/百万 token，输出 $${lock.price.outputPerM}/百万 token，每次调用另加 $${lock.price.requestUsd}。目录里按次收费的字段名还没有用真实请求核实。`);
+  ctx.out(`单次搜索最坏预留：${usd(searchWorstMicros({ inputTokens: SEARCH_HOLD_INPUT_TOKENS, maxTokens: cfg.search?.maxTokens ?? SEARCH_DEFAULTS.maxTokens }, lock.price))}。`);
+  if (!on) ctx.out('搜索现在没有打开，这只记下了价格。');
+  return 0;
+}
+
+async function cmdSearch(ctx, { positional, flags }) {
+  const sub = positional[0];
+  const cfg = readConfig(ctx);
+  if (sub === 'lock') return lockSearch(ctx, cfg, flags);
+  throw new CliError(USAGE);
 }
 
 async function cmdModel(ctx, { positional, flags }) {
@@ -1210,6 +1269,7 @@ const COMMANDS = {
   model: cmdModel,
   ack: cmdAck,
   provider: cmdProvider,
+  search: cmdSearch,
   doctor: cmdDoctor,
   start: cmdStart,
   stop: cmdStop,

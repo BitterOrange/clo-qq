@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import {
-  COST_ABOVE_COMPUTED_ALERT, computeMicros, FAST_MULTIPLIER, GEO_US_MULTIPLIER, REPORTED_ABOVE_COMPUTED_MARGIN, settleMicros, usageMicros, worstCaseMicros,
+  COST_ABOVE_COMPUTED_ALERT, computeMicros, FAST_MULTIPLIER, GEO_US_MULTIPLIER, REPORTED_ABOVE_COMPUTED_MARGIN, searchMicros, searchWorstMicros, settleMicros, usageMicros, worstCaseMicros,
 } from '../../src/clo-plugin/lib/core/providers/cost.js';
 import { usageMicros as gateUsageMicros } from '../../src/clo-plugin/lib/core/gate.js';
 import { createLedger } from '../../src/clo-plugin/lib/core/ledger.js';
@@ -317,4 +317,31 @@ test('own-runtime OpenRouter settlement keeps the ledger reconcilable: a lost bi
   const computed = computeMicros(usage, price);
   assert.equal(computed.micros, 40000);
   assert.deepEqual(await lostRowAfterReplies(computed), { status: 'settled', micros: 0, source: 'key_delta_none' });
+});
+
+// ---- Search (docs/search-contract.md section 7) ----
+const SONAR = { inputPerM: 3, outputPerM: 15, requestUsd: 0.005 };
+
+test('searchMicros: the reported cost first; without one, tokens at the lock plus the per-call fee; neither is never 0', () => {
+  assert.deepEqual(searchMicros({ input: 20, output: 40, costUsd: 0.0056 }, SONAR), { micros: 5600, source: 'model.usage' });
+  // 20 x 3 + 40 x 15 + 5000 = 5660.
+  assert.deepEqual(searchMicros({ input: 20, output: 40, cacheRead: 0, cacheWrite: 0, costUsd: null }, SONAR), { micros: 5660, source: 'computed' });
+  assert.deepEqual(searchMicros({ input: 20, output: 40, costUsd: 0 }, SONAR), { micros: 5660, source: 'computed' }, 'a reported 0 is not free');
+  assert.deepEqual(searchMicros({ input: 10, output: 0, cacheRead: 10, costUsd: null }, SONAR), { micros: 5060, source: 'computed' }, 'cached tokens at the input rate');
+  assert.equal(searchMicros({ input: 20, output: 40 }, null), null, 'no lock, no figure');
+  assert.equal(searchMicros({ input: 20, output: 40 }, { inputPerM: 3, outputPerM: 15 }), null, 'a lock without its fee prices nothing');
+  assert.equal(searchMicros({ input: 'x', output: 40 }, SONAR), null, 'an unreadable count is never read as 0');
+  assert.equal(searchMicros({ output: 40 }, SONAR), null);
+  assert.equal(searchMicros({ input: 0, output: 0 }, SONAR), null, 'no tokens and no cost: unknown, not just the fee');
+  assert.equal(searchMicros(null, SONAR), null);
+});
+
+test('searchWorstMicros: the held prompt, the output cap and the fee; it throws rather than read a gap as 0', () => {
+  assert.equal(searchWorstMicros({ inputTokens: 4000, maxTokens: 600 }, SONAR), 26000);
+  assert.equal(searchWorstMicros({ inputTokens: 4000, maxTokens: 600 }, { ...SONAR, requestUsd: 0 }), 21000);
+  assert.throws(() => searchWorstMicros({ inputTokens: 4000, maxTokens: 600 }, null), /not locked/);
+  assert.throws(() => searchWorstMicros({ inputTokens: 4000, maxTokens: 600 }, { inputPerM: 3, outputPerM: 15 }), /not locked/);
+  assert.throws(() => searchWorstMicros({ inputTokens: undefined, maxTokens: 600 }, SONAR), TypeError);
+  // The bound is above any computed settlement within it, so only a reported figure can pass the hold.
+  assert.ok(searchMicros({ input: 4000, output: 600, costUsd: null }, SONAR).micros <= searchWorstMicros({ inputTokens: 4000, maxTokens: 600 }, SONAR));
 });

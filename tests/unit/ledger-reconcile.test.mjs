@@ -130,6 +130,44 @@ test('spend already settled locally is not attributed twice', async () => {
   store.close();
 });
 
+// Search rows (provider 'search') are spent on the search Key: the chat Key's figure never explains them, never
+// settles them, and never settles one at zero. Raw rows stand in for the search claim, which needs the own runtime.
+test('search rows explain nothing on the chat Key, and its reads never settle them', async () => {
+  const { ledger, store, key, clock, eff } = setup();
+  const searchRow = (id, status, actual = null) => store.q(`INSERT INTO reservations(id, local_day, utc_day, tier, category, held_micros, actual_micros, status, source, event_key, model, run_gen, created_at, settled_at, provider)
+    VALUES (?, '2026-11-03', '2026-11-03', 'search', 'search', 26000, ?, ?, ?, 'S', 'perplexity/sonar-pro', 'g', ?, ?, 'search')`).run(id, actual, status, actual === null ? null : 'model.usage', clock.t, actual === null ? null : clock.t);
+  eff.budget.unsettledClearMs = 60000;
+  eff.budget.unsettledClearReads = 1;
+  key.usage = 1;
+  await ledger.reconcile(clock.t);
+  clock.t += 1;
+  searchRow('s-settled', 'settled', 100000);
+  searchRow('s-open', 'unsettled');
+  clock.t += 120000;
+  key.usage = 1.1;
+  await ledger.reconcile(clock.t);
+  const extra = store.q("SELECT * FROM reservations WHERE category='unattributed'").all();
+  assert.equal(extra.length, 1, 'the settled search row explains none of the chat Key\'s figure');
+  assert.equal(extra[0].actual_micros, 100000);
+  assert.equal(row(store, 's-open').status, 'unsettled', 'the chat Key\'s delta does not settle a search row');
+  clock.t += 120000;
+  await ledger.reconcile(clock.t);
+  assert.equal(row(store, 's-open').status, 'unsettled', 'nor does a clean chat read settle it at zero');
+
+  // Control: a chat row of the same amount does explain it.
+  const c = setup();
+  c.key.usage = 1;
+  await c.ledger.reconcile(c.clock.t);
+  const { id } = c.ledger.reserve({ tier: 'addressed', category: 'reply', heldMicros: 360000, eventKey: 'E' });
+  c.ledger.settle(id, { actualMicros: 100000, source: 'model.usage' });
+  c.clock.t += 120000;
+  c.key.usage = 1.1;
+  await c.ledger.reconcile(c.clock.t);
+  assert.equal(c.store.q("SELECT COUNT(*) AS n FROM reservations WHERE category='unattributed'").get().n, 0);
+  store.close();
+  c.store.close();
+});
+
 test('a call in flight is not read as unexplained', async () => {
   const { ledger, store, key, clock } = setup();
   key.usage = 1;

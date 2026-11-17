@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { activeKindOf, buildEffective, ConfigError, createEffectiveReader, liveConfigProblems, loadBusinessConfig, lockFitProblems, providerOfConfig, providerOfEffective, resolvePaths, runtimeOf, validateBusinessConfig } from '../clo-plugin/lib/core/config.js';
 import { ACTIVE_PROVIDER_CONTROL, providerRecord } from '../clo-plugin/lib/core/providers/registry.js';
+import { SEARCH_LOCK_KEY, searchOnInConfig } from '../clo-plugin/lib/core/providers/searchRegistry.js';
 import { createLedger } from '../clo-plugin/lib/core/ledger.js';
 import { createLog } from '../clo-plugin/lib/core/log.js';
 import { ensurePrivateDirs, tryNarrowMode } from '../clo-plugin/lib/core/private-fs.js';
@@ -120,6 +121,20 @@ export function readPriceBook(paths, kind) {
   return readVersionsLock(paths)?.models?.priceBooks?.[kind] ?? null;
 }
 
+// The search model's lock, models.locks.search: { id, price }, or null. It is not a chat kind's lock and never stands
+// for one; readModelsLock never returns it.
+export function readSearchLock(paths) {
+  return readVersionsLock(paths)?.models?.locks?.[SEARCH_LOCK_KEY] ?? null;
+}
+
+// Records `clo search lock`. Only models.locks.search changes: the lock is a price, not a model change. Turning search
+// on is the model change, and its command records that in the history.
+export function writeSearchLock(ctx, lock) {
+  const file = readVersionsLock(ctx.paths) ?? {};
+  file.models = { ...file.models, locks: { ...file.models?.locks, [SEARCH_LOCK_KEY]: lock } };
+  writeAtomic(ctx.paths.versionsLock, `${JSON.stringify(file, null, 2)}\n`);
+}
+
 // Records what `clo model` resolved. Other fields of the file stay as they are. An OpenRouter write leaves
 // models.locks and models.priceBooks alone; an Anthropic write touches only models.locks.anthropic and the history.
 export function writeModelsLock(ctx, lock, { qqPlatformNotified = false, changed = false, kind = 'openrouter' } = {}) {
@@ -179,7 +194,8 @@ function assertLockFits(cfg, lock) {
 
 // Under the own runtime there is no host config: openclaw is null, and of the workspace only the system prompt is used.
 function renderWith(ctx, cfg, lock, env) {
-  const effective = buildEffective(cfg, { paths: ctx.paths, modelsLock: lock, env, now: ctx.now });
+  const searchLock = searchOnInConfig(cfg) ? readSearchLock(ctx.paths) : null;
+  const effective = buildEffective(cfg, { paths: ctx.paths, modelsLock: lock, searchLock, env, now: ctx.now });
   const openclaw = runtimeOf(effective) === 'openclaw' ? renderOpenclaw(cfg, effective, ctx.paths, { testMode: isTestMode(env) }) : null;
   const workspace = renderWorkspace(ctx.paths.repoRoot, effective);
   return { effective, openclaw, workspace };

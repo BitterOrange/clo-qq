@@ -181,6 +181,7 @@ QQ 连接、gate、唯一出口、账本、内容策略、去重和崩溃恢复�
 | `tool-list.test.mjs` | `tool-list.test.mjs` | 证明请求里没有 `tools` 字段，调工具的回答按失败算 |
 | 没有 | `provider-anthropic.test.mjs` | 新增：直连 Anthropic，旁边一套 OpenRouter 作对照。按 token 结算、价格标记、拒答、403、429 和 529 的连败、花费上限和余额的形状（没确认）、启动时的硬上限检查、不对账 |
 | 没有 | `smoke.test.mjs` | 新增：一次 @、一次请求、结算、停机、不监听 |
+| 没有 | `search-stack.test.mjs` | 新增：搜索打开时（两种对话接口）可洛进程照常启动和回复，用搜索 Key 在搜索地址读 Key，现在还不搜索。openclaw 运行时没有搜索 |
 
 只在宿主上有意义、移植时去掉的检查：宿主提示文字、宿主文件日志、宿主看门狗、`openclaw.json`、通道和插件重载、插件加载。单元测试里 `host-notices`、`host-output-filter`、`render-validate` 和 `render` 的 `openclaw.json` 部分只守 openclaw 路线，切换之前继续跑。
 

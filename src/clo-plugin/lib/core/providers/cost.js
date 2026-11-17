@@ -155,3 +155,45 @@ export function worstCaseMicros({ input, output }, price, { geoUs = true } = {})
   const micros = inTokens * Math.max(c.inputPerM, c.cacheWritePerM) + outTokens * c.outputPerM;
   return ceilMicros(geoUs ? micros * GEO_US_MULTIPLIER : micros);
 }
+
+// ---- Search (docs/search-contract.md section 7) ----
+// The search lock's price: { inputPerM, outputPerM, requestUsd }, requestUsd being what one call adds on top of its
+// tokens (the catalog's per-request fields together). Whether the reported cost includes that fee is unverified.
+
+const searchRates = (price) => {
+  if (!price || typeof price !== 'object') return null;
+  const inputPerM = rate(price.inputPerM);
+  const outputPerM = rate(price.outputPerM);
+  const requestUsd = rate(price.requestUsd);
+  return inputPerM === null || outputPerM === null || requestUsd === null ? null : { inputPerM, outputPerM, requestUsd };
+};
+
+// What one search call settles at: the reported cost when there is one above 0 (what the search Key is charged), else
+// its tokens at the locked price plus the per-call fee. Null when neither can be had, which leaves the row unsettled and
+// counted at its hold. Cached tokens are priced as input: the search lock has no cache rates.
+export function searchMicros(usage, price) {
+  if (!usage || typeof usage !== 'object') return null;
+  const reported = reportedMicros(usage);
+  if (reported !== null) return { micros: reported, source: 'model.usage' };
+  const r = searchRates(price);
+  const input = tokens(usage.input);
+  const output = tokens(usage.output);
+  const cacheRead = tokens(usage.cacheRead ?? 0);
+  const cacheWrite = tokens(usage.cacheWrite ?? 0);
+  if (!r || input === undefined || output === undefined || cacheRead === undefined || cacheWrite === undefined) return null;
+  if (input + output + cacheRead + cacheWrite <= 0) return null;
+  const micros = (input + cacheRead + cacheWrite) * r.inputPerM + output * r.outputPerM + r.requestUsd * 1e6;
+  const total = ceilMicros(micros);
+  return total > 0 ? { micros: total, source: 'computed' } : null;
+}
+
+// One search call at its worst: inputTokens of prompt, maxTokens of output, and the per-call fee. Throws when the price
+// is not locked or a count is not a number: a hold must never read it as 0.
+export function searchWorstMicros({ inputTokens, maxTokens }, price) {
+  const r = searchRates(price);
+  if (!r) throw new Error('searchWorstMicros: search price is not locked');
+  const input = tokens(inputTokens);
+  const output = tokens(maxTokens);
+  if (input === undefined || output === undefined) throw new TypeError('searchWorstMicros: token counts must be numbers');
+  return ceilMicros(input * r.inputPerM + output * r.outputPerM + r.requestUsd * 1e6);
+}

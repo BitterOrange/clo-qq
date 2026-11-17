@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { POLICY_CATEGORIES, POLICY_V1_SHA256 } from './contentPolicy.js';
 import { DECISION_INPUT_TOKENS, usdToMicros } from './ledger.js';
+import { searchLockUsable } from './models.js';
 import {
   ANTHROPIC_EFFORTS, hardCapAckProblems, KEY_ENV, MODEL_ID_RULES, PROVIDER_ENTRY_FIELDS, PROVIDER_KINDS, PROVIDER_NAME_RE,
   providerOfConfig, providerOfEffective, providerRulesRecorded,
@@ -405,7 +406,8 @@ function ownersOf(qq, groupId) {
 const atRepo = (repoRoot, p) => (isAbsolute(p) ? p : join(repoRoot, p));
 
 // modelsLock: { primary: { id, selector, price }, decision: { id, price } }. Absent or null until resolved.
-export function buildEffective(cfg, { paths, modelsLock = null, env = process.env, now = Date.now } = {}) {
+// searchLock: models.locks.search, { id, price }. Read only while search is on; a lock for another model is no lock.
+export function buildEffective(cfg, { paths, modelsLock = null, searchLock = null, env = process.env, now = Date.now } = {}) {
   const v = validateBusinessConfig(cfg, { env });
   if (!v.ok) throw new ConfigError(`invalid config: ${v.errors.map((e) => e.path).join(', ')}`);
   const groups = {};
@@ -517,20 +519,23 @@ export function buildEffective(cfg, { paths, modelsLock = null, env = process.en
   if (apiProvider) effective.apiProvider = apiProvider;
   // Only with search on, so every effective file written with it off stays as it was.
   if (searchOnInConfig(cfg)) {
-    effective.search = searchOf(cfg);
+    effective.search = searchOf(cfg, searchLock);
     effective.budget.searchKeyDailyLimitUsd = b.searchKeyDailyLimitUsd;
     for (const [id, g] of Object.entries(cfg.qq.groups)) groups[id].search = g.search === true;
   }
   return effective;
 }
 
-// The effective search block: the provider, its one model, where it is sent, and the limits with their defaults.
-function searchOf(cfg) {
+// The effective search block: the provider, its one model, where it is sent, the limits with their defaults, and the
+// locked price (null until `clo search lock`; with no price the ledger holds nothing for search, so nothing is sent).
+function searchOf(cfg, searchLock) {
   const block = isObj(cfg.search) ? cfg.search : {};
   const provider = searchProviderOf(cfg);
-  const out = { provider, model: SEARCH_MODEL[provider], baseUrl: block.baseUrl ?? openrouterBaseOf(cfg) };
+  const model = SEARCH_MODEL[provider];
+  const out = { provider, model, baseUrl: block.baseUrl ?? openrouterBaseOf(cfg) };
   for (const f of SEARCH_BLOCK_LIMITS) out[f] = block[f] ?? SEARCH_DEFAULTS[f];
   out.searchMs = cfg.timeouts.searchMs ?? SEARCH_DEFAULTS.searchMs;
+  out.price = searchLockUsable(searchLock, model) ? { ...searchLock.price } : null;
   return out;
 }
 
@@ -606,7 +611,8 @@ function isEffectiveShape(e) {
   return isObj(e) && e.version === 1 && (e.mode === 'dry-run' || e.mode === 'live') && (e.runtime === undefined || RUNTIMES.includes(e.runtime))
     && (e.apiProvider === undefined || (isObj(e.apiProvider) && PROVIDER_KINDS.includes(e.apiProvider.kind)))
     // A search block this build does not know, or one on a runtime without search, reads the same way.
-    && (e.search === undefined || (isObj(e.search) && SEARCH_PROVIDERS.includes(e.search.provider) && e.search.provider !== SEARCH_OFF && SEARCH_RUNTIMES.includes(runtimeOf(e))))
+    && (e.search === undefined || (isObj(e.search) && SEARCH_PROVIDERS.includes(e.search.provider) && e.search.provider !== SEARCH_OFF && SEARCH_RUNTIMES.includes(runtimeOf(e))
+      && (e.search.price === undefined || e.search.price === null || searchLockUsable({ id: e.search.model, price: e.search.price }, e.search.model))))
     && isObj(e.qq) && isObj(e.qq.groups) && isObj(e.budget) && isObj(e.limits) && isObj(e.window) && isObj(e.paths);
 }
 
