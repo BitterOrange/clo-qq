@@ -334,7 +334,7 @@
 
 ## CI（2026-11-17，用户要求；做法是开发时定的，用户还没有确认）
 
-用户要求加 CI/CD 的测试。可洛跑在用户自己的机器上，没有部署目标，所以这里只有 CI：每次推送和每个 PR 给出一个测试结论，不部署、不发布、不上传运行产物。下面的做法都是开发时定的，用户不同意就改。写好时还没有在 GitHub 上真的跑过一次，Windows 那几个任务很可能先失败。
+用户要求加 CI/CD 的测试。可洛跑在用户自己的机器上，没有部署目标，所以这里只有 CI：每次推送和每个 PR 给出一个测试结论，不部署、不发布、不上传运行产物。下面的做法都是开发时定的，用户不同意就改。GitHub 上实际跑出来的结果见本节最后的“CI 上观察到的”。
 
 | 项目 | 现在的做法 | 说明 |
 |---|---|---|
@@ -343,13 +343,28 @@
 | 权限和密钥 | 整个工作流只有 `contents: read`。不用任何仓库密钥，不设带 Key 的环境变量。`actions/checkout` 不保留凭据 | 运行器给每个测试文件的环境按白名单构造（PATH、HOME、临时目录、语言，Windows 上另加系统变量），不复制外层 shell 的环境 |
 | 联网 | 只有安装步骤联网：从 nodejs.org 下载私有 Node（按 `versions.lock.json` 核对校验值），从 npm 仓库按锁文件 `npm ci`。测试本身只连回环地址 | 和本机用 `setup.sh --runtime`、`setup.ps1 -Runtime` 完全一样，单元测试和 e2e-own 也要 `.runtime/pkg`（acorn、OpenClaw 的 dist），所以都装 `--runtime` |
 | 先 own | 按用户 2026-11-17 的决定，own 运行时是主任务：Linux 上 `tests/unit`、`tests/seam`、`tests/e2e-own` 分 2 片（默认 mock OpenRouter），另把 `tests/e2e-own` 用 `CLO_TEST_PROVIDER=anthropic` 再跑一遍，一个任务。OpenClaw 运行时的 `tests/e2e` 是单独的任务，分 4 片 | 各任务同时开始，不互相等待，openclaw 失败不挡 own 的结论。分片按排好序的文件列表轮流分，没有按时长平衡 |
-| 要 root 的那个文件 | `tests/e2e/qq-first-run.test.mjs` 在 openclaw 第 1 片的最后一步用 `sudo env -i` 以 root 跑，环境只有 PATH、HOME、语言。同一片里别的文件失败时它照样跑，安装失败或取消时不跑 | GitHub 的 Ubuntu 机器以普通用户 `runner` 运行，可以免密码 sudo。这个文件要读每个进程的 `fd` 目录，普通用户读不了别人的进程。其他文件都以普通用户跑，所以“root 下做不到让写文件失败”的那个测试在 CI 上会真的跑。`sudo` 只写在工作流里，项目脚本里仍然禁用 |
-| Windows | `windows-latest` 上用 pwsh 运行 `setup.ps1 -Runtime`，own（单元、接缝、e2e-own）和 openclaw（e2e）各分 3 片，每片最多 150 分钟。先打印 git 的换行设置，供看失败原因。checkout 沿用机器的 `core.autocrlf`，和用户自己在 Windows 上克隆一样；带哈希的文件由 `.gitattributes`（`CLAUDE.md` 的 `-text`，`persona/`、`policy/` 各自的 `eol=lf`）保持 LF | 不设 `continue-on-error`，失败就显示失败。用 pwsh 是因为 `setup.ps1` 用了 `ConvertFrom-Json -AsHashtable`，Windows PowerShell 5.1 没有；README 里用户自己运行时用的是哪一个没有核对。Windows 上的 Anthropic 一遍没有加 |
+| 要 root 的那个文件 | `tests/e2e/qq-first-run.test.mjs` 在 openclaw 第 1 片的最后一步用 `sudo env -i` 以 root 跑，环境只有 PATH、HOME、语言。root 跑的是复制到 `/opt/clo-root` 的一份、属于 root 的检出：OpenClaw 不加载属于别的用户（既不是运行它的用户也不是 root）的插件文件，直接在 `runner` 的检出上以 root 跑，`clo-qq` 通道就不存在。同一片里别的文件失败时它照样跑，安装失败或取消时不跑 | GitHub 的 Ubuntu 机器以普通用户 `runner` 运行，可以免密码 sudo。这个文件要读每个进程的 `fd` 目录，普通用户读不了别人的进程。其他文件都以普通用户跑，所以“root 下做不到让写文件失败”的那个测试在 CI 上会真的跑。`sudo` 只写在工作流里，项目脚本里仍然禁用 |
+| Windows | `windows-latest` 上用 pwsh 运行 `setup.ps1 -Runtime`，own（单元、接缝、e2e-own）和 openclaw（e2e）各分 3 片，每片最多 150 分钟。先打印 git 的换行设置，供看失败原因。测试步骤把 `TEMP`、`TMP` 设到检出所在的 D 盘（机器的临时目录在 C 盘，有的测试要把私有 Node 硬链接进临时目录，硬链接不能跨盘）。checkout 沿用机器的 `core.autocrlf`，和用户自己在 Windows 上克隆一样；带哈希的文件由 `.gitattributes`（`CLAUDE.md` 的 `-text`，`persona/`、`policy/` 各自的 `eol=lf`）保持 LF | 不设 `continue-on-error`，失败就显示失败。用 pwsh 是因为 `setup.ps1` 用了 `ConvertFrom-Json -AsHashtable`，Windows PowerShell 5.1 没有；README 里用户自己运行时用的是哪一个没有核对。Windows 上的 Anthropic 一遍没有加 |
 | 第三方 Action | 只用 `actions/checkout`，固定到 v7.0.1 的完整提交 `3d3c42e5aac5ba805825da76410c181273ba90b1` | 不用 `setup-node`，Node 由项目自己的安装脚本按锁定版本和校验值装 |
 | 缓存 | 不用 | 私有 Node 和 npm 包每次重新下载并核对，避免被别的分支或 PR 写进去的缓存影响结论。代价是每个任务多几分钟 |
+| 测试的环境变量 | `tests/run-files.mjs` 在 Windows 上也传 `PSModulePath`，测试给控制台的环境（`tests/unit/_cli-helper.mjs` 的 `testEnv`）也带上它 | 控制台查进程时把它交给 `powershell.exe`。用户的 shell 总有这个变量；测试原来没给，CI 机器上每查一次要 18–30 秒（有它约 0.3 秒） |
+| 换行 | `.gitattributes` 把 `*.ps1` 固定成 LF；`doc-status` 读文档时把 CRLF 当 LF | 在 Windows 上用默认的 `core.autocrlf` 克隆时，`.ps1` 和文档变成 CRLF，原来的检查失败。两种 PowerShell 都能读 LF 的脚本，开发机上一直是 LF |
 | 时限和并发 | Linux 每片 45（own）、75（openclaw）分钟；同一个分支或 PR 有新的推送时，取消还在跑的那一次 | 2026-11-17 在开发用的容器里（4 核，root）用 `tests/run-files.mjs` 串行跑过一次：单元和接缝 90 个文件约 3.5 分钟，e2e-own 29 个文件约 12 分钟（`CLO_TEST_PROVIDER=anthropic` 再跑一遍也约 12 分钟），e2e 除 `qq-first-run` 外 28 个文件约 48 分钟，全部通过；`qq-first-run` 用 `env -i` 只给 PATH、HOME、语言，约 20 秒通过。GitHub 机器上没有量过 |
 
 **CI 通过只说明离线测试通过**（mock QQ、mock 模型），不是真实 QQ 验收，也不代表 Linux 部署已经支持。
+
+### CI 上观察到的（2026-11-17，GitHub Actions，只是 CI 日志里看到的）
+
+**Windows 这一项是 Linux 移植之后第一次在 Windows 上跑整套离线测试。** 以前 Windows 上的结果来自开发机，这次是 GitHub 的 `windows-latest`，和用户的机器不一样。
+
+| 第几次 | 看到的 | 原因和处理 |
+|---|---|---|
+| 1 | Linux 的 own 三个任务、openclaw 第 2–4 片都通过。openclaw 第 1 片里以 root 跑的 `qq-first-run` 5 个测试都失败，doctor 报 `channels.clo-qq: unknown channel id` | OpenClaw 拦下了属于 `runner` 用户的插件文件。改成以 root 跑一份属于 root 的复制 |
+| 1 | Windows：`doc-status` 2 个、`q5-anthropic` 的 LF 检查 2 个、`doctor` 的 `insideDir` 1 个、`lifecycle` 的空格路径 1 个（EXDEV）失败；`lifecycle`、`lifecycle-own` 共 4 个测试超时；`tests/e2e/q5-probe.test.mjs` 1 个失败（第一个 Gateway 回合后停在 `gateway_turn_failed`） | 换行：见上表“换行”。`insideDir`：Windows 上 Node 的 `path.relative` 本身不分大小写，`caseless:false` 在那里做不到区分，测试按平台断言。EXDEV：临时目录和检出不在同一个盘。超时和 q5-probe：查进程时没有 `PSModulePath`，每次 18–30 秒，测试进程被同步查询卡住，测试里的 mock 也就答不上 |
+| 2 | 只剩 `lifecycle`、`lifecycle-own` 的超时；q5-probe 这次通过 | 加了一个计时步骤：完整环境 0.3–0.4 秒，没有 `PSModulePath` 的 18–30 秒 |
+| 4 | 补上 `PSModulePath` 后，Windows own 三片从约 40 分钟降到 6–10 分钟，全部通过；Linux 全部通过。Windows openclaw 第 3 片 `qq-model-live` 有 1 个测试失败：QQ 收到了一条回复，模型却没有收到请求 | 同一个文件前两次在 Windows 上都通过，Linux 上都通过。只看到一次，原因没有查清。测试的失败信息改成带上发出去的内容，下次再出现能从日志看出是什么 |
+
+这些只说明离线测试在 GitHub 的 Linux 和 Windows 机器上的结果，不是真实 QQ 验收。
 
 ## 待定（决策点 D）
 

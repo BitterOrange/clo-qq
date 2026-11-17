@@ -126,7 +126,9 @@ test('live preconditions, in README order, then a real @ gets a reply from the l
   qq.push(...fullAt('现在可以回答了吗', { id, group: GROUP_A, member: MEMBER }));
   await until(() => qq.messagePosts().length === 1, 'the reply to reach the mock QQ', 120000);
   const [rec] = model.agentRequests();
-  assert.ok(rec, 'a model request was made');
+  // Seen once on the Windows CI runner: a post with no model request. The message says what was posted, so the next
+  // time it happens it can be read from the log.
+  assert.ok(rec, `a model request was made; posted: ${qq.messagePosts().map((p) => JSON.parse(p.body).content).join(' | ')}`);
   assert.equal(rec.headers.authorization, `Bearer ${FAKE_KEY}`, 'the host got CLO_CHAT_API_KEY from .env under its own name');
   assert.equal(rec.body.model, PRIMARY_ID);
   assert.equal(rec.body.max_completion_tokens ?? rec.body.max_tokens, 3000);
