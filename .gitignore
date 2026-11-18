@@ -16,3 +16,6 @@ captures/
 # Local notes and leftover temp files
 .private/
 *.tmp
+
+# Claude Code workflow worktrees and session files
+.claude/
