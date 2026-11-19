@@ -817,7 +817,12 @@ async function lockSearch(ctx, cfg, flags) {
   const previous = readSearchLock(ctx.paths);
   const confirmPrice = Boolean(flags['--confirm-price']);
   const r = lockSearchFromCatalog(model, catalog, { previous, confirmPrice, maxOutputPerM: cfg.budget?.maxOutputUsdPerMtok ?? undefined });
-  if (!r.ok) throw new CliError(`锁定没有通过：\n${r.errors.map((e) => `  ${e.path}: ${e.message}`).join('\n')}`);
+  if (!r.ok) {
+    const seen = r.price
+      ? `\n目录里的价格（${model}）：输入 $${r.price.inputPerM}/百万 token，输出 $${r.price.outputPerM}/百万 token，每次调用另加 $${r.price.requestUsd}。核对过再加 --confirm-price。`
+      : '';
+    throw new CliError(`锁定没有通过：\n${r.errors.map((e) => `  ${e.path}: ${e.message}`).join('\n')}${seen}`);
+  }
   const { lock } = r;
   const on = searchOnInConfig(cfg);
   if (on) assertApplicable(ctx, cfg);

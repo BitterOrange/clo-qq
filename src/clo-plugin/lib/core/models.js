@@ -8,8 +8,8 @@ const ANTHROPIC_ID = /^anthropic\/[^:\s~]+$/;
 const DEFAULT_MAX_OUTPUT_PER_M = 30;
 const MANDATORY_REASONING_MIN_TOKENS = 2000;
 
-export async function fetchCatalog({ fetch, baseUrl }) {
-  const res = await fetch(`${baseUrl}/models`, { method: 'GET', signal: AbortSignal.timeout(15000) });
+export async function fetchCatalog({ fetch, baseUrl, timeoutMs = 15000 }) {
+  const res = await fetch(`${baseUrl}/models`, { method: 'GET', signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`model catalog read failed: HTTP ${res.status}`);
   const body = await res.json();
   if (!Array.isArray(body?.data)) throw new Error('model catalog read failed: unexpected shape');
@@ -424,7 +424,8 @@ export function lockSearchFromCatalog(model, catalog, { previous = null, confirm
       else if (SEARCH_PRICE_KEYS.some((k) => previous.price?.[k] !== price[k])) err('price', 'the catalog price differs from the locked one; pass --confirm-price');
     }
   }
-  return errors.length ? { ok: false, errors, lock: null } : { ok: true, errors, lock: { id: model, price } };
+  // The catalog price goes back on a refusal too, so the console can show what --confirm-price would confirm.
+  return errors.length ? { ok: false, errors, lock: null, price } : { ok: true, errors, lock: { id: model, price }, price };
 }
 
 // Whether a lock record is a usable search lock for model.

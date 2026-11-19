@@ -44,6 +44,7 @@ test('search lock: the first lock needs --confirm-price; it records only models.
   const refused = await clo(r, ['search', 'lock'], { fetch: p.fetch });
   assert.equal(refused.code, 1);
   assert.match(refused.err, /--confirm-price/);
+  assert.match(refused.err, /目录里的价格（perplexity\/sonar-pro）：输入 \$3\/百万 token，输出 \$15\/百万 token，每次调用另加 \$0\.005/, 'the refusal shows the price the flag would confirm');
   assert.equal(lockText(r), before, 'a refusal writes nothing');
   const ok = await clo(r, ['search', 'lock', '--confirm-price'], { fetch: p.fetch });
   assert.equal(ok.code, 0, `${ok.out}${ok.err}`);
@@ -94,6 +95,7 @@ test('search lock: no row, no price, a free token price or one above the output 
   const none = await clo(r, ['search', 'lock', '--confirm-price'], { fetch: fakeProvider().fetch });
   assert.equal(none.code, 1);
   assert.match(none.err, /not in the catalog/);
+  assert.doesNotMatch(none.err, /目录里的价格/, 'no row, no price line (the first test is the positive control)');
   const free = await clo(r, ['search', 'lock', '--confirm-price'], { fetch: withSonar({ prompt: '0' }).fetch });
   assert.equal(free.code, 1);
   assert.match(free.err, /price of 0/);

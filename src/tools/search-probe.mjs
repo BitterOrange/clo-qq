@@ -53,6 +53,8 @@ const PROMPT_OVERHEAD_TOKENS = 500;
 const SEARCH_BODY_KEYS = Object.freeze(['max_tokens', 'messages', 'model', 'stream', 'usage']);
 const CALL_TIMEOUT_MS = 60000;
 const KEY_TIMEOUT_MS = 15000;
+// The catalog is large and free to read; 15 s timed out once on a real home connection (2026-11-19).
+const CATALOG_TIMEOUT_MS = 60000;
 // The Key can round. A difference this small is not a finding.
 const KEY_TOLERANCE_MICROS = 1000;
 const STOP_STATUS = new Set([401, 402, 403, 429]);
@@ -378,7 +380,7 @@ export async function runSearchProbe({ plan, baseUrl, key, maxUsd, resultPath, s
   let prices = null;
   if (!stopReason) {
     try {
-      const checked = checkCatalog(await fetchCatalog({ fetch: http, baseUrl }));
+      const checked = checkCatalog(await fetchCatalog({ fetch: http, baseUrl, timeoutMs: CATALOG_TIMEOUT_MS }));
       prices = { search: checked.searchPrice, decision: checked.decisionPrice };
       const line = { kind: 'catalog', priceFields: checked.priceFields, parameters: checked.parameters, problems: checked.problems,
         searchInputPerM: checked.searchPrice?.inputPerM ?? null, searchOutputPerM: checked.searchPrice?.outputPerM ?? null, searchRequestUsd: checked.searchPrice?.requestUsd ?? null,
@@ -390,8 +392,13 @@ export async function runSearchProbe({ plan, baseUrl, key, maxUsd, resultPath, s
       } else {
         record({ ...line, class: 'ok' });
       }
-    } catch {
-      record({ kind: 'catalog', class: 'read_failed' });
+    } catch (e) {
+      // Only a class, never the error text: timeout, an HTTP status, a body that is not the catalog, or other.
+      const status = /HTTP (\d{3})/.exec(String(e?.message))?.[1];
+      const why = e?.name === 'TimeoutError' || e?.name === 'AbortError' ? 'timeout'
+        : status ? `http_${status}`
+          : /unexpected shape/.test(String(e?.message)) ? 'shape' : 'other';
+      record({ kind: 'catalog', class: 'read_failed', reason: why });
       stopWith('catalog_read_failed');
     }
   }

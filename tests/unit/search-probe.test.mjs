@@ -222,6 +222,29 @@ test('the catalog refuses an unknown price field, a missing row or a price above
   assert.ok(PRICE_CEILING.search.outputPerM >= 15, 'the mock price sits under the ceiling');
 });
 
+test('a failed catalog read records why (timeout, HTTP status, shape) and stops before any paid call', async () => {
+  const timeout = () => { const e = new Error('The operation was aborted due to timeout'); e.name = 'TimeoutError'; throw e; };
+  const cases = [
+    [timeout, 'timeout'],
+    [() => json({ error: { message: 'down' } }, 503), 'http_503'],
+    [() => json({ models: [] }), 'shape'],
+  ];
+  for (const [answer, why] of cases) {
+    const provider = fakeOpenRouter();
+    const inner = provider.fetch;
+    provider.fetch = async (url, init) => (String(url).endsWith('/models') ? (provider.calls.push({ url: String(url) }), answer()) : inner(url, init));
+    const r = await run(['--approve', '--max-usd', '0.10'], { provider });
+    assert.equal(r.code, 1, why);
+    assert.equal(provider.chat().length, 0, `${why}: no paid call`);
+    const line = r.results().find((l) => l.kind === 'catalog');
+    assert.deepEqual([line.class, line.reason], ['read_failed', why]);
+    assert.doesNotMatch(JSON.stringify(r.results()), /aborted due to timeout|down/, `${why}: no error text is recorded`);
+  }
+  // Control: the same run with the catalog answering gets past the catalog.
+  const ok = await run(['--approve', '--max-usd', '0.10']);
+  assert.equal(ok.results().find((l) => l.kind === 'catalog').class, 'ok');
+});
+
 test('a 402 on Sonar stops the run, is not retried, and the closing Key read still happens', async () => {
   let sonarCalls = 0;
   const provider = fakeOpenRouter({ sonar: () => { sonarCalls += 1; return json({ error: { code: 402, message: 'Insufficient credits, see https://x.example' } }, 402); } });
